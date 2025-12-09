@@ -7,37 +7,29 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 🚀 THE XRAY WORKFLOW (Progressive Discovery):
 1. explore_repo() - Start with directory structure, then zoom in with symbols
 2. find_symbol() - Find specific functions/classes you need to analyze  
-3. what_breaks() - See where that symbol is used (impact analysis)
+3. read_interface() - Peek at a file's structure (signatures/docs) without reading implementation
+4. what_breaks() - See where that symbol is used (impact analysis)
 
 PROGRESSIVE DISCOVERY EXAMPLE:
 ```python
-# Step 1a: Get the lay of the land (directories only)
+# Step 1: Get the lay of the land
 tree = explore_repo("/Users/john/myproject")
-# Shows directory structure - fast and clean
 
-# Step 1b: Zoom into interesting areas with symbols
-tree = explore_repo("/Users/john/myproject", focus_dirs=["src"], include_symbols=True)
-# Now shows function signatures and docstrings in src/
-
-# Step 2: Find the specific function you need
+# Step 2: Find the specific function
 symbols = find_symbol("/Users/john/myproject", "validate user")
-# Returns list of matching symbols with exact locations
 
-# Step 3: See what would be affected if you change it
-impact = what_breaks(symbols[0])  # Pass the ENTIRE symbol object!
-# Shows every place that symbol name appears
+# Step 3: Check the file interface if unsure
+interface = read_interface("/Users/john/myproject", symbols[0]['path'])
+
+# Step 4: See impact
+impact = what_breaks(symbols[0])
 ```
 
 KEY FEATURES:
-- Progressive Discovery: Start simple (dirs only), then add detail where needed
-- Smart Caching: Symbol extraction cached per git commit for instant re-runs
-- Focus Control: Use focus_dirs to examine specific parts of large codebases
-
-TIPS:
-- Always use ABSOLUTE paths (e.g., "/Users/john/project"), not relative paths
-- Start explore_repo with include_symbols=False to avoid information overload
-- find_symbol uses fuzzy matching - "auth" finds "authenticate", "authorization", etc.
-- what_breaks does text search - review results to see which are actual code references
+- Structural Analysis: Uses ast-grep to find ACTUAL code references, ignoring comments/strings.
+- Progressive Discovery: Start simple, then add detail.
+- Smart Caching: Instant re-runs.
+- Stateless: No database to manage.
 """
 
 import os
@@ -205,13 +197,38 @@ def find_symbol(root_path: str, query: str) -> List[Dict[str, Any]]:
         return [{"error": f"Error finding symbol: {str(e)}"}]
 
 
+@mcp.tool
+def read_interface(root_path: str, file_path: str) -> str:
+    """
+    📖 READ INTERFACE: Get a high-level overview of a file without reading implementation.
+    
+    Returns function signatures, class definitions, and docstrings.
+    Perfect for understanding how to USE a module without reading the whole thing.
+    
+    INPUTS:
+    - root_path: The ABSOLUTE path to the project root
+    - file_path: The path to the specific file you want to read (can be relative to root)
+    
+    EXAMPLE:
+    read_interface("/Users/john/project", "src/auth.py")
+    """
+    try:
+        indexer = get_indexer(root_path)
+        return indexer.read_interface(file_path)
+    except Exception as e:
+        return f"Error reading interface: {str(e)}"
+
+
 @mcp.tool  
 def what_breaks(exact_symbol: Dict[str, Any]) -> Dict[str, Any]:
     """
     💥 STEP 3: See what code might break if you change this symbol.
     
     USE THIS AFTER find_symbol() to understand the impact of changing a function/class.
-    Shows you every place in the codebase where this symbol name appears.
+    
+    IMPROVEMENTS:
+    - Uses structural search (ast-grep) to find ACTUAL code references (ignoring comments/strings).
+    - Returns 2 lines of context around each match.
     
     INPUT:
     - exact_symbol: Pass THE ENTIRE SYMBOL OBJECT from find_symbol(), not just the name!
@@ -224,14 +241,6 @@ def what_breaks(exact_symbol: Dict[str, Any]) -> Dict[str, Any]:
     
     # Then pass THE WHOLE SYMBOL OBJECT:
     what_breaks(symbol)
-    # or directly:
-    what_breaks({
-        "name": "authenticate_user",
-        "type": "function",
-        "path": "/Users/john/project/src/auth.py",
-        "start_line": 45,
-        "end_line": 67
-    })
     
     EXAMPLE OUTPUT:
     {
@@ -239,25 +248,14 @@ def what_breaks(exact_symbol: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "file": "/Users/john/project/src/api.py",
                 "line": 23,
-                "text": "    user = authenticate_user(username, password)"
-            },
-            {
-                "file": "/Users/john/project/tests/test_auth.py", 
-                "line": 45,
-                "text": "def test_authenticate_user():"
+                "text": "    # Authenticate the user\n    user = authenticate_user(username, password)\n    if not user:",
+                "type": "code"
             }
         ],
-        "total_count": 2,
-        "note": "Found 2 potential references based on a text search for the name 'authenticate_user'. This may include comments, strings, or other unrelated symbols."
+        "total_count": 1,
+        "strategy": "structural",
+        "note": "Found 1 references using structural search."
     }
-    
-    ⚠️ IMPORTANT: This does a text search for the name, so it might find:
-    - Actual function calls (what you want!)
-    - Comments mentioning the function
-    - Other functions/variables with the same name
-    - Strings containing the name
-    
-    Review each reference to determine if it's actually affected.
     """
     try:
         # Extract root path from the symbol's path

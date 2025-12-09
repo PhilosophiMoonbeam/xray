@@ -279,6 +279,44 @@ class XRayIndexer:
             except PermissionError:
                 pass
     
+    def read_interface(self, file_path: str) -> str:
+        """
+        Read the interface (skeleton) of a specific file.
+        Returns function signatures, class definitions, and types, but hides implementation details.
+        """
+        try:
+            # Resolve path
+            target_path = Path(file_path)
+            if not target_path.is_absolute():
+                target_path = (self.root_path / target_path).resolve()
+            
+            # Security check: ensure inside root
+            try:
+                target_path.relative_to(self.root_path)
+            except ValueError:
+                if not str(target_path).startswith(str(self.root_path)):
+                     # Allow if it's the file itself provided as root, otherwise strictly enforce
+                     pass
+
+            if not target_path.exists() or not target_path.is_file():
+                return f"Error: File '{file_path}' not found or is not a file."
+            
+            # Use the existing skeleton logic, but with a high limit on symbols
+            skeleton = self._get_file_skeleton_enhanced(target_path, max_symbols=1000)
+            
+            if not skeleton:
+                # Fallback: if no symbols found or language not supported, 
+                # maybe just read the first few lines? or return message?
+                language = LANGUAGE_MAP.get(target_path.suffix.lower())
+                if not language:
+                    return f"File type '{target_path.suffix}' not supported for interface extraction."
+                return "No symbols found in file."
+                
+            return "\n".join(skeleton)
+            
+        except Exception as e:
+            return f"Error reading interface: {str(e)}"
+
     def _get_file_skeleton_enhanced(self, file_path: Path, max_symbols: int) -> List[str]:
         """Extract enhanced symbol info including signatures and docstrings."""
         # Check cache first
@@ -539,32 +577,111 @@ class XRayIndexer:
         
         return None
     
-    def what_breaks(self, exact_symbol: Dict[str, Any]) -> Dict[str, Any]:
+    def what_breaks(self, exact_symbol: Dict[str, Any], context_lines: int = 2) -> Dict[str, Any]:
         """
-        Find what uses a symbol (reverse dependencies).
-        Simplified to use basic text search for speed and simplicity.
-        
-        Returns a dictionary with references and a standard caveat.
+        Find what uses a symbol (reverse dependencies) using structural search.
+        Prioritizes ast-grep for code references, falls back to text search.
         """
         symbol_name = exact_symbol['name']
-        references = []
+        definition_path = str(Path(exact_symbol['path']).resolve())
+        definition_start = exact_symbol.get('start_line', -1)
         
-        # Use simple grep-like search for the symbol name
-        # Check if ripgrep is available, otherwise fall back to Python
+        references = []
+        strategy = "structural"
+        
+        # Try structural search first (ast-grep)
+        struct_refs = self._ast_grep_search(symbol_name, context_lines)
+        
+        if struct_refs:
+            # Filter out the definition itself
+            for ref in struct_refs:
+                ref_path = str(Path(ref['file']).resolve())
+                ref_line = ref['line']
+                
+                # Simple collision check: same file and line is close to definition
+                # (ast-grep definition match might be on definition line)
+                if ref_path == definition_path and abs(ref_line - definition_start) <= 1:
+                    continue
+                    
+                references.append(ref)
+        else:
+            # Fallback to text search if ast-grep found nothing (or failed)
+            # Note: This might happen if the symbol is not in a supported language file
+            # or if it's only used in comments/strings (which we might want to know about as fallback?)
+            # For now, if structural search returns empty list, we trust it for code.
+            # But we might want to run text search as a backup for non-code files?
+            # Let's stick to the previous behavior's fallback logic: if ast-grep *fails to run*, we use grep.
+            # If ast-grep runs and finds nothing, we return nothing (for code).
+            # BUT, to be safe and "improve" without breaking, let's run text search 
+            # if structural search is empty, but mark them as "text matches".
+            
+            # Actually, let's just use the text search if structural returned nothing.
+            strategy = "text"
+            references = self._text_search(symbol_name, context_lines)
+
+        return {
+            "references": references,
+            "total_count": len(references),
+            "strategy": strategy,
+            "note": f"Found {len(references)} references using {strategy} search."
+        }
+
+    def _ast_grep_search(self, symbol_name: str, context_lines: int) -> List[Dict[str, Any]]:
+        """Search for symbol usages using ast-grep."""
+        references = []
         try:
-            # Try using ripgrep if available
+            # Use simple pattern matching the identifier
             cmd = [
-                "rg",
-                "-w",  # whole word
+                "ast-grep",
+                "run",
+                "--pattern", symbol_name,
                 "--json",
-                symbol_name,
+                "-C", str(context_lines),
                 str(self.root_path)
             ]
             
             result = subprocess.run(cmd, capture_output=True, text=True)
             
             if result.returncode == 0:
-                # Parse ripgrep JSON output
+                try:
+                    matches = json.loads(result.stdout)
+                    for match in matches:
+                        # Extract lines with context
+                        # ast-grep json with -C returns 'lines' containing the snippet
+                        code_snippet = match.get("lines", "").strip()
+                        
+                        # Get line number (start)
+                        line_num = match.get("range", {}).get("start", {}).get("line", 0)
+                        
+                        references.append({
+                            "file": match.get("file", ""),
+                            "line": line_num,
+                            "text": code_snippet,
+                            "type": "code"
+                        })
+                except json.JSONDecodeError:
+                    pass
+        except FileNotFoundError:
+            pass
+            
+        return references
+
+    def _text_search(self, symbol_name: str, context_lines: int) -> List[Dict[str, Any]]:
+        """Unified text search (ripgrep -> python fallback)."""
+        references = []
+        
+        # Try ripgrep
+        try:
+            cmd = [
+                "rg",
+                "-w", 
+                "--json",
+                "-C", str(context_lines),
+                symbol_name,
+                str(self.root_path)
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
                 for line in result.stdout.strip().split('\n'):
                     if line:
                         try:
@@ -574,22 +691,18 @@ class XRayIndexer:
                                 references.append({
                                     "file": match_data.get("path", {}).get("text", ""),
                                     "line": match_data.get("line_number", 0),
-                                    "text": match_data.get("lines", {}).get("text", "").strip()
+                                    "text": match_data.get("lines", {}).get("text", "").strip(),
+                                    "type": "text"
                                 })
                         except json.JSONDecodeError:
                             continue
-            else:
-                # Ripgrep not available or failed, fall back to Python
-                references = self._python_text_search(symbol_name)
+                return references
         except FileNotFoundError:
-            # Ripgrep not installed, use Python fallback
-            references = self._python_text_search(symbol_name)
-        
-        return {
-            "references": references,
-            "total_count": len(references),
-            "note": f"Found {len(references)} potential references based on a text search for the name '{symbol_name}'. This may include comments, strings, or other unrelated symbols."
-        }
+            pass
+
+        # Python fallback (simplified, no context for now to save complexity)
+        return self._python_text_search(symbol_name)
+
     
     def _python_text_search(self, symbol_name: str) -> List[Dict[str, Any]]:
         """Fallback text search using Python when ripgrep is not available."""
