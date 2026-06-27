@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# XRAY MCP Server Uninstallation Script
+# XRAY CLI and MCP Uninstallation Script
 # Usage: bash uninstall.sh
 
 set -e
 
-echo "🗑️ Uninstalling XRAY MCP Server..."
+echo "🗑️ Uninstalling XRAY code intelligence CLI..."
 
 # Colors for output
 RED='\033[0;31m'
@@ -37,9 +37,9 @@ if [ -d "$INSTALL_DIR" ]; then
 fi
 
 # Verify uninstallation
-if ! command -v xray-mcp &> /dev/null; then
+if ! command -v xray &> /dev/null && ! command -v xray-mcp &> /dev/null; then
     echo -e "${GREEN}✅ Uninstallation complete!${NC}"
 else
-    echo -e "${RED}❌ Uninstallation failed.${NC} xray-mcp is still on the PATH."
+    echo -e "${RED}❌ Uninstallation may be incomplete.${NC} xray or xray-mcp is still on the PATH."
     echo "This might be due to your shell caching the command. Please restart your shell."
-fi 
+fi

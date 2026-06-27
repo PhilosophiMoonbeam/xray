@@ -1,14 +1,14 @@
 [project]
 name = "xray"
 version = "0.6.1"
-description = "XRAY: Progressive code intelligence for AI assistants - Map, Find, Impact"
+description = "XRAY: Agent-centric code intelligence CLI with MCP compatibility - Map, Find, Interface, Impact"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
     { name = "Srijan Shukla", email = "srijanshukla18@gmail.com" }
 ]
-keywords = ["mcp", "code-intelligence", "ai-assistant", "code-analysis", "ast-grep", "structural-search"]
+keywords = ["cli", "agents", "mcp", "code-intelligence", "ai-assistant", "code-analysis", "ast-grep", "structural-search"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -19,9 +19,14 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "fastmcp>=0.1.0",
+    "fastmcp>=3.4.2,<4",
     "ast-grep-cli>=0.39.0",
     "thefuzz>=0.20.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.0",
 ]
 
 [project.urls]
@@ -36,5 +41,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+xray = ["skills/**/*"]
+
 [project.scripts]
+xray = "xray.cli:main"
 xray-mcp = "xray.mcp_server:main"

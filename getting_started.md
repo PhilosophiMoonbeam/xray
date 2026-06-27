@@ -40,6 +40,11 @@ git clone https://github.com/srijanshukla18/xray.git
 cd xray
 
 # Run XRAY directly with uvx
+uvx --from . xray explore . --max-depth 2
+uvx --from . xray explore . --focus src --include-symbols --format json
+uvx --from . xray find . "UserService" --min-score 60
+
+# Or run the MCP server
 uvx --from . xray-mcp
 ```
 
@@ -55,7 +60,8 @@ cd xray
 # Install with uv
 uv tool install .
 
-# Now you can run xray-mcp from anywhere
+# Now you can run xray and xray-mcp from anywhere
+xray explore . --max-depth 2
 xray-mcp
 ```
 
@@ -75,8 +81,9 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 # Install in editable mode
 uv pip install -e .
 
-# Run the server
-python -m xray.mcp_server
+# Run the CLI or server
+uv run xray explore . --max-depth 2
+uv run xray-mcp
 ```
 
 ## Configure Your AI Assistant
@@ -95,11 +102,11 @@ To use it:
     ```
 2.  Run the script with your desired tool and installation method. For example, to get the configuration for Claude Desktop with an installed `xray-mcp` script:
     ```bash
-    python mcp-config-generator.py claude installed_script
+    uv run python mcp-config-generator.py claude installed_script
     ```
     Or for VS Code with a local Python installation:
     ```bash
-    python mcp-config-generator.py vscode local_python
+    uv run python mcp-config-generator.py vscode local_python
     ```
     The script will print the JSON configuration and instructions on where to add it.
 
@@ -180,10 +187,10 @@ This means you can start using XRAY immediately after installation with no compl
 
 ```bash
 # If installed as tool
-xray-mcp --version
+xray --version
 
 # If using uvx
-uvx --from /path/to/xray xray-mcp --version
+uvx --from /path/to/xray xray --version
 ```
 
 ### 2. Test basic functionality
@@ -205,10 +212,10 @@ class Calculator:
 ### 3. In your AI assistant, test these commands:
 
 ```
-Build the index for the current directory. use XRAY tools
+Map the current directory. use XRAY tools
 ```
 
-Expected: Success message with files indexed
+Expected: Repository tree output
 
 ```
 Find all functions containing "hello". use XRAY tools
@@ -227,8 +234,8 @@ Expected: Impact analysis showing any dependencies
 Once configured, use XRAY by adding "use XRAY tools" to your prompts:
 
 ```
-# Index a codebase
-"Index the src/ directory for analysis. use XRAY tools"
+# Map a codebase
+"Map the src/ directory for analysis. use XRAY tools"
 
 # Find symbols
 "Find all classes that contain 'User' in their name. use XRAY tools"
@@ -267,7 +274,7 @@ chmod +x ~/.local/bin/xray-mcp
 XRAY requires Python 3.10+. Check your version:
 
 ```bash
-python --version
+uv run python --version
 
 # If needed, install Python 3.10+ with uv
 uv python install 3.10
@@ -275,37 +282,23 @@ uv python install 3.10
 
 ### MCP connection issues
 
-1. Check XRAY is running: `xray-mcp --test`
+1. Check the CLI path: `xray map . --max-depth 1`
 2. Verify your MCP config JSON is valid
 3. Restart your AI assistant after config changes
 
-## Advanced Configuration
+## Runtime Model
 
-### Custom Database Location
-
-Set the `XRAY_DB_PATH` environment variable:
-
-```bash
-export XRAY_DB_PATH="$HOME/.xray/databases"
-```
-
-### Debug Mode
-
-Enable debug logging:
-
-```bash
-export XRAY_DEBUG=1
-```
+XRAY is stateless. It runs on-demand analysis against the repository path you pass to the CLI or MCP tool, uses `ast-grep` for structural search, and does not require a database service or persistent project index.
 
 ## What's Next?
 
-1. **Index your first repository**: In your AI assistant, ask it to "Build the index for my project. use XRAY tools"
+1. **Map your first repository**: In your AI assistant, ask it to "Map my project. use XRAY tools"
 
 2. **Explore the tools**:
-   - `build_index` - Visual file tree of your repository
+   - `explore_repo` - Visual file tree of your repository
+   - `read_interface` - File signatures and docstrings without implementation bodies
    - `find_symbol` - Fuzzy search for functions, classes, and methods
    - `what_breaks` - Find what code depends on a symbol (reverse dependencies)
-   - `what_depends` - Find what a symbol depends on (calls and imports)
    
    Note: Results may include matches from comments or strings. The AI assistant will intelligently filter based on context.
 
@@ -324,7 +317,7 @@ This approach avoids the complexity of setting up and managing multiple language
 
 - **10-100x faster** than pip for installations
 - **No virtual environment hassles** - uv manages everything
-- **Reproducible installs** - uv.lock ensures consistency
+- **Reproducible installs** - supports lockfiles when an application wants pinned environments
 - **Built-in Python management** - install any Python version
 - **Global tool management** - like pipx but faster
 

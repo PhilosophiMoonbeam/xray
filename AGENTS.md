@@ -14,6 +14,10 @@ Prefer dynamic subagents for nontrivial work that can be split into independent 
 
 When GitHub remote operations are in scope and authorized, prefer `gh` for PRs, reviews, Actions, releases, repo metadata, and GitHub issues. Use `git` for local repository state. Do not commit, push, merge, or mutate remotes unless explicitly instructed.
 
+## Python
+
+Use `uv` for all Python-related commands, including running modules, scripts, tests, package installs, and temporary tool dependencies. Prefer forms such as `uv run python ...`, `uv run pytest`, `uv run --with pytest pytest`, and `uv tool install ...`.
+
 ## Non-Interactive Shell Commands
 
 **ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.

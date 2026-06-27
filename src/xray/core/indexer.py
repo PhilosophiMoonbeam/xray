@@ -42,6 +42,7 @@ class XRayIndexer:
     def __init__(self, root_path: str):
         self.root_path = Path(root_path).resolve()
         self._cache = {}
+        self.last_warnings: List[str] = []
         self._init_cache()
     
     def _init_cache(self):
@@ -141,6 +142,45 @@ class XRayIndexer:
             self._save_cache()
         
         return "\n".join(tree_lines)
+
+    def explore_repo_data(
+        self,
+        max_depth: Optional[int] = None,
+        include_symbols: bool = False,
+        focus_dirs: Optional[List[str]] = None,
+        max_symbols_per_file: int = 5
+    ) -> Dict[str, Any]:
+        """
+        Build structured repository map data for CLI and automation.
+
+        The text tree remains available through explore_repo for MCP compatibility.
+        """
+        gitignore_patterns = self._parse_gitignore()
+        entries: List[Dict[str, Any]] = []
+        self._collect_tree_entries(
+            self.root_path,
+            entries,
+            gitignore_patterns,
+            current_depth=0,
+            max_depth=max_depth,
+            include_symbols=include_symbols,
+            focus_dirs=focus_dirs,
+            max_symbols_per_file=max_symbols_per_file
+        )
+
+        if include_symbols:
+            self._save_cache()
+
+        return {
+            "root_path": str(self.root_path),
+            "entries": entries,
+            "options": {
+                "max_depth": max_depth,
+                "include_symbols": include_symbols,
+                "focus_dirs": focus_dirs or [],
+                "max_symbols_per_file": max_symbols_per_file,
+            },
+        }
     
     def _parse_gitignore(self) -> Set[str]:
         """Parse .gitignore file if it exists."""
@@ -162,6 +202,13 @@ class XRayIndexer:
     def _should_exclude(self, path: Path, gitignore_patterns: Set[str]) -> bool:
         """Check if a path should be excluded."""
         name = path.name
+
+        if path != self.root_path and not self._is_inside_root(path):
+            return True
+
+        # Avoid following symlinked directories, which can escape the root or cycle.
+        if path.is_symlink() and path.is_dir():
+            return True
         
         # Check default exclusions
         if name in DEFAULT_EXCLUSIONS:
@@ -180,14 +227,132 @@ class XRayIndexer:
                 return True
         
         return False
+
+    def _is_inside_root(self, path: Path) -> bool:
+        """Return whether a path resolves inside the repository root."""
+        try:
+            path.resolve().relative_to(self.root_path)
+            return True
+        except ValueError:
+            return False
     
     def _should_include_dir(self, path: Path, focus_dirs: Optional[List[str]], current_depth: int) -> bool:
         """Check if a directory should be included based on focus_dirs."""
         if not focus_dirs or current_depth > 0:
             return True
+        if path == self.root_path:
+            return True
         
         # At depth 0 (top-level), only include if in focus_dirs
         return path.name in focus_dirs
+
+    def _collect_tree_entries(
+        self,
+        path: Path,
+        entries: List[Dict[str, Any]],
+        gitignore_patterns: Set[str],
+        current_depth: int,
+        max_depth: Optional[int],
+        include_symbols: bool,
+        focus_dirs: Optional[List[str]],
+        max_symbols_per_file: int
+    ):
+        """Collect a flat, structured repository map."""
+        if self._should_exclude(path, gitignore_patterns):
+            return
+
+        if max_depth is not None and current_depth > max_depth:
+            return
+
+        if path.is_dir() and not self._should_include_dir(path, focus_dirs, current_depth):
+            return
+
+        try:
+            relative_path = "." if path == self.root_path else path.relative_to(self.root_path).as_posix()
+        except ValueError:
+            relative_path = str(path)
+
+        entry: Dict[str, Any] = {
+            "path": relative_path,
+            "abs_path": str(path),
+            "name": path.name if path != self.root_path else self.root_path.name,
+            "kind": "directory" if path.is_dir() else "file",
+            "depth": current_depth,
+        }
+
+        language = LANGUAGE_MAP.get(path.suffix.lower()) if path.is_file() else None
+        if language:
+            entry["language"] = language
+
+        if path.is_file() and include_symbols and language:
+            entry["symbols"] = self._get_file_symbol_data(path, max_symbols_per_file)
+
+        entries.append(entry)
+
+        if not path.is_dir():
+            return
+
+        try:
+            children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+            children = [c for c in children if not self._should_exclude(c, gitignore_patterns)]
+
+            if current_depth == 0 and focus_dirs:
+                children = [c for c in children if c.is_file() or c.name in focus_dirs]
+
+            for child in children:
+                self._collect_tree_entries(
+                    child,
+                    entries,
+                    gitignore_patterns,
+                    current_depth + 1,
+                    max_depth,
+                    include_symbols,
+                    focus_dirs,
+                    max_symbols_per_file
+                )
+        except PermissionError:
+            pass
+
+    def _get_file_symbol_data(self, file_path: Path, max_symbols: int) -> List[Dict[str, str]]:
+        """Return structured symbol skeleton data for a source file."""
+        cache_key = self._get_cache_key(file_path)
+        if cache_key not in self._cache:
+            self._get_file_skeleton_enhanced(file_path, max_symbols)
+
+        symbols = self._cache.get(cache_key, [])
+        structured_symbols = []
+        for symbol in symbols[:max_symbols]:
+            signature = symbol.get("signature", "")
+            structured_symbols.append({
+                "name": self._extract_symbol_name(signature) or signature,
+                "type": self._infer_symbol_type(signature),
+                "signature": signature,
+                "doc": symbol.get("doc", ""),
+            })
+
+        if len(symbols) > max_symbols:
+            structured_symbols.append({
+                "name": "...",
+                "type": "truncated",
+                "signature": f"... and {len(symbols) - max_symbols} more",
+                "doc": "",
+            })
+
+        return structured_symbols
+
+    def _infer_symbol_type(self, signature: str) -> str:
+        """Infer a symbol type from a skeleton signature."""
+        if signature.startswith("class "):
+            return "class"
+        if signature.startswith(("def ", "async def ", "function ", "const ", "let ", "var ")):
+            return "function"
+        if signature.startswith("func "):
+            return "function"
+        if signature.startswith("type ") and " struct" in signature:
+            return "struct"
+        if signature.startswith("type ") and " interface" in signature:
+            return "interface"
+        return "symbol"
     
     def _build_tree_recursive_enhanced(
         self, 
@@ -285,18 +450,7 @@ class XRayIndexer:
         Returns function signatures, class definitions, and types, but hides implementation details.
         """
         try:
-            # Resolve path
-            target_path = Path(file_path)
-            if not target_path.is_absolute():
-                target_path = (self.root_path / target_path).resolve()
-            
-            # Security check: ensure inside root
-            try:
-                target_path.relative_to(self.root_path)
-            except ValueError:
-                if not str(target_path).startswith(str(self.root_path)):
-                     # Allow if it's the file itself provided as root, otherwise strictly enforce
-                     pass
+            target_path = self._resolve_file_inside_root(file_path)
 
             if not target_path.exists() or not target_path.is_file():
                 return f"Error: File '{file_path}' not found or is not a file."
@@ -316,6 +470,20 @@ class XRayIndexer:
             
         except Exception as e:
             return f"Error reading interface: {str(e)}"
+
+    def _resolve_file_inside_root(self, file_path: str) -> Path:
+        """Resolve a file path and require it to remain inside the repository root."""
+        target_path = Path(file_path).expanduser()
+        if not target_path.is_absolute():
+            target_path = self.root_path / target_path
+
+        target_path = target_path.resolve()
+        try:
+            target_path.relative_to(self.root_path)
+        except ValueError:
+            raise ValueError(f"File '{file_path}' is outside repository root '{self.root_path}'.")
+
+        return target_path
 
     def _get_file_skeleton_enhanced(self, file_path: Path, max_symbols: int) -> List[str]:
         """Extract enhanced symbol info including signatures and docstrings."""
@@ -458,7 +626,13 @@ class XRayIndexer:
         
         return symbols
     
-    def find_symbol(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def find_symbol(
+        self,
+        query: str,
+        limit: int = 10,
+        min_score: int = 0,
+        include_scores: bool = False
+    ) -> List[Dict[str, Any]]:
         """
         Find symbols matching the query using fuzzy search.
         Uses ast-grep to find all symbols, then fuzzy matches against the query.
@@ -466,13 +640,15 @@ class XRayIndexer:
         Returns a list of the top matching "Exact Symbol" objects.
         """
         all_symbols = []
+        self.last_warnings = []
+        self.last_search_succeeded = False
         
         # Define patterns for different symbol types
         patterns = [
             # Python functions and classes
-            ("def $NAME($$$):", "function"),
-            ("class $NAME($$$):", "class"),
-            ("async def $NAME($$$):", "function"),
+            ("def $NAME($$$)", "function"),
+            ("class $NAME: $$$", "class"),
+            ("class $NAME($$$): $$$", "class"),
             
             # JavaScript/TypeScript functions and classes
             ("function $NAME($$$)", "function"),
@@ -494,14 +670,20 @@ class XRayIndexer:
         for pattern, symbol_type in patterns:
             cmd = [
                 "ast-grep",
+                "run",
                 "--pattern", pattern,
                 "--json",
                 str(self.root_path)
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True)
+            except FileNotFoundError:
+                self.last_warnings.append("ast-grep executable was not found; symbol search could not run.")
+                break
             
             if result.returncode == 0:
+                self.last_search_succeeded = True
                 try:
                     matches = json.loads(result.stdout)
                     for match in matches:
@@ -516,8 +698,9 @@ class XRayIndexer:
                         name = None
                         
                         # Try to get NAME from metavariables
-                        if "NAME" in metavars:
-                            name = metavars["NAME"]["text"]
+                        name_var = self._get_metavariable(metavars, "NAME")
+                        if name_var:
+                            name = name_var.get("text")
                         else:
                             # Fallback to regex extraction
                             name = self._extract_symbol_name(text)
@@ -527,12 +710,16 @@ class XRayIndexer:
                                 "name": name,
                                 "type": symbol_type,
                                 "path": file_path,
-                                "start_line": start.get("line", 1),
-                                "end_line": end.get("line", start.get("line", 1))
+                                "start_line": self._normalize_ast_grep_line(start.get("line")),
+                                "end_line": self._normalize_ast_grep_line(end.get("line", start.get("line")))
                             }
                             all_symbols.append(symbol)
                 except json.JSONDecodeError:
-                    continue
+                    self.last_warnings.append(f"ast-grep returned invalid JSON for pattern {pattern!r}.")
+            else:
+                stderr = result.stderr.strip()
+                detail = f": {stderr}" if stderr else ""
+                self.last_warnings.append(f"ast-grep failed for pattern {pattern!r}{detail}")
         
         # Deduplicate symbols (same name and location)
         seen = set()
@@ -553,13 +740,42 @@ class XRayIndexer:
             if query.lower() in symbol["name"].lower():
                 score = max(score, 80)
             
-            scored_symbols.append((score, symbol))
+            if score >= min_score:
+                scored_symbols.append((score, symbol))
         
         # Sort by score and take top results
         scored_symbols.sort(key=lambda x: x[0], reverse=True)
-        top_symbols = [s[1] for s in scored_symbols[:limit]]
+        if include_scores:
+            top_symbols = []
+            for score, symbol in scored_symbols[:limit]:
+                scored_symbol = dict(symbol)
+                scored_symbol["score"] = score
+                top_symbols.append(scored_symbol)
+        else:
+            top_symbols = [s[1] for s in scored_symbols[:limit]]
         
         return top_symbols
+
+    def _get_metavariable(self, metavars: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:
+        """Return a metavariable from old or current ast-grep JSON shapes."""
+        if name in metavars:
+            value = metavars[name]
+            if isinstance(value, dict):
+                return value
+
+        single_vars = metavars.get("single", {})
+        if isinstance(single_vars, dict):
+            value = single_vars.get(name)
+            if isinstance(value, dict):
+                return value
+
+        return None
+
+    def _normalize_ast_grep_line(self, line: Optional[int]) -> int:
+        """Convert ast-grep zero-based line values to one-based line numbers."""
+        if line is None:
+            return 1
+        return int(line) + 1
     
     def _extract_symbol_name(self, text: str) -> Optional[str]:
         """Extract the symbol name from matched text."""
@@ -583,7 +799,8 @@ class XRayIndexer:
         Prioritizes ast-grep for code references, falls back to text search.
         """
         symbol_name = exact_symbol['name']
-        definition_path = str(Path(exact_symbol['path']).resolve())
+        definition_path_value = exact_symbol.get('abs_path') or exact_symbol['path']
+        definition_path = str(Path(definition_path_value).resolve())
         definition_start = exact_symbol.get('start_line', -1)
         
         references = []
@@ -651,7 +868,9 @@ class XRayIndexer:
                         code_snippet = match.get("lines", "").strip()
                         
                         # Get line number (start)
-                        line_num = match.get("range", {}).get("start", {}).get("line", 0)
+                        line_num = self._normalize_ast_grep_line(
+                            match.get("range", {}).get("start", {}).get("line")
+                        )
                         
                         references.append({
                             "file": match.get("file", ""),

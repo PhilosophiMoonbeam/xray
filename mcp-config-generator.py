@@ -14,8 +14,8 @@ CONFIGS = {
         "local_python": {
             "mcpServers": {
                 "xray": {
-                    "command": "python",
-                    "args": ["-m", "xray.mcp_server"]
+                    "command": "uv",
+                    "args": ["run", "python", "-m", "xray.mcp_server"]
                 }
             }
         },
@@ -30,8 +30,8 @@ CONFIGS = {
         "source": {
             "mcpServers": {
                 "xray": {
-                    "command": "python",
-                    "args": ["run_server.py"],
+                    "command": "uv",
+                    "args": ["run", "xray-mcp"],
                     "cwd": str(Path.cwd())
                 }
             }
@@ -48,8 +48,8 @@ CONFIGS = {
         "local_python": {
             "mcpServers": {
                 "xray": {
-                    "command": "python",
-                    "args": ["-m", "xray.mcp_server"]
+                    "command": "uv",
+                    "args": ["run", "python", "-m", "xray.mcp_server"]
                 }
             }
         },
@@ -60,6 +60,13 @@ CONFIGS = {
                     "args": ["run", "--rm", "-i", "xray"]
                 }
             }
+        },
+        "installed_script": {
+            "mcpServers": {
+                "xray": {
+                    "command": "xray-mcp"
+                }
+            }
         }
     },
     "vscode": {
@@ -68,8 +75,8 @@ CONFIGS = {
                 "servers": {
                     "xray": {
                         "type": "stdio",
-                        "command": "python",
-                        "args": ["-m", "xray.mcp_server"]
+                        "command": "uv",
+                        "args": ["run", "python", "-m", "xray.mcp_server"]
                     }
                 }
             }
@@ -81,6 +88,18 @@ CONFIGS = {
                         "type": "stdio",
                         "command": "docker", 
                         "args": ["run", "--rm", "-i", "xray"]
+                    }
+                }
+            }
+        },
+        "source": {
+            "mcp": {
+                "servers": {
+                    "xray": {
+                        "type": "stdio",
+                        "command": "uv",
+                        "args": ["run", "xray-mcp"],
+                        "cwd": str(Path.cwd())
                     }
                 }
             }
@@ -132,7 +151,7 @@ def main():
     if len(sys.argv) != 3:
         print("XRAY MCP Configuration Generator")
         print()
-        print("Usage: python mcp-config-generator.py <tool> <method>")
+        print("Usage: uv run python mcp-config-generator.py <tool> <method>")
         print()
         print("Available tools:")
         for tool in CONFIGS:
@@ -140,9 +159,9 @@ def main():
             print(f"  {tool}: {methods}")
         print()
         print("Examples:")
-        print("  python mcp-config-generator.py cursor local_python")
-        print("  python mcp-config-generator.py claude docker")
-        print("  python mcp-config-generator.py vscode source")
+        print("  uv run python mcp-config-generator.py cursor local_python")
+        print("  uv run python mcp-config-generator.py claude docker")
+        print("  uv run python mcp-config-generator.py vscode source")
         return 1
     
     tool = sys.argv[1].lower()

@@ -1,22 +1,9 @@
 #!/bin/bash
 
-# XRAY MCP Server Installation Script (uv version)
+# XRAY CLI and MCP Installation Script (uv version)
 # Usage: curl -fsSL https://raw.githubusercontent.com/srijanshukla18/xray/main/install.sh | bash
 
 set -e
-
-# Check if XRAY is already installed and on the PATH
-if command -v xray-mcp &>/dev/null; then
-    echo -e "${GREEN}✓${NC} XRAY is already installed."
-    # Optionally, ask to reinstall
-    read -p "Do you want to reinstall? (y/N) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 0
-    fi
-fi
-
-echo "🚀 Installing XRAY MCP Server with uv..."
 
 # Colors for output
 RED='\033[0;31m'
@@ -24,25 +11,24 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Check if Python 3.10+ is available
-if command -v python3.11 &>/dev/null; then
-    PYTHON_CMD="python3.11"
-elif command -v python3 &>/dev/null; then
-    PYTHON_CMD="python3"
-else
-    echo -e "${RED}❌${NC} Python 3 is not installed."
-    exit 1
-fi
+echo "🚀 Installing XRAY code intelligence CLI with MCP compatibility..."
 
-PYTHON_VERSION=$($PYTHON_CMD -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-PYTHON_MAJOR=$(echo $PYTHON_VERSION | cut -d. -f1)
-PYTHON_MINOR=$(echo $PYTHON_VERSION | cut -d. -f2)
-
-if [ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -ge 10 ]; then
-    echo -e "${GREEN}✓${NC} Found Python $PYTHON_VERSION"
-else
-    echo -e "${RED}❌${NC} Python $PYTHON_VERSION found, but 3.10+ is required"
-    exit 1
+# Check if XRAY is already installed and on the PATH
+if command -v xray &>/dev/null; then
+    echo -e "${GREEN}✓${NC} XRAY CLI is already installed."
+    if [ "${XRAY_INSTALL_FORCE:-}" != "1" ]; then
+        if [ -t 0 ]; then
+            # Optionally, ask to reinstall for interactive users.
+            read -p "Do you want to reinstall? (y/N) " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                exit 0
+            fi
+        else
+            echo "Set XRAY_INSTALL_FORCE=1 to reinstall in non-interactive shells."
+            exit 0
+        fi
+    fi
 fi
 
 # Check if uv is installed
@@ -73,10 +59,18 @@ else
     echo -e "${GREEN}✓${NC} uv is already installed"
 fi
 
+PYTHON_VERSION=$(uv run python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+echo -e "${GREEN}✓${NC} uv Python $PYTHON_VERSION is available"
+
+CURRENT_GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+
 # Determine installation directory
-if git rev-parse --is-inside-work-tree &> /dev/null; then
-    INSTALL_DIR=$(pwd)
-    echo -e "${GREEN}✓${NC} Installing from current Git repository: $INSTALL_DIR"
+if [ -n "$CURRENT_GIT_ROOT" ] \
+    && [ -f "$CURRENT_GIT_ROOT/pyproject.toml" ] \
+    && [ -d "$CURRENT_GIT_ROOT/src/xray" ] \
+    && grep -q '^name = "xray"' "$CURRENT_GIT_ROOT/pyproject.toml"; then
+    INSTALL_DIR="$CURRENT_GIT_ROOT"
+    echo -e "${GREEN}✓${NC} Installing from current XRAY repository: $INSTALL_DIR"
     SKIP_CLONE=true
 else
     INSTALL_DIR="$HOME/.xray"
@@ -110,9 +104,6 @@ if [ "$SKIP_CLONE" = false ]; then
 else
     # If installing from current repo, just change to it for uv tool install
     cd "$INSTALL_DIR"
-    # Clean uv cache to ensure local changes are picked up
-    echo -e "${YELLOW}🧹${NC} Cleaning uv cache..."
-    uv clean
 fi
 
 # Install XRAY as a uv tool
@@ -126,20 +117,24 @@ uv tool update-shell
 export PATH="$HOME/.local/bin:$PATH"
 
 # Verify installation
-if command -v xray-mcp &> /dev/null; then
-    echo -e "${GREEN}✓${NC} XRAY installed successfully!"
-else
-    echo -e "${RED}❌${NC} Installation failed"
+if ! command -v xray &> /dev/null; then
+    echo -e "${RED}❌${NC} Installation failed: xray CLI is not on PATH"
     exit 1
 fi
 
-# Run verification test
-echo -e "${YELLOW}🧪${NC} Running installation test..."
+if ! command -v xray-mcp &> /dev/null; then
+    echo -e "${RED}❌${NC} Installation failed: xray-mcp compatibility command is not on PATH"
+    exit 1
+fi
+
+# Run verification smoke tests
+echo -e "${YELLOW}🧪${NC} Running installation smoke tests..."
 cd "$INSTALL_DIR"
-if $PYTHON_CMD test_installation.py; then
-    echo -e "${GREEN}✓${NC} All tests passed!"
+if xray --version >/dev/null && xray map "$INSTALL_DIR" --max-depth 0 >/dev/null; then
+    echo -e "${GREEN}✓${NC} CLI smoke tests passed"
 else
-    echo -e "${YELLOW}⚠${NC} Some tests failed, but installation completed"
+    echo -e "${RED}❌${NC} CLI smoke tests failed"
+    exit 1
 fi
 
 # Show next steps
@@ -147,14 +142,18 @@ echo ""
 echo -e "${GREEN}✅ XRAY installed successfully!${NC}"
 echo ""
 echo "🎯 Quick Start:"
-echo "1. Add this to your MCP config:"
+echo "1. Use the agent CLI:"
+echo "   xray map /path/to/project --max-depth 2"
+echo "   xray find /path/to/project \"UserService\""
+echo ""
+echo "2. Optional MCP compatibility config:"
 echo '   {"mcpServers": {"xray": {"command": "xray-mcp"}}}'
 echo ""
-echo "2. Use in prompts:"
+echo "3. Use in prompts:"
 echo '   "Analyze this codebase for dependencies. use XRAY tools"'
 echo ""
 echo "📚 Full documentation:"
 echo "   https://github.com/srijanshukla18/xray"
 echo ""
 echo "💡 Tip: You can also run XRAY without installation using:"
-echo "   uvx --from $INSTALL_DIR xray-mcp"
+echo "   uvx --from $INSTALL_DIR xray map . --max-depth 2"
