@@ -12,6 +12,13 @@ from typing import Dict, List, Optional, Any, Set, Tuple
 import fnmatch
 from thefuzz import fuzz
 
+from xray.core.ast_grep import (
+    AstGrepCommandError,
+    AstGrepNotFoundError,
+    parse_json_array,
+    run_ast_grep,
+)
+
 # Default exclusions
 DEFAULT_EXCLUSIONS = {
     # Directories
@@ -669,65 +676,52 @@ class XRayIndexer:
             ("type $NAME interface", "interface"),
         ]
         
-        # Run ast-grep for each pattern
+        # Run ast-grep for each fixed symbol pattern.
         for pattern, symbol_type in patterns:
-            cmd = [
-                "ast-grep",
-                "run",
-                "--pattern", pattern,
-                "--json",
-                str(self.root_path)
-            ]
-            
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True)
-            except FileNotFoundError:
-                self.last_warnings.append("ast-grep executable was not found; symbol search could not run.")
+                result = run_ast_grep(["run", "--pattern", pattern, "--json", str(self.root_path)])
+            except AstGrepNotFoundError as exc:
+                self.last_warnings.append(str(exc))
                 break
-            
-            if result.returncode in (0, 1):
-                self.last_search_succeeded = True
-                try:
-                    matches = json.loads(result.stdout or "[]")
-                    if not isinstance(matches, list):
-                        self.last_warnings.append(f"ast-grep returned unexpected JSON for pattern {pattern!r}.")
-                        continue
-                    for match in matches:
-                        # Extract details from match
-                        text = match.get("text", "")
-                        file_path = match.get("file", "")
-                        start = match.get("range", {}).get("start", {})
-                        end = match.get("range", {}).get("end", {})
-                        
-                        # Extract the name from metavariables
-                        metavars = match.get("metaVariables", {})
-                        name = None
-                        
-                        # Try to get NAME from metavariables
-                        name_var = self._get_metavariable(metavars, "NAME")
-                        if name_var:
-                            name = name_var.get("text")
-                        else:
-                            # Fallback to regex extraction
-                            name = self._extract_symbol_name(text)
-                        
-                        if name:
-                            symbol = {
-                                "name": name,
-                                "type": symbol_type,
-                                "path": file_path,
-                                "start_line": self._normalize_ast_grep_line(start.get("line")),
-                                "end_line": self._normalize_ast_grep_line(end.get("line", start.get("line")))
-                            }
-                            all_symbols.append(symbol)
-                except json.JSONDecodeError:
-                    self.last_warnings.append(f"ast-grep returned invalid JSON for pattern {pattern!r}.")
-                if result.returncode == 1 and result.stderr.strip():
-                    self.last_warnings.append(f"ast-grep reported no matches for pattern {pattern!r}: {result.stderr.strip()}")
-            else:
-                stderr = result.stderr.strip()
-                detail = f": {stderr}" if stderr else ""
-                self.last_warnings.append(f"ast-grep failed for pattern {pattern!r}{detail}")
+            except AstGrepCommandError as exc:
+                self.last_warnings.append(f"ast-grep failed for pattern {pattern!r}: {exc}")
+                continue
+
+            self.last_search_succeeded = True
+            try:
+                matches = parse_json_array(result.stdout)
+            except (json.JSONDecodeError, ValueError) as exc:
+                self.last_warnings.append(f"ast-grep returned invalid JSON for pattern {pattern!r}: {exc}")
+                continue
+
+            for match in matches:
+                # Extract details from match
+                text = match.get("text", "")
+                file_path = match.get("file", "")
+                start = match.get("range", {}).get("start", {})
+                end = match.get("range", {}).get("end", {})
+                
+                # Extract the name from metavariables
+                metavars = match.get("metaVariables", {})
+                name = None
+                
+                # Try to get NAME from metavariables
+                name_var = self._get_metavariable(metavars, "NAME")
+                if name_var:
+                    name = name_var.get("text")
+                else:
+                    # Fallback to regex extraction
+                    name = self._extract_symbol_name(text)
+                
+                if name:
+                    symbol = {
+                        "name": name,
+                        "type": symbol_type,
+                        "path": file_path,
+                        "start_line": self._normalize_ast_grep_line(start.get("line")),
+                        "end_line": self._normalize_ast_grep_line(end.get("line", start.get("line")))
+                    }
+                    all_symbols.append(symbol)
         
         # Deduplicate symbols (same name and location)
         seen = set()
@@ -855,41 +849,30 @@ class XRayIndexer:
         """Search for symbol usages using ast-grep."""
         references = []
         try:
-            # Use simple pattern matching the identifier
-            cmd = [
-                "ast-grep",
+            result = run_ast_grep([
                 "run",
                 "--pattern", symbol_name,
                 "--json",
                 "-C", str(context_lines),
-                str(self.root_path)
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                try:
-                    matches = json.loads(result.stdout)
-                    for match in matches:
-                        # Extract lines with context
-                        # ast-grep json with -C returns 'lines' containing the snippet
-                        code_snippet = match.get("lines", "").strip()
-                        
-                        # Get line number (start)
-                        line_num = self._normalize_ast_grep_line(
-                            match.get("range", {}).get("start", {}).get("line")
-                        )
-                        
-                        references.append({
-                            "file": match.get("file", ""),
-                            "line": line_num,
-                            "text": code_snippet,
-                            "type": "code"
-                        })
-                except json.JSONDecodeError:
-                    pass
-        except FileNotFoundError:
-            pass
+                str(self.root_path),
+            ])
+            matches = parse_json_array(result.stdout)
+        except (AstGrepCommandError, AstGrepNotFoundError, json.JSONDecodeError, ValueError):
+            return references
+
+        for match in matches:
+            # ast-grep json with -C returns 'lines' containing the snippet.
+            code_snippet = match.get("lines", "").strip()
+            line_num = self._normalize_ast_grep_line(
+                match.get("range", {}).get("start", {}).get("line")
+            )
+
+            references.append({
+                "file": match.get("file", ""),
+                "line": line_num,
+                "text": code_snippet,
+                "type": "code"
+            })
             
         return references
 

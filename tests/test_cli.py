@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from xray import mcp_server
 from xray import cli
+from xray.core.ast_grep import AstGrepCommandError, AstGrepNotFoundError, AstGrepResult
 
 
 def write_sample_repo(tmp_path: Path) -> Path:
@@ -208,12 +209,9 @@ def test_find_cli_finds_js_function_expression(tmp_path, capsys):
 def test_find_cli_reports_missing_ast_grep_as_json_error(tmp_path, capsys):
     repo = write_sample_repo(tmp_path)
 
-    def fake_run(cmd, *args, **kwargs):
-        if cmd[0] == "git":
-            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
-        raise FileNotFoundError
-
-    with patch("xray.core.indexer.subprocess.run", side_effect=fake_run):
+    with patch("xray.core.indexer.run_ast_grep", side_effect=AstGrepNotFoundError(
+        "ast-grep executable was not found; symbol search could not run."
+    )):
         exit_code = cli.main(["find", str(repo), "target"])
 
     assert exit_code == 1
@@ -225,19 +223,9 @@ def test_find_cli_reports_missing_ast_grep_as_json_error(tmp_path, capsys):
 
 def test_find_cli_reports_ast_grep_nonzero_as_json_error(tmp_path, capsys):
     repo = write_sample_repo(tmp_path)
-    failed = subprocess.CompletedProcess(
-        args=["ast-grep"],
-        returncode=2,
-        stdout="",
-        stderr="parser failed",
-    )
-
-    def fake_run(cmd, *args, **kwargs):
-        if cmd[0] == "git":
-            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
-        return failed
-
-    with patch("xray.core.indexer.subprocess.run", side_effect=fake_run):
+    with patch("xray.core.indexer.run_ast_grep", side_effect=AstGrepCommandError(
+        "ast-grep failed with exit code 2: parser failed"
+    )):
         exit_code = cli.main(["find", str(repo), "target"])
 
     assert exit_code == 1
@@ -261,27 +249,17 @@ def test_find_cli_keeps_success_when_results_exist_with_warnings(tmp_path, capsy
             }
         },
     }
-    successful = subprocess.CompletedProcess(
-        args=["ast-grep"],
-        returncode=0,
-        stdout=json.dumps([match]),
-        stderr="",
-    )
-    failed = subprocess.CompletedProcess(
-        args=["ast-grep"],
-        returncode=2,
-        stdout="",
-        stderr="one pattern failed",
-    )
+    successful = AstGrepResult(stdout=json.dumps([match]), stderr="", returncode=0)
 
     ast_grep_results = iter([successful])
 
     def fake_run(cmd, *args, **kwargs):
-        if cmd[0] == "git":
-            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
-        return next(ast_grep_results, failed)
+        try:
+            return next(ast_grep_results)
+        except StopIteration:
+            raise AstGrepCommandError("ast-grep failed with exit code 2: one pattern failed")
 
-    with patch("xray.core.indexer.subprocess.run", side_effect=fake_run):
+    with patch("xray.core.indexer.run_ast_grep", side_effect=fake_run):
         exit_code = cli.main(["find", str(repo), "target"])
 
     assert exit_code == 0
