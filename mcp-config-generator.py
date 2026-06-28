@@ -8,7 +8,10 @@ import json
 import sys
 from pathlib import Path
 
-CONFIGS = {
+ConfigPayload = dict[str, object]
+ConfigMethods = dict[str, ConfigPayload]
+
+CONFIGS: dict[str, ConfigMethods] = {
     "cursor": {
         "local_python": {"mcpServers": {"xray": {"command": "uv", "args": ["run", "python", "-m", "xray.mcp_server"]}}},
         "docker": {"mcpServers": {"xray": {"command": "docker", "args": ["run", "--rm", "-i", "xray"]}}},
@@ -45,7 +48,7 @@ CONFIGS = {
 EXPECTED_ARG_COUNT = 3
 
 
-def print_config(tool, method):
+def print_config(tool: str, method: str) -> bool:
     """Print MCP configuration for specified tool and method."""
     if tool not in CONFIGS:
         print(f"❌ Unknown tool: {tool}")
@@ -76,7 +79,7 @@ def print_config(tool, method):
     return True
 
 
-def main():
+def main() -> int:
     if len(sys.argv) != EXPECTED_ARG_COUNT:
         print("XRAY MCP Configuration Generator")
         print()

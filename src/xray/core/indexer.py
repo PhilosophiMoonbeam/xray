@@ -9,8 +9,9 @@ import pickle
 import re
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, cast
 
 from thefuzz import fuzz
 
@@ -67,6 +68,74 @@ LANGUAGE_MAP = {
     ".tsx": "typescript",
     ".go": "go",
 }
+
+
+class SymbolSkeleton(TypedDict):
+    signature: str
+    doc: str
+
+
+class ExploreSymbol(TypedDict):
+    name: str
+    type: str
+    signature: str
+    doc: str
+
+
+class ExploreEntryBase(TypedDict):
+    path: str
+    abs_path: str
+    name: str
+    kind: str
+    depth: int
+
+
+class ExploreEntry(ExploreEntryBase, total=False):
+    language: str
+    symbols: list[ExploreSymbol]
+
+
+class ExploreOptions(TypedDict):
+    max_depth: int | None
+    include_symbols: bool
+    focus_dirs: list[str]
+    max_symbols_per_file: int
+
+
+class ExploreRepoData(TypedDict):
+    root_path: str
+    entries: list[ExploreEntry]
+    options: ExploreOptions
+
+
+class SymbolMatchBase(TypedDict):
+    name: str
+    type: str
+    path: str
+    start_line: int
+    end_line: int
+
+
+class SymbolMatch(SymbolMatchBase, total=False):
+    score: int
+    abs_path: str
+
+
+class ImpactReferenceBase(TypedDict):
+    file: str
+    line: int
+    text: str
+
+
+class ImpactReference(ImpactReferenceBase, total=False):
+    type: str
+
+
+class ImpactResult(TypedDict):
+    references: list[ImpactReference]
+    total_count: int
+    strategy: str
+    note: str
 
 
 class XRayIndexer:
@@ -194,14 +263,14 @@ class XRayIndexer:
         include_symbols: bool = False,
         focus_dirs: list[str] | None = None,
         max_symbols_per_file: int = 5,
-    ) -> dict[str, Any]:
+    ) -> ExploreRepoData:
         """
         Build structured repository map data for CLI and automation.
 
         The text tree remains available through explore_repo for MCP compatibility.
         """
         gitignore_patterns = self._parse_gitignore()
-        entries: list[dict[str, Any]] = []
+        entries: list[ExploreEntry] = []
         self._collect_tree_entries(
             self.root_path,
             entries,
@@ -294,7 +363,7 @@ class XRayIndexer:
     def _collect_tree_entries(
         self,
         path: Path,
-        entries: list[dict[str, Any]],
+        entries: list[ExploreEntry],
         gitignore_patterns: set[str],
         current_depth: int,
         max_depth: int | None,
@@ -317,7 +386,7 @@ class XRayIndexer:
         except ValueError:
             relative_path = str(path)
 
-        entry: dict[str, Any] = {
+        entry: ExploreEntry = {
             "path": relative_path,
             "abs_path": str(path),
             "name": path.name if path != self.root_path else self.root_path.name,
@@ -358,14 +427,14 @@ class XRayIndexer:
         except PermissionError:
             pass
 
-    def _get_file_symbol_data(self, file_path: Path, max_symbols: int) -> list[dict[str, str]]:
+    def _get_file_symbol_data(self, file_path: Path, max_symbols: int) -> list[ExploreSymbol]:
         """Return structured symbol skeleton data for a source file."""
         cache_key = self._get_cache_key(file_path)
         if cache_key not in self._cache:
             self._get_file_skeleton_enhanced(file_path, max_symbols)
 
         symbols = self._cache.get(cache_key, [])
-        structured_symbols = []
+        structured_symbols: list[ExploreSymbol] = []
         for symbol in symbols[:max_symbols]:
             signature = symbol.get("signature", "")
             structured_symbols.append(
@@ -561,7 +630,7 @@ class XRayIndexer:
         except Exception:
             return []
 
-    def _format_enhanced_skeleton(self, symbols: list[dict[str, str]], max_symbols: int) -> list[str]:
+    def _format_enhanced_skeleton(self, symbols: list[SymbolSkeleton], max_symbols: int) -> list[str]:
         """Format enhanced symbol info for display."""
         if not symbols:
             return []
@@ -581,9 +650,9 @@ class XRayIndexer:
 
         return lines
 
-    def _extract_python_symbols_enhanced(self, content: str) -> list[dict[str, str]]:
+    def _extract_python_symbols_enhanced(self, content: str) -> list[SymbolSkeleton]:
         """Extract Python symbols with signatures and docstrings."""
-        symbols = []
+        symbols: list[SymbolSkeleton] = []
         try:
             tree = ast.parse(content)
             for node in ast.iter_child_nodes(tree):
@@ -628,9 +697,9 @@ class XRayIndexer:
             pass
         return symbols
 
-    def _extract_regex_symbols_enhanced(self, content: str, language: str) -> list[dict[str, str]]:
+    def _extract_regex_symbols_enhanced(self, content: str, language: str) -> list[SymbolSkeleton]:
         """Extract symbols with signatures and comments for JS/TS/Go."""
-        symbols = []
+        symbols: list[SymbolSkeleton] = []
 
         # Language-specific patterns
         if language in ["javascript", "typescript"]:
@@ -684,20 +753,20 @@ class XRayIndexer:
         # Apply patterns
         for pattern, extractor in patterns:
             for match in re.finditer(pattern, content, re.MULTILINE):
-                symbols.append(extractor(match))
+                symbols.append(cast(SymbolSkeleton, extractor(match)))
 
         return symbols
 
     def find_symbol(
         self, query: str, limit: int = 10, min_score: int = 0, include_scores: bool = False
-    ) -> list[dict[str, Any]]:
+    ) -> list[SymbolMatch]:
         """
         Find symbols matching the query using fuzzy search.
         Uses ast-grep to find all symbols, then fuzzy matches against the query.
 
         Returns a list of the top matching "Exact Symbol" objects.
         """
-        all_symbols = []
+        all_symbols: list[SymbolMatch] = []
         self.last_warnings = []
         self.last_search_succeeded = False
 
@@ -754,18 +823,20 @@ class XRayIndexer:
 
                 # Extract the name from metavariables
                 metavars = match.get("metaVariables", {})
-                name = None
+                name: str | None = None
 
                 # Try to get NAME from metavariables
                 name_var = self._get_metavariable(metavars, "NAME")
                 if name_var:
-                    name = name_var.get("text")
+                    name_text = name_var.get("text")
+                    if isinstance(name_text, str):
+                        name = name_text
                 else:
                     # Fallback to regex extraction
                     name = self._extract_symbol_name(text)
 
                 if name:
-                    symbol = {
+                    symbol: SymbolMatch = {
                         "name": name,
                         "type": symbol_type,
                         "path": file_path,
@@ -776,7 +847,7 @@ class XRayIndexer:
 
         # Deduplicate symbols (same name and location)
         seen = set()
-        unique_symbols = []
+        unique_symbols: list[SymbolMatch] = []
         for symbol in all_symbols:
             key = (symbol["name"], symbol["path"], symbol["start_line"])
             if key not in seen:
@@ -784,7 +855,7 @@ class XRayIndexer:
                 unique_symbols.append(symbol)
 
         # Now perform fuzzy matching against the query
-        scored_symbols = []
+        scored_symbols: list[tuple[int, SymbolMatch]] = []
         query_lower = query.lower()
         for symbol in unique_symbols:
             symbol_name_lower = symbol["name"].lower()
@@ -804,10 +875,9 @@ class XRayIndexer:
             reverse=True,
         )
         if include_scores:
-            top_symbols = []
+            top_symbols: list[SymbolMatch] = []
             for score, symbol in scored_symbols[:limit]:
-                scored_symbol = dict(symbol)
-                scored_symbol["score"] = score
+                scored_symbol: SymbolMatch = {**symbol, "score": score}
                 top_symbols.append(scored_symbol)
         else:
             top_symbols = [s[1] for s in scored_symbols[:limit]]
@@ -851,7 +921,7 @@ class XRayIndexer:
 
         return None
 
-    def what_breaks(self, exact_symbol: dict[str, Any], context_lines: int = 2) -> dict[str, Any]:
+    def what_breaks(self, exact_symbol: Mapping[str, Any], context_lines: int = 2) -> ImpactResult:
         """
         Find what uses a symbol (reverse dependencies) using structural search.
         Prioritizes ast-grep for code references, falls back to text search.
@@ -861,7 +931,7 @@ class XRayIndexer:
         definition_path = str(Path(definition_path_value).resolve())
         definition_start = exact_symbol.get("start_line", -1)
 
-        references = []
+        references: list[ImpactReference] = []
         strategy = "structural"
 
         # Try structural search first (ast-grep)
@@ -901,9 +971,9 @@ class XRayIndexer:
             "note": f"Found {len(references)} references using {strategy} search.",
         }
 
-    def _ast_grep_search(self, symbol_name: str, context_lines: int) -> list[dict[str, Any]]:
+    def _ast_grep_search(self, symbol_name: str, context_lines: int) -> list[ImpactReference]:
         """Search for symbol usages using ast-grep."""
-        references = []
+        references: list[ImpactReference] = []
         try:
             result = run_ast_grep(
                 [
@@ -929,9 +999,9 @@ class XRayIndexer:
 
         return references
 
-    def _text_search(self, symbol_name: str, context_lines: int) -> list[dict[str, Any]]:
+    def _text_search(self, symbol_name: str, context_lines: int) -> list[ImpactReference]:
         """Unified text search (ripgrep -> python fallback)."""
-        references = []
+        references: list[ImpactReference] = []
 
         # Try ripgrep
         try:
@@ -961,9 +1031,9 @@ class XRayIndexer:
         # Python fallback (simplified, no context for now to save complexity)
         return self._python_text_search(symbol_name)
 
-    def _python_text_search(self, symbol_name: str) -> list[dict[str, Any]]:
+    def _python_text_search(self, symbol_name: str) -> list[ImpactReference]:
         """Fallback text search using Python when ripgrep is not available."""
-        references = []
+        references: list[ImpactReference] = []
         gitignore_patterns = self._parse_gitignore()
 
         # Create word boundary pattern

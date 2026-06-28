@@ -13,6 +13,7 @@ ROOT = Path(__file__).parents[1]
 def load_config_generator():
     module_path = ROOT / "mcp-config-generator.py"
     spec = importlib.util.spec_from_file_location("mcp_config_generator", module_path)
+    assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -29,6 +30,8 @@ def test_project_metadata_is_cli_first_with_mcp_compatibility():
     assert "agents" in project["keywords"]
     assert project["scripts"]["xray"] == "xray.cli:main"
     assert project["scripts"]["xray-mcp"] == "xray.mcp_server:main"
+    assert "pydantic>=2.0,<3" in project["dependencies"]
+    assert "pyright>=1.1.407" in data["dependency-groups"]["dev"]
     assert "pytest>=9.0.0" in data["dependency-groups"]["dev"]
     assert "ruff>=0.14.0" in data["dependency-groups"]["dev"]
     assert "vulture>=2.14" in data["dependency-groups"]["dev"]
@@ -45,6 +48,20 @@ def test_quality_tooling_is_configured_for_repo_layout():
     assert data["tool"]["vulture"]["paths"] == ["src", "mcp-config-generator.py"]
     assert "test_samples" in data["tool"]["vulture"]["exclude"]
     assert data["tool"]["vulture"]["min_confidence"] == 80
+    assert data["tool"]["pyright"]["include"] == [
+        "src",
+        "mcp-config-generator.py",
+        "tests",
+    ]
+    assert "tests" not in data["tool"]["pyright"]["exclude"]
+    assert data["tool"]["pyright"]["pythonVersion"] == "3.10"
+    assert data["tool"]["pyright"]["typeCheckingMode"] == "standard"
+    assert data["tool"]["pyright"]["strict"] == [
+        "src/xray/models.py",
+        "src/xray/core/ast_grep.py",
+        "mcp-config-generator.py",
+    ]
+    assert data["tool"]["pyright"]["reportMissingTypeStubs"] is False
 
 
 def test_fastmcp_dependency_requires_verified_modern_surface():

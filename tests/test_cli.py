@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 import tomllib
@@ -13,6 +14,18 @@ import tomllib
 from xray import cli, mcp_server
 from xray.core.ast_grep import AstGrepCommandError, AstGrepNotFoundError, AstGrepResult
 from xray.core.indexer import XRayIndexer
+
+
+def structured_content(result: Any) -> dict[str, Any]:
+    content = result.structured_content
+    assert content is not None
+    return cast(dict[str, Any], content)
+
+
+def text_content(value: Any) -> str:
+    text = getattr(value, "text", None)
+    assert isinstance(text, str)
+    return text
 
 
 def write_sample_repo(tmp_path: Path) -> Path:
@@ -283,6 +296,8 @@ def test_indexer_cache_dir_is_scoped_by_root_path(tmp_path):
         indexer_a = XRayIndexer(str(repo_a))
         indexer_b = XRayIndexer(str(repo_b))
 
+    assert indexer_a.cache_dir is not None
+    assert indexer_b.cache_dir is not None
     assert indexer_a.cache_dir != indexer_b.cache_dir
     assert indexer_a.cache_dir.name.endswith("-abc123")
     assert indexer_b.cache_dir.name.endswith("-abc123")
@@ -303,6 +318,7 @@ def test_indexer_save_cache_writes_readable_pickle(tmp_path):
     indexer._cache = {"sample": [{"signature": "def target_function(value):", "doc": ""}]}
     indexer._save_cache()
 
+    assert indexer.cache_dir is not None
     cache_file = indexer.cache_dir / "symbols.pkl"
     with open(cache_file, "rb") as f:
         saved = pickle.load(f)
@@ -493,11 +509,11 @@ def test_mcp_tool_surface_is_search_first_with_compact_metadata(tmp_path):
 
     assert [tool.name for tool in tools] == ["search_tools", "call_tool"]
     assert all("PROGRESSIVE DISCOVERY WORKFLOW" not in (tool.description or "") for tool in tools)
-    matches = search_result.structured_content["result"]
+    matches = structured_content(search_result)["result"]
     assert [match["name"] for match in matches] == ["what_breaks"]
     assert matches[0]["description"] == "Find usages, callers, references, and dependency impact for a symbol change."
     assert matches[0]["inputSchema"]["properties"]["exact_symbol"]["description"].startswith("Full symbol object")
-    assert call_result.structured_content["result"].startswith(str(repo))
+    assert structured_content(call_result)["result"].startswith(str(repo))
 
 
 def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path):
@@ -516,7 +532,7 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
 
         async with Client(mcp_server.mcp) as client:
             searches = {
-                term: (await client.call_tool("search_tools", {"pattern": term})).structured_content["result"]
+                term: structured_content(await client.call_tool("search_tools", {"pattern": term}))["result"]
                 for term in [
                     "map",
                     "tree",
@@ -592,13 +608,13 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
             }
             assert all(property_schema.get("description") for property_schema in properties.values())
 
-    assert calls["explore_repo"].structured_content["result"].startswith(str(repo))
+    assert structured_content(calls["explore_repo"])["result"].startswith(str(repo))
     assert any(
         symbol_result["name"] == "target_function"
-        for symbol_result in calls["find_symbol"].structured_content["result"]
+        for symbol_result in structured_content(calls["find_symbol"])["result"]
     )
-    assert "def target_function(value):" in calls["read_interface"].structured_content["result"]
-    impact = calls["what_breaks"].structured_content
+    assert "def target_function(value):" in structured_content(calls["read_interface"])["result"]
+    impact = structured_content(calls["what_breaks"])
     assert impact["total_count"] >= 1
     assert all(reference["line"] >= 1 for reference in impact["references"])
 
@@ -631,10 +647,10 @@ def test_mcp_explore_reports_context_progress(tmp_path):
 
     search_result, call_result = asyncio.run(call_explore())
 
-    match = search_result.structured_content["result"][0]
+    match = structured_content(search_result)["result"][0]
     assert match["name"] == "explore_repo"
     assert "ctx" not in match["inputSchema"]["properties"]
-    assert call_result.structured_content["result"].startswith(str(repo))
+    assert structured_content(call_result)["result"].startswith(str(repo))
     assert progress_events == [
         (0.0, 2.0, "normalizing repository path"),
         (1.0, 2.0, "building repository map"),
@@ -662,12 +678,14 @@ def test_async_mcp_find_symbol_offloads_blocking_indexer(tmp_path, monkeypatch):
         started.set()
         if not release.wait(timeout=2):
             raise AssertionError("blocking operation was not released")
-        return [{"name": "target_function"}]
+        return [
+            {"name": "target_function", "path": str(repo / "src" / "sample.py"), "type": "function", "start_line": 1}
+        ]
 
     monkeypatch.setattr(mcp_server, "run_indexer_operation", fake_run_indexer_operation)
 
     async def exercise():
-        task = asyncio.create_task(mcp_server.find_symbol(str(repo), "target", FakeContext()))
+        task = asyncio.create_task(mcp_server.find_symbol(str(repo), "target", cast(Any, FakeContext())))
         assert await asyncio.to_thread(started.wait, 1)
         result = await asyncio.wait_for(asyncio.sleep(0, result="event loop alive"), timeout=0.1)
         release.set()
@@ -676,7 +694,9 @@ def test_async_mcp_find_symbol_offloads_blocking_indexer(tmp_path, monkeypatch):
     loop_probe, symbols = asyncio.run(exercise())
 
     assert loop_probe == "event loop alive"
-    assert symbols == [{"name": "target_function"}]
+    assert symbols[0]["name"] == "target_function"
+    assert symbols[0]["type"] == "function"
+    assert symbols[0]["start_line"] == 1
 
 
 def test_mcp_concurrent_call_tool_requests_succeed_same_and_multi_root(tmp_path):
@@ -739,7 +759,8 @@ def test_mcp_concurrent_call_tool_requests_succeed_same_and_multi_root(tmp_path)
     same_root, multi_root = asyncio.run(call_concurrently())
 
     def payload(result):
-        return result.structured_content.get("result", result.structured_content)
+        content = structured_content(result)
+        return content.get("result", content)
 
     same_results = [payload(result) for result in same_root]
     assert same_results[0].startswith(str(repo_a))
@@ -781,16 +802,20 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     assert [(prompt_def.name, prompt_def.description) for prompt_def in prompts] == [
         ("xray_discovery_plan", "Plan a compact XRAY discovery sequence for a code task.")
     ]
-    assert workflow[0].text.startswith("# XRAY Progressive Discovery")
-    assert "map -> find -> interface -> impact" in workflow[0].text
+    workflow_text = text_content(workflow[0])
+    assert workflow_text.startswith("# XRAY Progressive Discovery")
+    assert "map -> find -> interface -> impact" in workflow_text
     xray_workflow = next(resource for resource in resources if str(resource.uri) == "xray://workflow")
-    assert xray_workflow.annotations.readOnlyHint is True
-    assert xray_workflow.annotations.idempotentHint is True
-    assert skill[0].text.startswith("# XRAY Progressive Discovery")
-    assert "search_tools" in skill[0].text
-    assert "signature" in skill[0].text
-    assert "dependency" in skill[0].text
-    prompt_text = prompt.messages[0].content.text
+    annotations = xray_workflow.annotations
+    assert annotations is not None
+    assert getattr(annotations, "readOnlyHint") is True
+    assert getattr(annotations, "idempotentHint") is True
+    skill_text = text_content(skill[0])
+    assert skill_text.startswith("# XRAY Progressive Discovery")
+    assert "search_tools" in skill_text
+    assert "signature" in skill_text
+    assert "dependency" in skill_text
+    prompt_text = text_content(prompt.messages[0].content)
     assert prompt_text.startswith("Goal: review impact")
     assert "Fetch xray://workflow" in prompt_text
 
@@ -834,6 +859,23 @@ def test_impact_cli_rejects_missing_symbol_source(tmp_path, capsys):
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
     assert error["error"] == "Provide exactly one symbol source: --symbol-json, --symbol-file, or --name with --path."
+
+
+def test_impact_cli_validates_symbol_json_with_pydantic(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+
+    exit_code = cli.main(["impact", str(repo), "--symbol-json", json.dumps({"path": "src/sample.py"})])
+
+    assert exit_code == 2
+    error = json.loads(capsys.readouterr().err)
+    assert error["ok"] is False
+    assert "Symbol input field 'name'" in error["error"]
+
+
+def test_mcp_what_breaks_validates_symbol_input():
+    result = mcp_server.what_breaks({"path": "/tmp/sample.py"})
+
+    assert result["error"].startswith("Error finding references: Symbol input field 'name'")
 
 
 def test_map_alias_matches_explore(tmp_path, capsys):

@@ -339,8 +339,11 @@ Quality checks:
 ```bash
 uv run ruff format .
 uv run ruff check .
+uv run pyright
 uv run vulture
 ```
+
+Pyright currently runs in standard mode over `src`, `mcp-config-generator.py`, and `tests`; the strictness strategy is documented in `pyproject.toml`.
 
 The tests cover:
 

@@ -6,7 +6,7 @@ import json
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 
 @dataclass(frozen=True)
@@ -60,7 +60,10 @@ def parse_json_array(stdout: str) -> list[dict[str, Any]]:
     parsed = json.loads(stdout or "[]")
     if not isinstance(parsed, list):
         raise ValueError("ast-grep returned unexpected JSON; expected a list of matches.")
-    return parsed
+    parsed_matches = cast(list[Any], parsed)
+    if not all(isinstance(match, dict) for match in parsed_matches):
+        raise ValueError("ast-grep returned unexpected JSON; expected match objects.")
+    return cast(list[dict[str, Any]], parsed_matches)
 
 
 def _is_no_match_output(stdout: str, args: Sequence[str]) -> bool:

@@ -21,10 +21,12 @@ dependencies = [
     "fastmcp>=3.4.2,<4",
     "ast-grep-cli>=0.39.0",
     "thefuzz>=0.20.0",
+    "pydantic>=2.0,<3",
 ]
 
 [dependency-groups]
 dev = [
+    "pyright>=1.1.407",
     "pytest>=9.0.0",
     "ruff>=0.14.0",
     "vulture>=2.14",
@@ -99,3 +101,26 @@ ignore_names = [
 ]
 paths = ["src", "mcp-config-generator.py"]
 min_confidence = 80
+
+[tool.pyright]
+include = [
+    "src",
+    "mcp-config-generator.py",
+    "tests",
+]
+exclude = [
+    "**/__pycache__",
+    ".venv",
+    ".cache",
+    ".ruff_cache",
+    ".pytest_cache",
+    ".reference_projects",
+    "test_samples",
+]
+# Strategy: keep standard mode globally while public contracts and test helpers
+# become typed. Strict mode was evaluated for source modules on 2026-06-28; the
+# current low-risk step is broader checked coverage, then targeted strict files.
+typeCheckingMode = "standard"
+strict = ["src/xray/models.py", "src/xray/core/ast_grep.py", "mcp-config-generator.py"]
+pythonVersion = "3.10"
+reportMissingTypeStubs = false

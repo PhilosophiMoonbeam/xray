@@ -42,6 +42,7 @@ from fastmcp.server.transforms.search import RegexSearchTransform
 from fastmcp.tools.tool_transform import ArgTransformConfig, ToolTransformConfig
 
 from xray.core.indexer import XRayIndexer
+from xray.models import dump_impact_result, dump_symbol_output, validate_symbol_input
 
 # Initialize FastMCP server
 mcp = FastMCP("XRAY Code Intelligence")
@@ -201,6 +202,7 @@ async def find_symbol(root_path: str, query: str, ctx: Context) -> list[dict[str
             root_path,
             lambda indexer: indexer.find_symbol(query),
         )
+        results = [dump_symbol_output(result) for result in results]
         await ctx.report_progress(2, 2, f"found {len(results)} symbol matches")
         return results
     except Exception as e:
@@ -224,6 +226,7 @@ def read_interface(root_path: str, file_path: str) -> str:
 def what_breaks(exact_symbol: dict[str, Any]) -> dict[str, Any]:
     """Find structural code references that may break if a symbol changes."""
     try:
+        exact_symbol = validate_symbol_input(exact_symbol)
         symbol_path_value = exact_symbol.get("abs_path") or exact_symbol["path"]
         symbol_path = Path(symbol_path_value)
         if not symbol_path.is_absolute():
@@ -242,10 +245,11 @@ def what_breaks(exact_symbol: dict[str, Any]) -> dict[str, Any]:
                 break
             root_path = str(parent)
 
-        return run_indexer_operation(
+        result = run_indexer_operation(
             root_path,
             lambda indexer: indexer.what_breaks(symbol_for_indexer),
         )
+        return dump_impact_result(result)
     except Exception as e:
         return {"error": f"Error finding references: {e!s}"}
 
