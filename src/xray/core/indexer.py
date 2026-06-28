@@ -37,8 +37,14 @@ DEFAULT_EXCLUSIONS = {
     ".git",
     ".svn",
     ".hg",
+    ".agents",
+    ".beads",
+    ".claude",
+    ".codex",
     ".idea",
     ".vscode",
+    ".reference_projects",
+    ".ruff_cache",
     ".xray",
     "site-packages",
     ".tox",
@@ -50,6 +56,7 @@ DEFAULT_EXCLUSIONS = {
     "*.pyd",
     "*.so",
     "*.dll",
+    "*.egg-info",
     "*.log",
     ".DS_Store",
     "Thumbs.db",
@@ -134,6 +141,8 @@ class ImpactReference(ImpactReferenceBase, total=False):
 class ImpactResult(TypedDict):
     references: list[ImpactReference]
     total_count: int
+    raw_count: int
+    filtered_count: int
     strategy: str
     note: str
 
@@ -857,21 +866,32 @@ class XRayIndexer:
         # Now perform fuzzy matching against the query
         scored_symbols: list[tuple[int, SymbolMatch]] = []
         query_lower = query.lower()
+        query_parts = [part for part in re.split(r"[\s.:/\\]+", query_lower) if part]
+        terminal_query_part = query_parts[-1] if query_parts else query_lower
+        qualified_query = "." in query_lower or "::" in query_lower
+        class_symbols = [symbol for symbol in unique_symbols if symbol["type"] == "class"]
         for symbol in unique_symbols:
+            owner_name = self._find_enclosing_class_name(symbol, class_symbols)
+            score = self._score_symbol_match(query_lower, symbol, owner_name)
             symbol_name_lower = symbol["name"].lower()
-            # Calculate similarity score
-            score = fuzz.partial_ratio(query_lower, symbol_name_lower)
-
-            # Boost score for exact substring matches
-            if query_lower in symbol_name_lower:
-                score = max(score, 80)
+            if qualified_query and terminal_query_part not in symbol_name_lower:
+                score = min(score, fuzz.partial_ratio(terminal_query_part, symbol_name_lower))
+            if qualified_query and owner_name:
+                qualified_name = f"{owner_name.lower()}.{symbol_name_lower}"
+                if query_lower.endswith(qualified_name) or query_lower == qualified_name:
+                    score = max(score, 100)
 
             if score >= min_score:
                 scored_symbols.append((score, symbol))
 
         # Sort by score and take top results
         scored_symbols.sort(
-            key=lambda x: (x[0], x[1]["name"].lower() == query_lower),
+            key=lambda x: (
+                x[0],
+                self._is_qualified_symbol_match(query_lower, x[1], class_symbols),
+                x[1]["name"].lower() == terminal_query_part,
+                x[1]["name"].lower() == query_lower,
+            ),
             reverse=True,
         )
         if include_scores:
@@ -883,6 +903,58 @@ class XRayIndexer:
             top_symbols = [s[1] for s in scored_symbols[:limit]]
 
         return top_symbols
+
+    def _score_symbol_match(self, query_lower: str, symbol: SymbolMatch, owner_name: str | None) -> int:
+        """Score a symbol against name, owner, and path context."""
+        symbol_name_lower = symbol["name"].lower()
+        path_lower = symbol["path"].lower()
+        path_context = re.sub(r"[^a-z0-9_]+", ".", path_lower).strip(".")
+        candidates = {
+            symbol_name_lower,
+            path_context,
+            f"{path_context}.{symbol_name_lower}",
+        }
+        if owner_name:
+            owner_lower = owner_name.lower()
+            candidates.update(
+                {
+                    owner_lower,
+                    f"{owner_lower}.{symbol_name_lower}",
+                    f"{path_context}.{owner_lower}.{symbol_name_lower}",
+                }
+            )
+
+        score = max(fuzz.partial_ratio(query_lower, candidate) for candidate in candidates)
+        if query_lower in candidates or query_lower in symbol_name_lower:
+            score = max(score, 80)
+        return int(score)
+
+    def _find_enclosing_class_name(self, symbol: SymbolMatch, class_symbols: list[SymbolMatch]) -> str | None:
+        """Return the smallest class range enclosing a symbol in the same file."""
+        if symbol["type"] == "class":
+            return None
+
+        enclosing: list[SymbolMatch] = [
+            class_symbol
+            for class_symbol in class_symbols
+            if class_symbol["path"] == symbol["path"]
+            and class_symbol["start_line"] <= symbol["start_line"] <= class_symbol["end_line"]
+        ]
+        if not enclosing:
+            return None
+
+        owner = min(enclosing, key=lambda item: item["end_line"] - item["start_line"])
+        return owner["name"]
+
+    def _is_qualified_symbol_match(
+        self, query_lower: str, symbol: SymbolMatch, class_symbols: list[SymbolMatch]
+    ) -> bool:
+        """Return whether the query names a symbol with its owner context."""
+        owner_name = self._find_enclosing_class_name(symbol, class_symbols)
+        if not owner_name:
+            return False
+        qualified_name = f"{owner_name.lower()}.{symbol['name'].lower()}"
+        return query_lower == qualified_name or query_lower.endswith(qualified_name)
 
     def _get_metavariable(self, metavars: dict[str, Any], name: str) -> dict[str, Any] | None:
         """Return a metavariable from old or current ast-grep JSON shapes."""
@@ -930,25 +1002,15 @@ class XRayIndexer:
         definition_path_value = exact_symbol.get("abs_path") or exact_symbol["path"]
         definition_path = str(Path(definition_path_value).resolve())
         definition_start = exact_symbol.get("start_line", -1)
+        definition_end = exact_symbol.get("end_line", definition_start)
 
-        references: list[ImpactReference] = []
         strategy = "structural"
 
         # Try structural search first (ast-grep)
         struct_refs = self._ast_grep_search(symbol_name, context_lines)
 
         if struct_refs:
-            # Filter out the definition itself
-            for ref in struct_refs:
-                ref_path = str(Path(ref["file"]).resolve())
-                ref_line = ref["line"]
-
-                # Simple collision check: same file and line is close to definition
-                # (ast-grep definition match might be on definition line)
-                if ref_path == definition_path and abs(ref_line - definition_start) <= 1:
-                    continue
-
-                references.append(ref)
+            references = struct_refs
         else:
             # Fallback to text search if ast-grep found nothing (or failed)
             # Note: This might happen if the symbol is not in a supported language file
@@ -964,9 +1026,20 @@ class XRayIndexer:
             strategy = "text"
             references = self._text_search(symbol_name, context_lines)
 
+        raw_count = len(references)
+        references = self._filter_impact_references(
+            references,
+            symbol_name,
+            definition_path,
+            int(definition_start),
+            int(definition_end),
+        )
+
         return {
             "references": references,
             "total_count": len(references),
+            "raw_count": raw_count,
+            "filtered_count": raw_count - len(references),
             "strategy": strategy,
             "note": f"Found {len(references)} references using {strategy} search.",
         }
@@ -992,16 +1065,79 @@ class XRayIndexer:
 
         for match in matches:
             # ast-grep json with -C returns 'lines' containing the snippet.
-            code_snippet = match.get("lines", "").strip()
+            code_snippet = (match.get("lines") or match.get("text") or "").strip()
             line_num = self._normalize_ast_grep_line(match.get("range", {}).get("start", {}).get("line"))
 
             references.append({"file": match.get("file", ""), "line": line_num, "text": code_snippet, "type": "code"})
 
         return references
 
+    def _filter_impact_references(
+        self,
+        references: list[ImpactReference],
+        symbol_name: str,
+        definition_path: str,
+        definition_start: int,
+        definition_end: int,
+    ) -> list[ImpactReference]:
+        """Keep only exact, source-file references outside the symbol definition."""
+        filtered: list[ImpactReference] = []
+        seen: set[tuple[str, int, str, str]] = set()
+        word_pattern = re.compile(r"\b" + re.escape(symbol_name) + r"\b")
+        gitignore_patterns = self._parse_gitignore()
+
+        for ref in references:
+            ref_file = str(ref.get("file", ""))
+            if not ref_file:
+                continue
+
+            ref_path = self._resolve_impact_reference_path(ref_file)
+            if ref_path is None or not self._is_supported_impact_file(ref_path, gitignore_patterns):
+                continue
+
+            text = str(ref.get("text", ""))
+            if not word_pattern.search(text):
+                continue
+
+            ref_line = int(ref.get("line", 0))
+            ref_path_str = str(ref_path)
+            if ref_path_str == definition_path and definition_start <= ref_line <= definition_end:
+                continue
+
+            ref_type = str(ref.get("type", "text"))
+            key = (ref_path_str, ref_line, text, ref_type)
+            if key in seen:
+                continue
+
+            seen.add(key)
+            filtered_ref: ImpactReference = {
+                "file": ref_path_str,
+                "line": ref_line,
+                "text": text,
+                "type": ref_type,
+            }
+            filtered.append(filtered_ref)
+
+        return filtered
+
+    def _resolve_impact_reference_path(self, file_path: str) -> Path | None:
+        """Resolve ast-grep/rg result paths relative to the repository root."""
+        path = Path(file_path).expanduser()
+        if not path.is_absolute():
+            path = self.root_path / path
+        try:
+            return path.resolve()
+        except OSError:
+            return None
+
+    def _is_supported_impact_file(self, path: Path, gitignore_patterns: set[str]) -> bool:
+        """Return whether impact analysis should report a file as code."""
+        return path.suffix.lower() in LANGUAGE_MAP and not self._should_exclude(path, gitignore_patterns)
+
     def _text_search(self, symbol_name: str, context_lines: int) -> list[ImpactReference]:
         """Unified text search (ripgrep -> python fallback)."""
         references: list[ImpactReference] = []
+        gitignore_patterns = self._parse_gitignore()
 
         # Try ripgrep
         try:
@@ -1014,9 +1150,13 @@ class XRayIndexer:
                             data = json.loads(line)
                             if data.get("type") == "match":
                                 match_data = data.get("data", {})
+                                file_path = match_data.get("path", {}).get("text", "")
+                                resolved = self._resolve_impact_reference_path(file_path)
+                                if resolved is None or not self._is_supported_impact_file(resolved, gitignore_patterns):
+                                    continue
                                 references.append(
                                     {
-                                        "file": match_data.get("path", {}).get("text", ""),
+                                        "file": str(resolved),
                                         "line": match_data.get("line_number", 0),
                                         "text": match_data.get("lines", {}).get("text", "").strip(),
                                         "type": "text",

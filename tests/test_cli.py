@@ -258,6 +258,36 @@ def test_find_cli_finds_js_function_expression(tmp_path, capsys):
     assert result["symbols"][0]["name"] == "helper"
 
 
+def test_find_cli_ranks_qualified_method_query_by_owner_context(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    src = repo / "src" / "xray" / "core"
+    src.mkdir(parents=True)
+    (src / "indexer.py").write_text(
+        """
+class XRayIndexer:
+    def find_symbol(self, query):
+        return query
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (repo / "src" / "xray" / "mcp_server.py").write_text(
+        """
+def find_symbol(root_path, query):
+    return query
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code = cli.main(["find", str(repo), "XRayIndexer.find_symbol", "--limit", "2"])
+
+    assert exit_code == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["symbols"][0]["name"] == "find_symbol"
+    assert result["symbols"][0]["path"] == "src/xray/core/indexer.py"
+
+
 def test_find_cli_finds_typescript_enum(tmp_path, capsys):
     repo = write_mixed_symbol_repo(tmp_path)
 
@@ -461,6 +491,90 @@ def test_impact_cli_accepts_relative_symbol_from_find_json(tmp_path, capsys):
     assert result["symbol"]["path"] == "src/sample.py"
     assert result["impact"]["total_count"] >= 1
     assert all(reference["line"] >= 1 for reference in result["impact"]["references"])
+
+
+def test_impact_filters_duplicate_non_source_and_inexact_structural_matches(tmp_path):
+    repo = write_sample_repo(tmp_path)
+    (repo / "README.md").write_text("target_function in docs should not be an impact code hit.\n", encoding="utf-8")
+    indexer = XRayIndexer(str(repo))
+    valid_match = {
+        "text": "target_function",
+        "file": str(repo / "src" / "sample.py"),
+        "range": {"start": {"line": 4}},
+        "lines": "def caller():\n    return target_function(41)",
+    }
+    matches = [
+        valid_match,
+        dict(valid_match),
+        {
+            "text": "target_function",
+            "file": str(repo / "README.md"),
+            "range": {"start": {"line": 0}},
+            "lines": "target_function in docs should not be an impact code hit.",
+        },
+        {
+            "text": "_",
+            "file": str(repo / "src" / "sample.py"),
+            "range": {"start": {"line": 5}},
+            "lines": "return helper(41)",
+        },
+        {
+            "text": "target_function",
+            "file": str(repo / "src" / "sample.py"),
+            "range": {"start": {"line": 0}},
+            "lines": "def target_function(value):",
+        },
+    ]
+
+    with patch("xray.core.indexer.run_ast_grep", return_value=AstGrepResult(json.dumps(matches), "", 0)):
+        result = indexer.what_breaks(
+            {
+                "name": "target_function",
+                "type": "function",
+                "path": str(repo / "src" / "sample.py"),
+                "start_line": 1,
+                "end_line": 2,
+            }
+        )
+
+    assert result["strategy"] == "structural"
+    assert result["total_count"] == 1
+    assert result["raw_count"] == 5
+    assert result["filtered_count"] == 4
+    assert result["references"] == [
+        {
+            "file": str(repo / "src" / "sample.py"),
+            "line": 5,
+            "text": "def caller():\n    return target_function(41)",
+            "type": "code",
+        }
+    ]
+
+
+def test_impact_text_fallback_filters_to_source_and_excludes_definition(tmp_path):
+    repo = write_sample_repo(tmp_path)
+    (repo / "README.md").write_text("target_function in docs should not be an impact code hit.\n", encoding="utf-8")
+    indexer = XRayIndexer(str(repo))
+
+    with patch("xray.core.indexer.run_ast_grep", return_value=AstGrepResult("[]", "", 1, no_matches=True)):
+        result = indexer.what_breaks(
+            {
+                "name": "target_function",
+                "type": "function",
+                "path": str(repo / "src" / "sample.py"),
+                "start_line": 1,
+                "end_line": 2,
+            },
+            context_lines=0,
+        )
+
+    assert result["strategy"] == "text"
+    assert result["total_count"] == 1
+    assert result["raw_count"] == 2
+    assert result["filtered_count"] == 1
+    assert result["references"][0]["file"] == str(repo / "src" / "sample.py")
+    assert result["references"][0]["line"] == 6
+    assert "target_function(41)" in result["references"][0]["text"]
 
 
 def test_mcp_what_breaks_accepts_cli_find_symbol_json(tmp_path, capsys):
@@ -957,6 +1071,32 @@ def test_explore_focus_keeps_root_and_focused_top_level_dir(tmp_path, capsys):
     assert "src" in output
     assert "sample.py" in output
     assert "docs" not in output
+
+
+def test_explore_cli_excludes_generated_and_agent_state_dirs(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+    noisy_dirs = [
+        ".agents",
+        ".beads",
+        ".codex",
+        ".claude",
+        ".reference_projects",
+        ".ruff_cache",
+        "xray.egg-info",
+    ]
+    for dirname in noisy_dirs:
+        target = repo / dirname
+        target.mkdir()
+        (target / "state.py").write_text("def generated_state():\n    pass\n", encoding="utf-8")
+
+    exit_code = cli.main(["explore", str(repo), "--max-depth", "2", "--format", "json"])
+
+    assert exit_code == 0
+    result = json.loads(capsys.readouterr().out)
+    paths = {entry["path"] for entry in result["entries"]}
+    assert "src" in paths
+    assert "src/sample.py" in paths
+    assert all(dirname not in paths for dirname in noisy_dirs)
 
 
 def test_explore_json_includes_structured_entries(tmp_path, capsys):

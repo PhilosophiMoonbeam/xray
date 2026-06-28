@@ -131,6 +131,8 @@ class ImpactResult(PublicModel):
 
     references: list[ImpactReference]
     total_count: int
+    raw_count: int | None = None
+    filtered_count: int | None = None
     strategy: str
     note: str
 

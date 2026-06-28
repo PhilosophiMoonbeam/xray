@@ -98,9 +98,13 @@ Important options:
 
 - `--max-depth N` limits directory traversal and must be zero or greater.
 - `--include-symbols` and `--symbols` include compact file skeletons.
-- `--focus DIR` can be repeated to keep output centered on selected top-level directories.
+- `--focus DIR` can be repeated to keep output centered on selected top-level directories; root-level files remain visible for repository context.
 - `--max-symbols-per-file N` limits skeleton detail per file and must be zero or greater.
 - `--format json` returns both `tree_text` and structured `entries`.
+
+Explore output excludes common dependency, cache, build, generated metadata, and
+agent/task state directories by default so maps stay focused on maintainable
+project files.
 
 ### `xray find`
 
@@ -157,7 +161,7 @@ Command-specific fields:
 - `explore`: `invoked_as`, `tree_text`, `entries`, `options`, `warnings`.
 - `find`: `query`, `limit`, `min_score`, `symbols`, `error`, `warnings`.
 - `interface`: `file_path`, `interface`, `error`, `warnings`.
-- `impact`: `symbol`, `impact`, `error`, `warnings`.
+- `impact`: `symbol`, `impact`, `error`, `warnings`. Impact payloads include `strategy`, `total_count`, `raw_count`, and `filtered_count` so callers can see when non-source, duplicate, or definition-range matches were removed.
 
 Example:
 

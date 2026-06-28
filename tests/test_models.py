@@ -84,12 +84,16 @@ def test_impact_result_dump_preserves_reference_shape():
         {
             "references": [{"file": "/repo/src/sample.py", "line": 5, "text": "target_function(41)"}],
             "total_count": 1,
+            "raw_count": 2,
+            "filtered_count": 1,
             "strategy": "text",
             "note": "Found 1 references using text search.",
         }
     )
 
     assert payload["references"] == [{"file": "/repo/src/sample.py", "line": 5, "text": "target_function(41)"}]
+    assert payload["raw_count"] == 2
+    assert payload["filtered_count"] == 1
 
 
 def test_error_envelope_dump_omits_absent_command():
