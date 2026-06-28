@@ -126,7 +126,10 @@ def test_readme_documents_generated_cli_decision():
     assert "uv tool install ." in readme
     assert "mcp-config-generator.py cursor installed_script" in readme
     assert "mcp-config-generator.py vscode installed_script" in readme
+    assert "[mcp_servers.xray]" in readme
     assert '"command": "xray-mcp"' in readme
+    assert '"mcpServers": {' in readme
+    assert '"xray": {' in readme
     assert "source-checkout configuration" in readme
 
 

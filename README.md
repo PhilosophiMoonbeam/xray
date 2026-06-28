@@ -276,11 +276,25 @@ that run inside the repository environment, such as:
 }
 ```
 
-For installed uv tools, the generator emits the direct installed command:
+For installed uv tools, configure clients to run the direct installed command.
+For example:
+
+Codex `config.toml`:
+
+```toml
+[mcp_servers.xray]
+command = "xray-mcp"
+```
+
+JSON MCP clients:
 
 ```json
 {
-  "command": "xray-mcp"
+  "mcpServers": {
+    "xray": {
+      "command": "xray-mcp"
+    }
+  }
 }
 ```
 
