@@ -113,6 +113,26 @@ To use it:
     Available tools: `cursor`, `claude`, `vscode`
     Available methods: `local_python`, `docker`, `source`, `installed_script` (method availability varies by tool)
 
+### MCP Tool Discovery
+
+XRAY's MCP server uses a search-first FastMCP surface to keep tool context small.
+Most clients initially list only:
+
+- `search_tools` - find XRAY operations by terms such as `map`, `find`, `interface`, or `impact`
+- `call_tool` - run the discovered operation with a `{ "name": "...", "arguments": {...} }` payload
+
+The underlying operations are still `explore_repo`, `find_symbol`,
+`read_interface`, and `what_breaks`. Longer workflow guidance is available only
+when the client asks for it:
+
+- Resource: `xray://workflow`
+- Prompt: `xray_discovery_plan`
+- Skill: `skill://xray-progressive-discovery/SKILL.md`
+
+FastMCP can generate an ad hoc CLI from this MCP schema, but XRAY intentionally
+ships the handwritten `xray` CLI for shell workflows because it exposes direct
+map/find/interface/impact commands and stable JSON output.
+
 ### Manual Configuration (Advanced)
 
 If you prefer to configure manually, here are examples for common AI assistants:
@@ -295,6 +315,7 @@ XRAY is stateless. It runs on-demand analysis against the repository path you pa
 1. **Map your first repository**: In your AI assistant, ask it to "Map my project. use XRAY tools"
 
 2. **Explore the tools**:
+   - In MCP clients, start with `search_tools`, then call the selected operation with `call_tool`.
    - `explore_repo` - Visual file tree of your repository
    - `read_interface` - File signatures and docstrings without implementation bodies
    - `find_symbol` - Fuzzy search for functions, classes, and methods

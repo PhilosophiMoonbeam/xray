@@ -5,9 +5,9 @@ Use this skill when an MCP client needs to inspect a repository with XRAY while 
 ## Workflow
 
 1. Map with `search_tools` using terms like `map`, then call `call_tool` with `name="explore_repo"`.
-2. Find symbols with `search_tools` using terms like `symbol` or `find`, then call `call_tool` with `name="find_symbol"`.
-3. Read contracts by calling `call_tool` with `name="read_interface"` before loading implementations.
-4. Assess change impact by calling `call_tool` with `name="what_breaks"` and passing the full symbol object returned from `find_symbol`.
+2. Find symbols with `search_tools` using terms like `symbol`, `function`, `class`, or `find`, then call `call_tool` with `name="find_symbol"`.
+3. Read contracts with `search_tools` using terms like `interface`, `signature`, `contract`, or `docstring`, then call `call_tool` with `name="read_interface"` before loading implementations.
+4. Assess change impact with `search_tools` using terms like `impact`, `usage`, `caller`, `reference`, or `dependency`, then call `call_tool` with `name="what_breaks"` and pass the full symbol object returned from `find_symbol`.
 
 ## Guidance
 

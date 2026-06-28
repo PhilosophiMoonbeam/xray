@@ -499,9 +499,112 @@ def test_mcp_tool_surface_is_search_first_with_compact_metadata(tmp_path):
     assert all("PROGRESSIVE DISCOVERY WORKFLOW" not in (tool.description or "") for tool in tools)
     matches = search_result.structured_content["result"]
     assert [match["name"] for match in matches] == ["what_breaks"]
-    assert matches[0]["description"] == "Assess change impact by finding references to a returned symbol."
+    assert matches[0]["description"] == "Find usages, callers, references, and dependency impact for a symbol change."
     assert matches[0]["inputSchema"]["properties"]["exact_symbol"]["description"].startswith("Full symbol object")
     assert call_result.structured_content["result"].startswith(str(repo))
+
+
+def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path):
+    repo = write_sample_repo(tmp_path)
+    (repo / ".git").mkdir()
+    symbol = {
+        "name": "target_function",
+        "type": "function",
+        "path": str(repo / "src" / "sample.py"),
+        "start_line": 1,
+        "end_line": 2,
+    }
+
+    async def inspect_search_and_calls():
+        from fastmcp import Client
+
+        async with Client(mcp_server.mcp) as client:
+            searches = {
+                term: (await client.call_tool("search_tools", {"pattern": term})).structured_content["result"]
+                for term in [
+                    "map",
+                    "tree",
+                    "find",
+                    "function",
+                    "class",
+                    "interface",
+                    "signature",
+                    "contract",
+                    "docstring",
+                    "impact",
+                    "usage",
+                    "caller",
+                    "dependency",
+                    ".",
+                    "[",
+                ]
+            }
+            calls = {
+                "explore_repo": await client.call_tool(
+                    "call_tool",
+                    {"name": "explore_repo", "arguments": {"root_path": str(repo), "max_depth": 1}},
+                ),
+                "find_symbol": await client.call_tool(
+                    "call_tool",
+                    {"name": "find_symbol", "arguments": {"root_path": str(repo), "query": "target"}},
+                ),
+                "read_interface": await client.call_tool(
+                    "call_tool",
+                    {"name": "read_interface", "arguments": {"root_path": str(repo), "file_path": "src/sample.py"}},
+                ),
+                "what_breaks": await client.call_tool(
+                    "call_tool",
+                    {"name": "what_breaks", "arguments": {"exact_symbol": symbol}},
+                ),
+            }
+            return searches, calls
+
+    searches, calls = asyncio.run(inspect_search_and_calls())
+
+    assert searches["map"][0]["name"] == "explore_repo"
+    assert searches["tree"][0]["name"] == "explore_repo"
+    assert searches["find"][0]["name"] == "find_symbol"
+    assert any(match["name"] == "find_symbol" for match in searches["function"])
+    assert any(match["name"] == "find_symbol" for match in searches["class"])
+    assert searches["interface"][0]["name"] == "read_interface"
+    assert searches["signature"][0]["name"] == "read_interface"
+    assert searches["contract"][0]["name"] == "read_interface"
+    assert searches["docstring"][0]["name"] == "read_interface"
+    assert searches["impact"][0]["name"] == "what_breaks"
+    assert searches["usage"][0]["name"] == "what_breaks"
+    assert searches["caller"][0]["name"] == "what_breaks"
+    assert searches["dependency"][0]["name"] == "what_breaks"
+    assert [match["name"] for match in searches["."]] == [
+        "explore_repo",
+        "find_symbol",
+        "read_interface",
+        "what_breaks",
+    ]
+    assert searches["["] == []
+
+    for matches in searches.values():
+        assert len(matches) <= 10
+        for match in matches:
+            properties = match["inputSchema"]["properties"]
+            assert "ctx" not in properties
+            assert match["description"]
+            assert match["annotations"] == {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            }
+            assert all(property_schema.get("description") for property_schema in properties.values())
+
+    assert calls["explore_repo"].structured_content["result"].startswith(str(repo))
+    assert any(
+        symbol_result["name"] == "target_function"
+        for symbol_result in calls["find_symbol"].structured_content["result"]
+    )
+    assert "def target_function(value):" in calls["read_interface"].structured_content["result"]
+    impact = calls["what_breaks"].structured_content
+    assert impact["total_count"] >= 1
+    assert all(reference["line"] >= 1 for reference in impact["references"])
 
 
 def test_mcp_explore_reports_context_progress(tmp_path):
@@ -684,8 +787,13 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     ]
     assert workflow[0].text.startswith("# XRAY Progressive Discovery")
     assert "map -> find -> interface -> impact" in workflow[0].text
+    xray_workflow = next(resource for resource in resources if str(resource.uri) == "xray://workflow")
+    assert xray_workflow.annotations.readOnlyHint is True
+    assert xray_workflow.annotations.idempotentHint is True
     assert skill[0].text.startswith("# XRAY Progressive Discovery")
     assert "search_tools" in skill[0].text
+    assert "signature" in skill[0].text
+    assert "dependency" in skill[0].text
     prompt_text = prompt.messages[0].content.text
     assert prompt_text.startswith("Goal: review impact")
     assert "Fetch xray://workflow" in prompt_text
