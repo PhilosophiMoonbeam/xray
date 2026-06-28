@@ -6,14 +6,16 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Callable, Sequence
 from importlib import metadata
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any
 
 from xray import __version__
 from xray.core.indexer import XRayIndexer
 
 SCHEMA_VERSION = "xray.cli.v1"
+MAX_SCORE = 100
 
 
 class ParserExit(Exception):
@@ -150,14 +152,16 @@ def handle_explore(args: argparse.Namespace) -> int:
             max_symbols_per_file=args.max_symbols_per_file,
         )
         invoked_as = args.command
-        data.update({
-            "schema_version": SCHEMA_VERSION,
-            "ok": True,
-            "command": "explore",
-            "invoked_as": invoked_as,
-            "tree_text": tree,
-            "warnings": [],
-        })
+        data.update(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "ok": True,
+                "command": "explore",
+                "invoked_as": invoked_as,
+                "tree_text": tree,
+                "warnings": [],
+            }
+        )
         print_json(data)
     else:
         print(tree)
@@ -167,7 +171,7 @@ def handle_explore(args: argparse.Namespace) -> int:
 def handle_find(args: argparse.Namespace) -> int:
     if args.limit < 0:
         raise ValueError("--limit must be 0 or greater.")
-    if args.min_score < 0 or args.min_score > 100:
+    if args.min_score < 0 or args.min_score > MAX_SCORE:
         raise ValueError("--min-score must be between 0 and 100.")
 
     indexer = XRayIndexer(normalize_path(args.root_path))
@@ -186,18 +190,20 @@ def handle_find(args: argparse.Namespace) -> int:
             print(f"warning: {warning}", file=sys.stderr)
     else:
         symbols = [format_symbol_for_json(symbol, indexer.root_path) for symbol in results]
-        print_json({
-            "schema_version": SCHEMA_VERSION,
-            "ok": not search_failed,
-            "command": "find",
-            "root_path": str(indexer.root_path),
-            "query": args.query,
-            "limit": args.limit,
-            "min_score": args.min_score,
-            "symbols": symbols,
-            "error": "Symbol search failed." if search_failed else None,
-            "warnings": warnings,
-        })
+        print_json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "ok": not search_failed,
+                "command": "find",
+                "root_path": str(indexer.root_path),
+                "query": args.query,
+                "limit": args.limit,
+                "min_score": args.min_score,
+                "symbols": symbols,
+                "error": "Symbol search failed." if search_failed else None,
+                "warnings": warnings,
+            }
+        )
     return 1 if search_failed else 0
 
 
@@ -206,16 +212,18 @@ def handle_interface(args: argparse.Namespace) -> int:
     interface = indexer.read_interface(args.file_path)
     is_error = interface.startswith("Error")
     if args.format == "json":
-        print_json({
-            "schema_version": SCHEMA_VERSION,
-            "ok": not is_error,
-            "command": "interface",
-            "root_path": str(indexer.root_path),
-            "file_path": args.file_path,
-            "interface": None if is_error else interface,
-            "error": interface if is_error else None,
-            "warnings": [],
-        })
+        print_json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "ok": not is_error,
+                "command": "interface",
+                "root_path": str(indexer.root_path),
+                "file_path": args.file_path,
+                "interface": None if is_error else interface,
+                "error": interface if is_error else None,
+                "warnings": [],
+            }
+        )
     else:
         print(interface)
     return 1 if is_error else 0
@@ -236,16 +244,18 @@ def handle_impact(args: argparse.Namespace) -> int:
     if args.format == "text":
         print(format_impact(result))
     else:
-        print_json({
-            "schema_version": SCHEMA_VERSION,
-            "ok": not is_error,
-            "command": "impact",
-            "root_path": str(indexer.root_path),
-            "symbol": format_symbol_for_json(symbol, indexer.root_path),
-            "impact": result,
-            "error": result.get("error") if is_error else None,
-            "warnings": [],
-        })
+        print_json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "ok": not is_error,
+                "command": "impact",
+                "root_path": str(indexer.root_path),
+                "symbol": format_symbol_for_json(symbol, indexer.root_path),
+                "impact": result,
+                "error": result.get("error") if is_error else None,
+                "warnings": [],
+            }
+        )
     return 1 if is_error else 0
 
 
@@ -266,7 +276,9 @@ def load_symbol(args: argparse.Namespace, root_path: Path | None = None) -> dict
         if not args.name or not args.path:
             raise ValueError("Manual symbols require both --name and --path.")
         if args.start_line is None:
-            raise ValueError("Manual symbols require --start-line so the definition can be excluded from impact results.")
+            raise ValueError(
+                "Manual symbols require --start-line so the definition can be excluded from impact results."
+            )
         symbol = {
             "name": args.name,
             "type": args.type,
@@ -339,13 +351,16 @@ def print_json(value: Any, stream: Any = None) -> None:
 
 def print_error(message: str, args: argparse.Namespace) -> None:
     if getattr(args, "format", None) == "json":
-        print_json({
-            "schema_version": SCHEMA_VERSION,
-            "ok": False,
-            "command": getattr(args, "command", None),
-            "error": message,
-            "warnings": [],
-        }, stream=sys.stderr)
+        print_json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "ok": False,
+                "command": getattr(args, "command", None),
+                "error": message,
+                "warnings": [],
+            },
+            stream=sys.stderr,
+        )
     else:
         print(f"xray: {message}", file=sys.stderr)
 
@@ -373,13 +388,16 @@ def parse_command_name(argv: Sequence[str] | None) -> str | None:
 
 def print_parse_error(message: str, argv: Sequence[str] | None) -> None:
     if wants_json_output(argv):
-        print_json({
-            "schema_version": SCHEMA_VERSION,
-            "ok": False,
-            "command": parse_command_name(argv),
-            "error": message,
-            "warnings": [],
-        }, stream=sys.stderr)
+        print_json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "ok": False,
+                "command": parse_command_name(argv),
+                "error": message,
+                "warnings": [],
+            },
+            stream=sys.stderr,
+        )
     else:
         print(message, file=sys.stderr)
 

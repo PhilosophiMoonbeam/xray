@@ -334,6 +334,14 @@ Run the full suite with:
 uv run pytest
 ```
 
+Quality checks:
+
+```bash
+uv run ruff format .
+uv run ruff check .
+uv run vulture
+```
+
 The tests cover:
 
 - CLI envelopes, validation, path safety, aliases, JSON/text behavior, and package scripts.

@@ -1,12 +1,8 @@
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
 """XRAY MCP Server - Progressive code discovery in 4 steps: Map, Find, Interface, Impact.
 
 🚀 THE XRAY WORKFLOW (Progressive Discovery):
 1. explore_repo() - Start with directory structure, then zoom in with symbols
-2. find_symbol() - Find specific functions/classes you need to analyze  
+2. find_symbol() - Find specific functions/classes you need to analyze
 3. read_interface() - Peek at a file's structure (signatures/docs) without reading implementation
 4. what_breaks() - See where that symbol is used (impact analysis)
 
@@ -35,7 +31,9 @@ KEY FEATURES:
 import asyncio
 import os
 import threading
-from typing import Callable, Dict, List, Any, Optional, TypeVar, Union
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, TypeVar
 
 from fastmcp import Context, FastMCP
 from fastmcp.server.providers.skills import SkillsDirectoryProvider
@@ -49,8 +47,8 @@ from xray.core.indexer import XRayIndexer
 mcp = FastMCP("XRAY Code Intelligence")
 
 # Cache for indexer instances per repository path
-_indexer_cache: Dict[str, XRayIndexer] = {}
-_indexer_locks: Dict[str, threading.RLock] = {}
+_indexer_cache: dict[str, XRayIndexer] = {}
+_indexer_locks: dict[str, threading.RLock] = {}
 _indexer_cache_lock = threading.RLock()
 T = TypeVar("T")
 
@@ -112,10 +110,12 @@ def xray_discovery_plan(goal: str = "understand a code change") -> str:
     )
 
 
-mcp.add_provider(SkillsDirectoryProvider(
-    roots=Path(__file__).parent / "skills",
-    supporting_files="template",
-))
+mcp.add_provider(
+    SkillsDirectoryProvider(
+        roots=Path(__file__).parent / "skills",
+        supporting_files="template",
+    )
+)
 
 
 def normalize_path(path: str) -> str:
@@ -154,10 +154,10 @@ def run_indexer_operation(path: str, operation: Callable[[XRayIndexer], T]) -> T
 async def explore_repo(
     root_path: str,
     ctx: Context,
-    max_depth: Optional[Union[int, str]] = None,
-    include_symbols: Union[bool, str] = False,
-    focus_dirs: Optional[List[str]] = None,
-    max_symbols_per_file: Union[int, str] = 5
+    max_depth: int | str | None = None,
+    include_symbols: bool | str = False,
+    focus_dirs: list[str] | None = None,
+    max_symbols_per_file: int | str = 5,
 ) -> str:
     """Map repository structure, optionally including symbol skeletons."""
     try:
@@ -169,8 +169,8 @@ async def explore_repo(
         if isinstance(max_symbols_per_file, str):
             max_symbols_per_file = int(max_symbols_per_file)
         if isinstance(include_symbols, str):
-            include_symbols = include_symbols.lower() in ('true', '1', 'yes')
-            
+            include_symbols = include_symbols.lower() in ("true", "1", "yes")
+
         await ctx.report_progress(1, 2, "building repository map")
         tree = await asyncio.to_thread(
             run_indexer_operation,
@@ -186,11 +186,11 @@ async def explore_repo(
         return tree
     except Exception as e:
         await ctx.error(f"Error exploring repository: {e}")
-        return f"Error exploring repository: {str(e)}"
+        return f"Error exploring repository: {e!s}"
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
-async def find_symbol(root_path: str, query: str, ctx: Context) -> List[Dict[str, Any]]:
+async def find_symbol(root_path: str, query: str, ctx: Context) -> list[dict[str, Any]]:
     """Find functions, classes, methods, or types by fuzzy query."""
     try:
         await ctx.info(f"Finding symbols for query: {query}")
@@ -205,7 +205,7 @@ async def find_symbol(root_path: str, query: str, ctx: Context) -> List[Dict[str
         return results
     except Exception as e:
         await ctx.error(f"Error finding symbol: {e}")
-        return [{"error": f"Error finding symbol: {str(e)}"}]
+        return [{"error": f"Error finding symbol: {e!s}"}]
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
@@ -217,79 +217,81 @@ def read_interface(root_path: str, file_path: str) -> str:
             lambda indexer: indexer.read_interface(file_path),
         )
     except Exception as e:
-        return f"Error reading interface: {str(e)}"
+        return f"Error reading interface: {e!s}"
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
-def what_breaks(exact_symbol: Dict[str, Any]) -> Dict[str, Any]:
+def what_breaks(exact_symbol: dict[str, Any]) -> dict[str, Any]:
     """Find structural code references that may break if a symbol changes."""
     try:
-        symbol_path_value = exact_symbol.get('abs_path') or exact_symbol['path']
+        symbol_path_value = exact_symbol.get("abs_path") or exact_symbol["path"]
         symbol_path = Path(symbol_path_value)
         if not symbol_path.is_absolute():
-            return {
-                "error": "what_breaks requires an absolute symbol path or abs_path when called via MCP."
-            }
+            return {"error": "what_breaks requires an absolute symbol path or abs_path when called via MCP."}
         symbol_path = symbol_path.resolve()
         root_path = str(symbol_path.parent)
         symbol_for_indexer = dict(exact_symbol)
-        symbol_for_indexer['path'] = str(symbol_path)
-        
+        symbol_for_indexer["path"] = str(symbol_path)
+
         # Find a suitable root (go up until we find a git repo or reach root)
-        while root_path != '/':
-            if (Path(root_path) / '.git').exists():
+        while root_path != "/":
+            if (Path(root_path) / ".git").exists():
                 break
             parent = Path(root_path).parent
             if parent == Path(root_path):
                 break
             root_path = str(parent)
-        
+
         return run_indexer_operation(
             root_path,
             lambda indexer: indexer.what_breaks(symbol_for_indexer),
         )
     except Exception as e:
-        return {"error": f"Error finding references: {str(e)}"}
+        return {"error": f"Error finding references: {e!s}"}
 
 
-mcp.add_transform(ToolTransform({
-    "explore_repo": ToolTransformConfig(
-        description="Map repository structure as a tree; optionally include compact symbol skeletons.",
-        tags={"map", "tree", "discovery", "repository"},
-        arguments={
-            "root_path": ArgTransformConfig(description="Absolute repository root to inspect."),
-            "max_depth": ArgTransformConfig(description="Optional directory depth limit."),
-            "include_symbols": ArgTransformConfig(description="Include function/class skeletons when true."),
-            "focus_dirs": ArgTransformConfig(description="Top-level directories to focus on."),
-            "max_symbols_per_file": ArgTransformConfig(description="Symbol skeleton limit per file."),
-        },
-    ),
-    "find_symbol": ToolTransformConfig(
-        description="Find functions, classes, and code symbols by fuzzy name or behavior phrase.",
-        tags={"find", "symbol", "search", "function", "class"},
-        arguments={
-            "root_path": ArgTransformConfig(description="Absolute repository root to search."),
-            "query": ArgTransformConfig(description="Symbol name or behavior phrase to find."),
-        },
-    ),
-    "read_interface": ToolTransformConfig(
-        description="Read signatures, contracts, classes, and docstrings without implementation bodies.",
-        tags={"interface", "signature", "contract", "docstring", "summary"},
-        arguments={
-            "root_path": ArgTransformConfig(description="Absolute repository root."),
-            "file_path": ArgTransformConfig(description="File path, absolute or relative to root_path."),
-        },
-    ),
-    "what_breaks": ToolTransformConfig(
-        description="Find usages, callers, references, and dependency impact for a symbol change.",
-        tags={"impact", "usage", "references", "callers", "dependencies"},
-        arguments={
-            "exact_symbol": ArgTransformConfig(
-                description="Full symbol object from find_symbol, including an absolute path."
+mcp.add_transform(
+    ToolTransform(
+        {
+            "explore_repo": ToolTransformConfig(
+                description="Map repository structure as a tree; optionally include compact symbol skeletons.",
+                tags={"map", "tree", "discovery", "repository"},
+                arguments={
+                    "root_path": ArgTransformConfig(description="Absolute repository root to inspect."),
+                    "max_depth": ArgTransformConfig(description="Optional directory depth limit."),
+                    "include_symbols": ArgTransformConfig(description="Include function/class skeletons when true."),
+                    "focus_dirs": ArgTransformConfig(description="Top-level directories to focus on."),
+                    "max_symbols_per_file": ArgTransformConfig(description="Symbol skeleton limit per file."),
+                },
             ),
-        },
-    ),
-}))
+            "find_symbol": ToolTransformConfig(
+                description="Find functions, classes, and code symbols by fuzzy name or behavior phrase.",
+                tags={"find", "symbol", "search", "function", "class"},
+                arguments={
+                    "root_path": ArgTransformConfig(description="Absolute repository root to search."),
+                    "query": ArgTransformConfig(description="Symbol name or behavior phrase to find."),
+                },
+            ),
+            "read_interface": ToolTransformConfig(
+                description="Read signatures, contracts, classes, and docstrings without implementation bodies.",
+                tags={"interface", "signature", "contract", "docstring", "summary"},
+                arguments={
+                    "root_path": ArgTransformConfig(description="Absolute repository root."),
+                    "file_path": ArgTransformConfig(description="File path, absolute or relative to root_path."),
+                },
+            ),
+            "what_breaks": ToolTransformConfig(
+                description="Find usages, callers, references, and dependency impact for a symbol change.",
+                tags={"impact", "usage", "references", "callers", "dependencies"},
+                arguments={
+                    "exact_symbol": ArgTransformConfig(
+                        description="Full symbol object from find_symbol, including an absolute path."
+                    ),
+                },
+            ),
+        }
+    )
+)
 
 mcp.add_transform(RegexSearchTransform(max_results=10))
 

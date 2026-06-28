@@ -1,16 +1,16 @@
-import json
-import io
 import asyncio
+import io
+import json
 import pickle
 import subprocess
 import sys
 import threading
-import tomllib
 from pathlib import Path
 from unittest.mock import patch
 
-from xray import mcp_server
-from xray import cli
+import tomllib
+
+from xray import cli, mcp_server
 from xray.core.ast_grep import AstGrepCommandError, AstGrepNotFoundError, AstGrepResult
 from xray.core.indexer import XRayIndexer
 
@@ -314,9 +314,10 @@ def test_indexer_save_cache_writes_readable_pickle(tmp_path):
 def test_find_cli_reports_missing_ast_grep_as_json_error(tmp_path, capsys):
     repo = write_sample_repo(tmp_path)
 
-    with patch("xray.core.indexer.run_ast_grep", side_effect=AstGrepNotFoundError(
-        "ast-grep executable was not found; symbol search could not run."
-    )):
+    with patch(
+        "xray.core.indexer.run_ast_grep",
+        side_effect=AstGrepNotFoundError("ast-grep executable was not found; symbol search could not run."),
+    ):
         exit_code = cli.main(["find", str(repo), "target"])
 
     assert exit_code == 1
@@ -328,9 +329,10 @@ def test_find_cli_reports_missing_ast_grep_as_json_error(tmp_path, capsys):
 
 def test_find_cli_reports_ast_grep_nonzero_as_json_error(tmp_path, capsys):
     repo = write_sample_repo(tmp_path)
-    with patch("xray.core.indexer.run_ast_grep", side_effect=AstGrepCommandError(
-        "ast-grep failed with exit code 2: parser failed"
-    )):
+    with patch(
+        "xray.core.indexer.run_ast_grep",
+        side_effect=AstGrepCommandError("ast-grep failed with exit code 2: parser failed"),
+    ):
         exit_code = cli.main(["find", str(repo), "target"])
 
     assert exit_code == 1
@@ -348,11 +350,7 @@ def test_find_cli_keeps_success_when_results_exist_with_warnings(tmp_path, capsy
             "start": {"line": 0},
             "end": {"line": 1},
         },
-        "metaVariables": {
-            "single": {
-                "NAME": {"text": "target_function"}
-            }
-        },
+        "metaVariables": {"single": {"NAME": {"text": "target_function"}}},
     }
     successful = AstGrepResult(stdout=json.dumps([match]), stderr="", returncode=0)
 
@@ -473,9 +471,7 @@ def test_mcp_what_breaks_rejects_bare_relative_symbol_path():
 
     result = mcp_server.what_breaks(symbol)
 
-    assert result == {
-        "error": "what_breaks requires an absolute symbol path or abs_path when called via MCP."
-    }
+    assert result == {"error": "what_breaks requires an absolute symbol path or abs_path when called via MCP."}
 
 
 def test_mcp_tool_surface_is_search_first_with_compact_metadata(tmp_path):
@@ -924,15 +920,17 @@ def test_explore_focus_keeps_root_and_focused_top_level_dir(tmp_path, capsys):
 def test_explore_json_includes_structured_entries(tmp_path, capsys):
     repo = write_sample_repo(tmp_path)
 
-    exit_code = cli.main([
-        "explore",
-        str(repo),
-        "--focus",
-        "src",
-        "--include-symbols",
-        "--format",
-        "json",
-    ])
+    exit_code = cli.main(
+        [
+            "explore",
+            str(repo),
+            "--focus",
+            "src",
+            "--include-symbols",
+            "--format",
+            "json",
+        ]
+    )
 
     assert exit_code == 0
     result = json.loads(capsys.readouterr().out)

@@ -1,11 +1,11 @@
+import importlib.metadata
 import importlib.util
 import json
-import importlib.metadata
-import tomllib
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
+import tomllib
 
 ROOT = Path(__file__).parents[1]
 
@@ -30,6 +30,21 @@ def test_project_metadata_is_cli_first_with_mcp_compatibility():
     assert project["scripts"]["xray"] == "xray.cli:main"
     assert project["scripts"]["xray-mcp"] == "xray.mcp_server:main"
     assert "pytest>=9.0.0" in data["dependency-groups"]["dev"]
+    assert "ruff>=0.14.0" in data["dependency-groups"]["dev"]
+    assert "vulture>=2.14" in data["dependency-groups"]["dev"]
+
+
+def test_quality_tooling_is_configured_for_repo_layout():
+    data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert data["tool"]["ruff"]["line-length"] == 120
+    assert data["tool"]["ruff"]["target-version"] == "py310"
+    assert "test_samples" in data["tool"]["ruff"]["extend-exclude"]
+    assert data["tool"]["ruff"]["lint"]["select"] == ["E", "F", "I", "UP", "PL", "RUF"]
+    assert data["tool"]["ruff"]["lint"]["per-file-ignores"]["tests/**/*"] == ["PLR2004", "E501"]
+    assert data["tool"]["vulture"]["paths"] == ["src", "mcp-config-generator.py"]
+    assert "test_samples" in data["tool"]["vulture"]["exclude"]
+    assert data["tool"]["vulture"]["min_confidence"] == 80
 
 
 def test_fastmcp_dependency_requires_verified_modern_surface():

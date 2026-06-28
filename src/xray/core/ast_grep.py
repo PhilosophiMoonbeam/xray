@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ def run_ast_grep(args: Sequence[str], input_text: str | None = None) -> AstGrepR
         completed = subprocess.run(
             command,
             capture_output=True,
+            check=False,
             input=input_text,
             text=True,
         )

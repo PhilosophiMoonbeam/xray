@@ -26,6 +26,8 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=9.0.0",
+    "ruff>=0.14.0",
+    "vulture>=2.14",
 ]
 
 [project.urls]
@@ -46,3 +48,54 @@ xray = ["skills/**/*"]
 [project.scripts]
 xray = "xray.cli:main"
 xray-mcp = "xray.mcp_server:main"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["test_samples"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "PL", "RUF"]
+fixable = ["ALL"]
+ignore = [
+    "PLC0415", # Late imports
+    "PLR0911", # Too many return statements
+    "PLR0912", # Too many branches
+    "PLR0913", # Too many arguments
+    "PLR0915", # Too many statements
+    "RUF012",  # Mutable class attributes
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*" = ["PLR2004", "E501"]
+
+[tool.vulture]
+exclude = [
+    ".venv",
+    ".cache",
+    "venv",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    "build",
+    "dist",
+    "tests",
+    "test_samples",
+]
+ignore_decorators = [
+    "@*.tool",
+    "@*.resource",
+    "@*.prompt",
+    "@pytest.fixture",
+    "@pytest.mark.*",
+    "@contextmanager",
+]
+ignore_names = [
+    "visit_*",
+    "do_*",
+    "test_*",
+    "mock_*",
+    "main",
+]
+paths = ["src", "mcp-config-generator.py"]
+min_confidence = 80
