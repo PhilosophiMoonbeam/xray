@@ -652,9 +652,12 @@ class XRayIndexer:
             
             # JavaScript/TypeScript functions and classes
             ("function $NAME($$$)", "function"),
-            ("const $NAME = ($$$) =>", "function"),
-            ("let $NAME = ($$$) =>", "function"),
-            ("var $NAME = ($$$) =>", "function"),
+            ("const $NAME = $$$ => $$$", "function"),
+            ("let $NAME = $$$ => $$$", "function"),
+            ("var $NAME = $$$ => $$$", "function"),
+            ("const $NAME = function($$$) { $$$ }", "function"),
+            ("let $NAME = function($$$) { $$$ }", "function"),
+            ("var $NAME = function($$$) { $$$ }", "function"),
             ("class $NAME", "class"),
             ("interface $NAME", "interface"),
             ("type $NAME =", "type"),
@@ -682,10 +685,13 @@ class XRayIndexer:
                 self.last_warnings.append("ast-grep executable was not found; symbol search could not run.")
                 break
             
-            if result.returncode == 0:
+            if result.returncode in (0, 1):
                 self.last_search_succeeded = True
                 try:
-                    matches = json.loads(result.stdout)
+                    matches = json.loads(result.stdout or "[]")
+                    if not isinstance(matches, list):
+                        self.last_warnings.append(f"ast-grep returned unexpected JSON for pattern {pattern!r}.")
+                        continue
                     for match in matches:
                         # Extract details from match
                         text = match.get("text", "")
@@ -716,6 +722,8 @@ class XRayIndexer:
                             all_symbols.append(symbol)
                 except json.JSONDecodeError:
                     self.last_warnings.append(f"ast-grep returned invalid JSON for pattern {pattern!r}.")
+                if result.returncode == 1 and result.stderr.strip():
+                    self.last_warnings.append(f"ast-grep reported no matches for pattern {pattern!r}: {result.stderr.strip()}")
             else:
                 stderr = result.stderr.strip()
                 detail = f": {stderr}" if stderr else ""

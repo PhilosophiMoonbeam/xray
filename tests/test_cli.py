@@ -34,6 +34,26 @@ class SampleService:
     return repo
 
 
+def write_js_sample_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    (src / "sample.js").write_text(
+        """
+const fetchData = async (url) => {
+    return url;
+};
+
+const helper = function(value) {
+    return value * 2;
+};
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    return repo
+
+
 def test_explore_cli_prints_tree(tmp_path, capsys):
     repo = write_sample_repo(tmp_path)
 
@@ -159,6 +179,30 @@ def test_find_cli_filters_by_min_score(tmp_path, capsys):
     result = json.loads(capsys.readouterr().out)
     assert result["min_score"] == 95
     assert result["symbols"] == []
+
+
+def test_find_cli_finds_js_arrow_function_without_no_match_warnings(tmp_path, capsys):
+    repo = write_js_sample_repo(tmp_path)
+
+    exit_code = cli.main(["find", str(repo), "fetchData", "--limit", "3"])
+
+    assert exit_code == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is True
+    assert result["warnings"] == []
+    assert result["symbols"][0]["name"] == "fetchData"
+
+
+def test_find_cli_finds_js_function_expression(tmp_path, capsys):
+    repo = write_js_sample_repo(tmp_path)
+
+    exit_code = cli.main(["find", str(repo), "helper", "--limit", "3"])
+
+    assert exit_code == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is True
+    assert result["warnings"] == []
+    assert result["symbols"][0]["name"] == "helper"
 
 
 def test_find_cli_reports_missing_ast_grep_as_json_error(tmp_path, capsys):
