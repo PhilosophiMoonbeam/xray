@@ -32,8 +32,10 @@ KEY FEATURES:
 - Stateless: No database to manage.
 """
 
+import asyncio
 import os
-from typing import Dict, List, Any, Optional, Union
+import threading
+from typing import Callable, Dict, List, Any, Optional, TypeVar, Union
 
 from fastmcp import Context, FastMCP
 from fastmcp.server.providers.skills import SkillsDirectoryProvider
@@ -48,6 +50,9 @@ mcp = FastMCP("XRAY Code Intelligence")
 
 # Cache for indexer instances per repository path
 _indexer_cache: Dict[str, XRayIndexer] = {}
+_indexer_locks: Dict[str, threading.RLock] = {}
+_indexer_cache_lock = threading.RLock()
+T = TypeVar("T")
 
 XRAY_WORKFLOW_GUIDE = """# XRAY Progressive Discovery
 
@@ -120,9 +125,21 @@ def normalize_path(path: str) -> str:
 def get_indexer(path: str) -> XRayIndexer:
     """Get or create indexer instance for the given path."""
     path = normalize_path(path)
-    if path not in _indexer_cache:
-        _indexer_cache[path] = XRayIndexer(path)
-    return _indexer_cache[path]
+    with _indexer_cache_lock:
+        if path not in _indexer_cache:
+            _indexer_cache[path] = XRayIndexer(path)
+            _indexer_locks[path] = threading.RLock()
+        return _indexer_cache[path]
+
+
+def run_indexer_operation(path: str, operation: Callable[[XRayIndexer], T]) -> T:
+    """Run blocking indexer work with per-repository serialization."""
+    path = normalize_path(path)
+    indexer = get_indexer(path)
+    with _indexer_cache_lock:
+        lock = _indexer_locks.setdefault(path, threading.RLock())
+    with lock:
+        return operation(indexer)
 
 
 @mcp.tool
@@ -146,13 +163,16 @@ async def explore_repo(
         if isinstance(include_symbols, str):
             include_symbols = include_symbols.lower() in ('true', '1', 'yes')
             
-        indexer = get_indexer(root_path)
         await ctx.report_progress(1, 2, "building repository map")
-        tree = indexer.explore_repo(
-            max_depth=max_depth,
-            include_symbols=include_symbols,
-            focus_dirs=focus_dirs,
-            max_symbols_per_file=max_symbols_per_file
+        tree = await asyncio.to_thread(
+            run_indexer_operation,
+            root_path,
+            lambda indexer: indexer.explore_repo(
+                max_depth=max_depth,
+                include_symbols=include_symbols,
+                focus_dirs=focus_dirs,
+                max_symbols_per_file=max_symbols_per_file,
+            ),
         )
         await ctx.report_progress(2, 2, "repository map ready")
         return tree
@@ -167,9 +187,12 @@ async def find_symbol(root_path: str, query: str, ctx: Context) -> List[Dict[str
     try:
         await ctx.info(f"Finding symbols for query: {query}")
         await ctx.report_progress(0, 2, "normalizing repository path")
-        indexer = get_indexer(root_path)
         await ctx.report_progress(1, 2, "searching symbols")
-        results = indexer.find_symbol(query)
+        results = await asyncio.to_thread(
+            run_indexer_operation,
+            root_path,
+            lambda indexer: indexer.find_symbol(query),
+        )
         await ctx.report_progress(2, 2, f"found {len(results)} symbol matches")
         return results
     except Exception as e:
@@ -181,8 +204,10 @@ async def find_symbol(root_path: str, query: str, ctx: Context) -> List[Dict[str
 def read_interface(root_path: str, file_path: str) -> str:
     """Read signatures, class definitions, and docstrings for one file."""
     try:
-        indexer = get_indexer(root_path)
-        return indexer.read_interface(file_path)
+        return run_indexer_operation(
+            root_path,
+            lambda indexer: indexer.read_interface(file_path),
+        )
     except Exception as e:
         return f"Error reading interface: {str(e)}"
 
@@ -211,8 +236,10 @@ def what_breaks(exact_symbol: Dict[str, Any]) -> Dict[str, Any]:
                 break
             root_path = str(parent)
         
-        indexer = get_indexer(root_path)
-        return indexer.what_breaks(symbol_for_indexer)
+        return run_indexer_operation(
+            root_path,
+            lambda indexer: indexer.what_breaks(symbol_for_indexer),
+        )
     except Exception as e:
         return {"error": f"Error finding references: {str(e)}"}
 

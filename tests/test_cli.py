@@ -1,8 +1,10 @@
 import json
 import io
 import asyncio
+import pickle
 import subprocess
 import sys
+import threading
 import tomllib
 from pathlib import Path
 from unittest.mock import patch
@@ -10,6 +12,7 @@ from unittest.mock import patch
 from xray import mcp_server
 from xray import cli
 from xray.core.ast_grep import AstGrepCommandError, AstGrepNotFoundError, AstGrepResult
+from xray.core.indexer import XRayIndexer
 
 
 def write_sample_repo(tmp_path: Path) -> Path:
@@ -48,6 +51,42 @@ const fetchData = async (url) => {
 const helper = function(value) {
     return value * 2;
 };
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    return repo
+
+
+def write_mixed_symbol_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    (src / "types.ts").write_text(
+        """
+enum Status {
+    Active = "ACTIVE",
+    Inactive = "INACTIVE",
+}
+
+type UserRole = "admin" | "user";
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (src / "types.go").write_text(
+        """
+package sample
+
+type User struct {
+    ID int
+}
+
+type Service interface {
+    GetUser(id int) (*User, error)
+}
+
+type UserID int
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -204,6 +243,72 @@ def test_find_cli_finds_js_function_expression(tmp_path, capsys):
     assert result["ok"] is True
     assert result["warnings"] == []
     assert result["symbols"][0]["name"] == "helper"
+
+
+def test_find_cli_finds_typescript_enum(tmp_path, capsys):
+    repo = write_mixed_symbol_repo(tmp_path)
+
+    exit_code = cli.main(["find", str(repo), "Status", "--min-score", "100", "--limit", "1"])
+
+    assert exit_code == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is True
+    assert result["symbols"][0]["name"] == "Status"
+    assert result["symbols"][0]["type"] == "enum"
+
+
+def test_find_cli_finds_go_type_alias(tmp_path, capsys):
+    repo = write_mixed_symbol_repo(tmp_path)
+
+    exit_code = cli.main(["find", str(repo), "UserID", "--min-score", "100", "--limit", "1"])
+
+    assert exit_code == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is True
+    assert result["symbols"][0]["name"] == "UserID"
+    assert result["symbols"][0]["type"] == "type"
+
+
+def test_indexer_cache_dir_is_scoped_by_root_path(tmp_path):
+    repo_a = write_sample_repo(tmp_path / "a")
+    repo_b = write_sample_repo(tmp_path / "b")
+    completed = subprocess.CompletedProcess(
+        args=["git", "rev-parse", "HEAD"],
+        returncode=0,
+        stdout="abc123\n",
+        stderr="",
+    )
+
+    with patch("xray.core.indexer.subprocess.run", return_value=completed):
+        indexer_a = XRayIndexer(str(repo_a))
+        indexer_b = XRayIndexer(str(repo_b))
+
+    assert indexer_a.cache_dir != indexer_b.cache_dir
+    assert indexer_a.cache_dir.name.endswith("-abc123")
+    assert indexer_b.cache_dir.name.endswith("-abc123")
+
+
+def test_indexer_save_cache_writes_readable_pickle(tmp_path):
+    repo = write_sample_repo(tmp_path)
+    completed = subprocess.CompletedProcess(
+        args=["git", "rev-parse", "HEAD"],
+        returncode=0,
+        stdout="def456\n",
+        stderr="",
+    )
+
+    with patch("xray.core.indexer.subprocess.run", return_value=completed):
+        indexer = XRayIndexer(str(repo))
+
+    indexer._cache = {"sample": [{"signature": "def target_function(value):", "doc": ""}]}
+    indexer._save_cache()
+
+    cache_file = indexer.cache_dir / "symbols.pkl"
+    with open(cache_file, "rb") as f:
+        saved = pickle.load(f)
+
+    assert saved == indexer._cache
+    assert list(indexer.cache_dir.glob("tmp*")) == []
 
 
 def test_find_cli_reports_missing_ast_grep_as_json_error(tmp_path, capsys):
@@ -437,6 +542,118 @@ def test_mcp_explore_reports_context_progress(tmp_path):
         (2.0, 2.0, "repository map ready"),
     ]
     assert log_messages[0]["msg"].startswith("Exploring repository:")
+
+
+def test_async_mcp_find_symbol_offloads_blocking_indexer(tmp_path, monkeypatch):
+    repo = write_sample_repo(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    class FakeContext:
+        async def info(self, message):
+            pass
+
+        async def report_progress(self, progress, total, message):
+            pass
+
+        async def error(self, message):
+            pass
+
+    def fake_run_indexer_operation(path, operation):
+        started.set()
+        if not release.wait(timeout=2):
+            raise AssertionError("blocking operation was not released")
+        return [{"name": "target_function"}]
+
+    monkeypatch.setattr(mcp_server, "run_indexer_operation", fake_run_indexer_operation)
+
+    async def exercise():
+        task = asyncio.create_task(mcp_server.find_symbol(str(repo), "target", FakeContext()))
+        assert await asyncio.to_thread(started.wait, 1)
+        result = await asyncio.wait_for(asyncio.sleep(0, result="event loop alive"), timeout=0.1)
+        release.set()
+        return result, await asyncio.wait_for(task, timeout=1)
+
+    loop_probe, symbols = asyncio.run(exercise())
+
+    assert loop_probe == "event loop alive"
+    assert symbols == [{"name": "target_function"}]
+
+
+def test_mcp_concurrent_call_tool_requests_succeed_same_and_multi_root(tmp_path):
+    repo_a = write_sample_repo(tmp_path / "a")
+    repo_b = write_sample_repo(tmp_path / "b")
+    (repo_a / ".git").mkdir()
+    (repo_b / ".git").mkdir()
+
+    def symbol_for(repo: Path) -> dict[str, object]:
+        return {
+            "name": "target_function",
+            "type": "function",
+            "path": str(repo / "src" / "sample.py"),
+            "start_line": 1,
+            "end_line": 2,
+        }
+
+    async def call_concurrently():
+        from fastmcp import Client
+
+        async with Client(mcp_server.mcp) as client:
+            same_root = await asyncio.gather(
+                client.call_tool(
+                    "call_tool",
+                    {"name": "explore_repo", "arguments": {"root_path": str(repo_a), "max_depth": 1}},
+                ),
+                client.call_tool(
+                    "call_tool",
+                    {"name": "find_symbol", "arguments": {"root_path": str(repo_a), "query": "target"}},
+                ),
+                client.call_tool(
+                    "call_tool",
+                    {"name": "read_interface", "arguments": {"root_path": str(repo_a), "file_path": "src/sample.py"}},
+                ),
+                client.call_tool(
+                    "call_tool",
+                    {"name": "what_breaks", "arguments": {"exact_symbol": symbol_for(repo_a)}},
+                ),
+            )
+            multi_root = await asyncio.gather(
+                client.call_tool(
+                    "call_tool",
+                    {"name": "find_symbol", "arguments": {"root_path": str(repo_a), "query": "target"}},
+                ),
+                client.call_tool(
+                    "call_tool",
+                    {"name": "find_symbol", "arguments": {"root_path": str(repo_b), "query": "target"}},
+                ),
+                client.call_tool(
+                    "call_tool",
+                    {"name": "explore_repo", "arguments": {"root_path": str(repo_a), "max_depth": 1}},
+                ),
+                client.call_tool(
+                    "call_tool",
+                    {"name": "explore_repo", "arguments": {"root_path": str(repo_b), "max_depth": 1}},
+                ),
+            )
+            return same_root, multi_root
+
+    same_root, multi_root = asyncio.run(call_concurrently())
+
+    def payload(result):
+        return result.structured_content.get("result", result.structured_content)
+
+    same_results = [payload(result) for result in same_root]
+    assert same_results[0].startswith(str(repo_a))
+    assert any(symbol["name"] == "target_function" for symbol in same_results[1])
+    assert "def target_function(value):" in same_results[2]
+    assert same_results[3]["total_count"] >= 1
+    assert all("error" not in result for result in same_results[1:])
+
+    multi_results = [payload(result) for result in multi_root]
+    assert any(symbol["name"] == "target_function" for symbol in multi_results[0])
+    assert any(symbol["name"] == "target_function" for symbol in multi_results[1])
+    assert multi_results[2].startswith(str(repo_a))
+    assert multi_results[3].startswith(str(repo_b))
 
 
 def test_mcp_workflow_guidance_is_available_on_demand():

@@ -7,6 +7,7 @@ import json
 import subprocess
 import hashlib
 import pickle
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Set, Tuple
 import fnmatch
@@ -64,7 +65,8 @@ class XRayIndexer:
             )
             if result.returncode == 0:
                 self.commit_sha = result.stdout.strip()
-                self.cache_dir = Path(f"/tmp/.xray_cache/{self.commit_sha}")
+                root_hash = hashlib.sha256(str(self.root_path).encode("utf-8")).hexdigest()[:16]
+                self.cache_dir = Path(f"/tmp/.xray_cache/{root_hash}-{self.commit_sha}")
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
                 self._load_cache()
             else:
@@ -93,10 +95,20 @@ class XRayIndexer:
             return
         
         cache_file = self.cache_dir / "symbols.pkl"
+        temp_path = None
         try:
-            with open(cache_file, 'wb') as f:
+            with tempfile.NamedTemporaryFile("wb", dir=self.cache_dir, delete=False) as f:
                 pickle.dump(self._cache, f)
+                f.flush()
+                os.fsync(f.fileno())
+                temp_path = Path(f.name)
+            os.replace(temp_path, cache_file)
         except:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
             pass
     
     def _get_cache_key(self, file_path: Path) -> str:
@@ -668,18 +680,20 @@ class XRayIndexer:
             ("class $NAME", "class"),
             ("interface $NAME", "interface"),
             ("type $NAME =", "type"),
+            ("enum $NAME { $$$ }", "enum"),
             
             # Go functions and types
             ("func $NAME($$$)", "function"),
             ("func ($$$) $NAME($$$)", "method"),
             ("type $NAME struct", "struct"),
             ("type $NAME interface", "interface"),
+            ("type $NAME $$$", "type"),
         ]
         
         # Run ast-grep for each fixed symbol pattern.
         for pattern, symbol_type in patterns:
             try:
-                result = run_ast_grep(["run", "--pattern", pattern, "--json", str(self.root_path)])
+                result = run_ast_grep(["run", "--pattern", pattern, "--json=compact", str(self.root_path)])
             except AstGrepNotFoundError as exc:
                 self.last_warnings.append(str(exc))
                 break
@@ -734,19 +748,24 @@ class XRayIndexer:
         
         # Now perform fuzzy matching against the query
         scored_symbols = []
+        query_lower = query.lower()
         for symbol in unique_symbols:
+            symbol_name_lower = symbol["name"].lower()
             # Calculate similarity score
-            score = fuzz.partial_ratio(query.lower(), symbol["name"].lower())
+            score = fuzz.partial_ratio(query_lower, symbol_name_lower)
             
             # Boost score for exact substring matches
-            if query.lower() in symbol["name"].lower():
+            if query_lower in symbol_name_lower:
                 score = max(score, 80)
             
             if score >= min_score:
                 scored_symbols.append((score, symbol))
         
         # Sort by score and take top results
-        scored_symbols.sort(key=lambda x: x[0], reverse=True)
+        scored_symbols.sort(
+            key=lambda x: (x[0], x[1]["name"].lower() == query_lower),
+            reverse=True,
+        )
         if include_scores:
             top_symbols = []
             for score, symbol in scored_symbols[:limit]:
@@ -852,7 +871,7 @@ class XRayIndexer:
             result = run_ast_grep([
                 "run",
                 "--pattern", symbol_name,
-                "--json",
+                "--json=compact",
                 "-C", str(context_lines),
                 str(self.root_path),
             ])

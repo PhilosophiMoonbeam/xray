@@ -41,6 +41,21 @@ def test_run_ast_grep_treats_stream_no_matches_as_success():
     assert result.returncode == 1
 
 
+def test_run_ast_grep_treats_compact_json_no_matches_as_success():
+    completed = subprocess.CompletedProcess(
+        args=["ast-grep"],
+        returncode=1,
+        stdout="[]",
+        stderr="",
+    )
+
+    with patch("xray.core.ast_grep.subprocess.run", return_value=completed):
+        result = run_ast_grep(["run", "--pattern", "missing", "--json=compact", "."])
+
+    assert result.no_matches is True
+    assert result.returncode == 1
+
+
 def test_run_ast_grep_raises_for_real_command_failure():
     completed = subprocess.CompletedProcess(
         args=["ast-grep"],

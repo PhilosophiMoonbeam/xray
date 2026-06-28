@@ -65,6 +65,6 @@ def _is_no_match_output(stdout: str, args: Sequence[str]) -> bool:
     stripped = stdout.strip()
     if "--json=stream" in args:
         return stripped == "" or all(line.lstrip().startswith("{") for line in stripped.splitlines())
-    if "--json" in args:
+    if any(arg == "--json" or arg.startswith("--json=") for arg in args):
         return stripped in ("", "[]") or stripped.startswith("[")
     return stripped == ""
