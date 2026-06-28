@@ -119,11 +119,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     interface = subparsers.add_parser("interface", help="Show a file interface without implementation bodies.")
     interface.add_argument("root_path", help="Repository root to inspect.")
-    interface.add_argument("file_path", help="File path, absolute or relative to the repository root.")
+    interface.add_argument("file_path", help="File path, absolute or relative; must resolve inside the root.")
     interface.add_argument("--format", choices=("text", "json"), default="text")
     interface.set_defaults(handler=handle_interface)
 
-    impact = subparsers.add_parser("impact", help="Find references that may break if a symbol changes.")
+    impact = subparsers.add_parser(
+        "impact",
+        help="Find references that may break if a symbol changes.",
+        description=(
+            "Find references that may break if a symbol changes. Provide exactly one symbol source: "
+            "--symbol-json, --symbol-file, or --name with --path and --start-line."
+        ),
+    )
     impact.add_argument("root_path", help="Repository root to inspect.")
     impact.add_argument("--symbol-json", help="Exact symbol object as JSON, usually from `xray find`.")
     impact.add_argument(
@@ -133,7 +140,12 @@ def build_parser() -> argparse.ArgumentParser:
     impact.add_argument("--name", help="Symbol name when not passing a full symbol JSON object.")
     impact.add_argument("--path", help="Symbol definition path when not passing a full symbol JSON object.")
     impact.add_argument("--type", default="symbol", help="Symbol type for manually specified symbols.")
-    impact.add_argument("--start-line", type=int, default=None, help="Definition start line for manual symbols.")
+    impact.add_argument(
+        "--start-line",
+        type=int,
+        default=None,
+        help="Definition start line for manual symbols; required with --name and --path.",
+    )
     impact.add_argument("--end-line", type=int, default=None, help="Definition end line for manual symbols.")
     impact.add_argument("--context-lines", type=int, default=2, help="Context lines around each reference.")
     impact.add_argument("--format", choices=("json", "text"), default="json")

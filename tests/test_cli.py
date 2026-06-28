@@ -625,7 +625,7 @@ def test_mcp_tool_surface_is_search_first_with_compact_metadata(tmp_path):
     assert all("PROGRESSIVE DISCOVERY WORKFLOW" not in (tool.description or "") for tool in tools)
     matches = structured_content(search_result)["result"]
     assert [match["name"] for match in matches] == ["what_breaks"]
-    assert matches[0]["description"] == "Find usages, callers, references, and dependency impact for a symbol change."
+    assert matches[0]["description"].startswith("Find breaking change impact")
     assert matches[0]["inputSchema"]["properties"]["exact_symbol"]["description"].startswith("Full symbol object")
     assert structured_content(call_result)["result"].startswith(str(repo))
 
@@ -661,6 +661,25 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
                     "usage",
                     "caller",
                     "dependency",
+                    "overview",
+                    "layout",
+                    "file tree",
+                    "definitions",
+                    "method",
+                    "type",
+                    "enum",
+                    "api",
+                    "summary",
+                    "body",
+                    "uses",
+                    "used by",
+                    "dependencies",
+                    "dependents",
+                    "blast radius",
+                    "breaking change",
+                    "change impact",
+                    "root path",
+                    "line data",
                     ".",
                     "[",
                 ]
@@ -700,6 +719,29 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
     assert searches["usage"][0]["name"] == "what_breaks"
     assert searches["caller"][0]["name"] == "what_breaks"
     assert searches["dependency"][0]["name"] == "what_breaks"
+    assert searches["overview"][0]["name"] == "explore_repo"
+    assert searches["layout"][0]["name"] == "explore_repo"
+    assert searches["file tree"][0]["name"] == "explore_repo"
+    assert searches["definitions"][0]["name"] == "find_symbol"
+    assert searches["method"][0]["name"] == "find_symbol"
+    assert searches["type"][0]["name"] == "find_symbol"
+    assert searches["enum"][0]["name"] == "find_symbol"
+    assert searches["api"][0]["name"] == "read_interface"
+    assert searches["summary"][0]["name"] == "read_interface"
+    assert searches["body"][0]["name"] == "read_interface"
+    assert searches["uses"][0]["name"] == "what_breaks"
+    assert searches["used by"][0]["name"] == "what_breaks"
+    assert searches["dependencies"][0]["name"] == "what_breaks"
+    assert searches["dependents"][0]["name"] == "what_breaks"
+    assert searches["blast radius"][0]["name"] == "what_breaks"
+    assert searches["breaking change"][0]["name"] == "what_breaks"
+    assert searches["change impact"][0]["name"] == "what_breaks"
+    assert {match["name"] for match in searches["root path"]} >= {
+        "explore_repo",
+        "find_symbol",
+        "read_interface",
+    }
+    assert searches["line data"][0]["name"] == "what_breaks"
     assert [match["name"] for match in searches["."]] == [
         "explore_repo",
         "find_symbol",
@@ -1056,6 +1098,20 @@ def test_cli_version_returns_without_system_exit(capsys):
 
     assert exit_code == 0
     assert capsys.readouterr().out.strip() == "xray 0.6.1"
+
+
+def test_cli_help_mentions_path_and_symbol_constraints(capsys):
+    interface_exit = cli.main(["interface", "--help"])
+    interface_help = " ".join(capsys.readouterr().out.split())
+
+    impact_exit = cli.main(["impact", "--help"])
+    impact_help = " ".join(capsys.readouterr().out.split())
+
+    assert interface_exit == 0
+    assert "must resolve inside the root" in interface_help
+    assert impact_exit == 0
+    assert "Provide exactly one symbol source" in impact_help
+    assert "required with --name and --path" in impact_help
 
 
 def test_explore_focus_keeps_root_and_focused_top_level_dir(tmp_path, capsys):

@@ -263,11 +263,11 @@ Once configured, use XRAY by adding "use XRAY tools" to your prompts:
 # Impact analysis
 "What breaks if I change the authenticate method in UserService? use XRAY tools"
 
-# Dependency tracking
-"What does the PaymentProcessor class depend on? use XRAY tools"
+# Reference impact
+"What code references PaymentProcessor before I change it? use XRAY tools"
 
-# Location queries
-"What function is defined at line 125 in main.py? use XRAY tools"
+# Interface lookup
+"Show the interface for src/payments/processor.py before reading implementation. use XRAY tools"
 ```
 
 ## Troubleshooting
@@ -319,7 +319,7 @@ XRAY is stateless. It runs on-demand analysis against the repository path you pa
    - `explore_repo` - Visual file tree of your repository
    - `read_interface` - File signatures and docstrings without implementation bodies
    - `find_symbol` - Fuzzy search for functions, classes, and methods
-   - `what_breaks` - Find what code depends on a symbol (reverse dependencies)
+   - `what_breaks` - Find code references that may break if a symbol changes
    
    Note: Results may include matches from comments or strings. The AI assistant will intelligently filter based on context.
 

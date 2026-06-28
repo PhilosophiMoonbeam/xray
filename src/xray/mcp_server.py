@@ -58,11 +58,11 @@ XRAY_WORKFLOW_GUIDE = """# XRAY Progressive Discovery
 XRAY is optimized for a map -> find -> interface -> impact workflow:
 
 1. Map the repository with `explore_repo`.
-   Start with directory structure only. Add `include_symbols=True`, `focus_dirs`,
-   or `max_depth` when you know where to zoom in.
+   Pass an absolute repository root. Start with directory structure only; add
+   `include_symbols=True`, `focus_dirs`, or `max_depth` when you know where to zoom in.
 2. Locate code with `find_symbol`.
    Use fuzzy phrases such as "auth service", "validate user", or "parse_json".
-   Keep the returned symbol object for impact analysis.
+   Keep the returned symbol object, including path and line data, for impact analysis.
 3. Inspect usage contracts with `read_interface`.
    Read signatures, classes, and docstrings without pulling full implementations
    into context.
@@ -258,10 +258,12 @@ mcp.add_transform(
     ToolTransform(
         {
             "explore_repo": ToolTransformConfig(
-                description="Map repository structure as a tree; optionally include compact symbol skeletons.",
+                description=(
+                    "Map repository overview: file tree, layout, and structure; optionally include symbol skeletons."
+                ),
                 tags={"map", "tree", "discovery", "repository"},
                 arguments={
-                    "root_path": ArgTransformConfig(description="Absolute repository root to inspect."),
+                    "root_path": ArgTransformConfig(description="Absolute repository root path to inspect."),
                     "max_depth": ArgTransformConfig(description="Optional directory depth limit."),
                     "include_symbols": ArgTransformConfig(description="Include function/class skeletons when true."),
                     "focus_dirs": ArgTransformConfig(description="Top-level directories to focus on."),
@@ -269,27 +271,33 @@ mcp.add_transform(
                 },
             ),
             "find_symbol": ToolTransformConfig(
-                description="Find functions, classes, and code symbols by fuzzy name or behavior phrase.",
+                description="Find definitions: functions, methods, classes, types, enums, and code symbols.",
                 tags={"find", "symbol", "search", "function", "class"},
                 arguments={
-                    "root_path": ArgTransformConfig(description="Absolute repository root to search."),
+                    "root_path": ArgTransformConfig(description="Absolute repository root path to search."),
                     "query": ArgTransformConfig(description="Symbol name or behavior phrase to find."),
                 },
             ),
             "read_interface": ToolTransformConfig(
-                description="Read signatures, contracts, classes, and docstrings without implementation bodies.",
+                description=(
+                    "Read a file API summary: signatures, contracts, classes, and docstrings without implementation "
+                    "body text."
+                ),
                 tags={"interface", "signature", "contract", "docstring", "summary"},
                 arguments={
-                    "root_path": ArgTransformConfig(description="Absolute repository root."),
+                    "root_path": ArgTransformConfig(description="Absolute repository root path."),
                     "file_path": ArgTransformConfig(description="File path, absolute or relative to root_path."),
                 },
             ),
             "what_breaks": ToolTransformConfig(
-                description="Find usages, callers, references, and dependency impact for a symbol change.",
+                description=(
+                    "Find breaking change impact, usage, and dependency impact: where a symbol is used by code; "
+                    "uses, callers, references, dependencies, dependents, and blast radius."
+                ),
                 tags={"impact", "usage", "references", "callers", "dependencies"},
                 arguments={
                     "exact_symbol": ArgTransformConfig(
-                        description="Full symbol object from find_symbol, including an absolute path."
+                        description="Full symbol object from find_symbol, including absolute path and line data."
                     ),
                 },
             ),
