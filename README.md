@@ -234,19 +234,40 @@ workflows and keeps stable JSON envelopes for automation.
 
 ## Configure MCP Clients
 
-Use `mcp-config-generator.py` from the repository root:
+XRAY supports two common MCP setup styles:
+
+1. **Source checkout** - point the client at a cloned XRAY directory and run
+   the server with `uv run`. Use this for development or when the server should
+   track local source edits.
+2. **Installed uv tool** - install XRAY once with `uv tool install`, then point
+   the client at the installed `xray-mcp` command. Use this for everyday MCP
+   client configuration when editable source behavior is not needed.
+
+Install the persistent tool from a checkout:
+
+```bash
+git clone https://github.com/srijanshukla18/xray.git
+cd xray
+uv tool install .
+command -v xray-mcp
+```
+
+Use `mcp-config-generator.py` from the repository root to generate either style:
 
 ```bash
 uv run python mcp-config-generator.py cursor local_python
+uv run python mcp-config-generator.py cursor installed_script
 uv run python mcp-config-generator.py claude docker
 uv run python mcp-config-generator.py claude installed_script
 uv run python mcp-config-generator.py vscode source
+uv run python mcp-config-generator.py vscode installed_script
 ```
 
 Supported tools are `cursor`, `claude`, and `vscode`. Supported methods vary by
 tool and include `local_python`, `docker`, `source`, and `installed_script`.
 
-For local Python configurations, the generator emits:
+For source-checkout or local Python configurations, the generator emits commands
+that run inside the repository environment, such as:
 
 ```json
 {
@@ -255,13 +276,18 @@ For local Python configurations, the generator emits:
 }
 ```
 
-For installed tools, it preserves the direct command:
+For installed uv tools, the generator emits the direct installed command:
 
 ```json
 {
   "command": "xray-mcp"
 }
 ```
+
+The installed-script configuration assumes `uv tool install .` has placed
+`xray-mcp` on the MCP client's `PATH`. If the client cannot find it, use the
+source-checkout configuration or add uv's tool bin directory to that client's
+environment.
 
 ## Language and Symbol Support
 

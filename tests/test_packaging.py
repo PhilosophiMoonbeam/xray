@@ -121,6 +121,13 @@ def test_readme_documents_generated_cli_decision():
     assert "FastMCP's `generate-cli` can generate an ad hoc client" in readme
     assert "XRAY does not ship that generated script as its primary CLI" in readme
     assert "The `xray` command is the supported user-facing CLI" in readme
+    assert "**Source checkout**" in readme
+    assert "**Installed uv tool**" in readme
+    assert "uv tool install ." in readme
+    assert "mcp-config-generator.py cursor installed_script" in readme
+    assert "mcp-config-generator.py vscode installed_script" in readme
+    assert '"command": "xray-mcp"' in readme
+    assert "source-checkout configuration" in readme
 
 
 def test_getting_started_documents_search_first_mcp_usage():
