@@ -1,6 +1,7 @@
 import importlib.metadata
 import importlib.util
 import json
+import re
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -74,6 +75,34 @@ def test_packaging_includes_mcp_skill_markdown():
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     assert data["tool"]["setuptools"]["package-data"]["xray"] == ["skills/**/*"]
+
+
+def test_top_level_cli_skill_is_agent_skills_compliant():
+    skill_dir = ROOT / "skills" / "xray-cli"
+    skill_path = skill_dir / "SKILL.md"
+
+    assert skill_path.exists()
+    assert not (ROOT / "skills" / "XRAY-CLI").exists()
+    assert not (skill_dir / "skill.md").exists()
+
+    content = skill_path.read_text(encoding="utf-8")
+    assert content.startswith("---\n")
+    frontmatter, body = content.split("---\n", 2)[1:]
+    metadata = {}
+    for line in frontmatter.splitlines():
+        key, value = line.split(": ", 1)
+        metadata[key] = value.strip('"')
+
+    assert metadata["name"] == skill_dir.name
+    assert re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", metadata["name"])
+    assert 1 <= len(metadata["description"]) <= 1024
+    assert "xray explore" in body
+    assert "xray find" in body
+    assert "xray interface" in body
+    assert "xray impact" in body
+    assert "Do not request YAML output" in body
+    assert "search_tools" in body
+    assert "call_tool" in body
 
 
 def test_mcp_server_imports_with_verified_fastmcp_surface():

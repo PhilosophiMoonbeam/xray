@@ -1,0 +1,4 @@
+interface:
+  display_name: "XRAY CLI"
+  short_description: "Use XRAY's code intelligence CLI"
+  default_prompt: "Use $xray-cli to inspect this repository with the XRAY CLI."

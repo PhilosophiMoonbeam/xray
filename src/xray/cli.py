@@ -28,6 +28,74 @@ from xray.models import (
 SCHEMA_VERSION = "xray.cli.v1"
 MAX_SCORE = 100
 
+ROOT_HELP_EPILOG = """\
+Progressive workflow:
+  xray explore ROOT --max-depth 2
+  xray find ROOT "target symbol" --min-score 60
+  xray interface ROOT path/from/find.py
+  symbol=$(xray find ROOT "target symbol" --limit 1 | jq -c '.symbols[0]')
+  xray impact ROOT --symbol-json "$symbol"
+
+Use --format json for automation. Supported output formats are text and json only; YAML is intentionally unsupported.
+"""
+
+EXPLORE_HELP = """\
+Map repository structure before reading large files. Start shallow, then add
+--focus and --include-symbols when you know where to zoom in.
+"""
+
+EXPLORE_EPILOG = """\
+Examples:
+  xray explore ROOT --max-depth 2
+  xray explore ROOT --focus src --include-symbols --max-symbols-per-file 5
+  xray map ROOT --format json
+
+JSON output includes schema_version, ok, command, invoked_as, root_path,
+tree_text, entries, options, and warnings. The map alias reports command
+"explore" with invoked_as "map".
+"""
+
+FIND_EPILOG = """\
+Examples:
+  xray find ROOT "AuthService.validate_user" --limit 5 --min-score 60
+  xray find ROOT "target_function" --format text
+
+JSON is the default because find results are exact symbol objects for impact
+analysis. Symbols include path, abs_path, start_line, end_line, type, and score.
+Use --min-score 60 or higher to suppress weak fuzzy matches.
+"""
+
+INTERFACE_HELP = """\
+Show signatures, class definitions, types, and docstrings for one file without
+printing implementation bodies.
+"""
+
+INTERFACE_EPILOG = """\
+Examples:
+  xray interface ROOT src/package/module.py
+  xray interface ROOT /absolute/path/inside/root.py --format json
+
+FILE_PATH may be absolute or relative, but it must resolve inside ROOT. XRAY
+rejects parent traversal and symlink escapes rather than reading outside files.
+"""
+
+IMPACT_HELP = """\
+Find references that may break if a symbol changes. Provide exactly one symbol
+source: --symbol-json, --symbol-file, or --name with --path and --start-line.
+"""
+
+IMPACT_EPILOG = """\
+Examples:
+  symbol=$(xray find ROOT "target_function" --limit 1 | jq -c '.symbols[0]')
+  xray impact ROOT --symbol-json "$symbol"
+  xray find ROOT "target_function" --limit 1 | jq -c '.symbols[0]' | xray impact ROOT --symbol-file -
+  xray impact ROOT --name target_function --path src/app.py --start-line 42 --type function
+
+Symbols returned by xray find are the safest input because they include abs_path
+and line data. CLI symbol paths must resolve inside ROOT. JSON output includes
+impact.strategy, total_count, raw_count, filtered_count, references, and note.
+"""
+
 
 class ParserExit(Exception):
     """Internal replacement for argparse's process-level exits."""
@@ -40,6 +108,10 @@ class ParserExit(Exception):
 
 class XRayArgumentParser(argparse.ArgumentParser):
     """ArgumentParser variant that lets cli.main return exit codes."""
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        kwargs.setdefault("formatter_class", argparse.RawDescriptionHelpFormatter)
+        super().__init__(*args, **kwargs)
 
     def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
         raise ParserExit(status, message or "")
@@ -70,6 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = XRayArgumentParser(
         prog="xray",
         description="Agent-centric code intelligence CLI: map, find, inspect, and assess impact.",
+        epilog=ROOT_HELP_EPILOG,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {get_version()}")
 
@@ -79,6 +152,8 @@ def build_parser() -> argparse.ArgumentParser:
         "explore",
         aliases=["map"],
         help="Map repository structure, optionally with symbols.",
+        description=EXPLORE_HELP,
+        epilog=EXPLORE_EPILOG,
     )
     explore.add_argument("root_path", help="Repository root to inspect.")
     explore.add_argument("--max-depth", type=int, default=None, help="Maximum directory depth to traverse.")
@@ -101,10 +176,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=5,
         help="Maximum skeleton symbols shown per file when symbols are included.",
     )
-    explore.add_argument("--format", choices=("text", "json"), default="text")
+    explore.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format. Use json for automation; YAML is not supported.",
+    )
     explore.set_defaults(handler=handle_explore)
 
-    find = subparsers.add_parser("find", help="Find functions, classes, methods, and types by fuzzy query.")
+    find = subparsers.add_parser(
+        "find",
+        help="Find functions, classes, methods, and types by fuzzy query.",
+        description="Find definitions by fuzzy name, behavior phrase, or owner-qualified symbol path.",
+        epilog=FIND_EPILOG,
+    )
     find.add_argument("root_path", help="Repository root to inspect.")
     find.add_argument("query", help="Symbol query, such as 'auth service' or 'parse_json'.")
     find.add_argument("--limit", type=int, default=10, help="Maximum number of matches to return.")
@@ -114,22 +199,35 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Minimum fuzzy match score, from 0 to 100. Use 60+ to suppress weak matches.",
     )
-    find.add_argument("--format", choices=("json", "text"), default="json")
+    find.add_argument(
+        "--format",
+        choices=("json", "text"),
+        default="json",
+        help="Output format. json is the default for jq and impact handoff; YAML is not supported.",
+    )
     find.set_defaults(handler=handle_find)
 
-    interface = subparsers.add_parser("interface", help="Show a file interface without implementation bodies.")
+    interface = subparsers.add_parser(
+        "interface",
+        help="Show a file interface without implementation bodies.",
+        description=INTERFACE_HELP,
+        epilog=INTERFACE_EPILOG,
+    )
     interface.add_argument("root_path", help="Repository root to inspect.")
     interface.add_argument("file_path", help="File path, absolute or relative; must resolve inside the root.")
-    interface.add_argument("--format", choices=("text", "json"), default="text")
+    interface.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format. Use json for automation; YAML is not supported.",
+    )
     interface.set_defaults(handler=handle_interface)
 
     impact = subparsers.add_parser(
         "impact",
         help="Find references that may break if a symbol changes.",
-        description=(
-            "Find references that may break if a symbol changes. Provide exactly one symbol source: "
-            "--symbol-json, --symbol-file, or --name with --path and --start-line."
-        ),
+        description=IMPACT_HELP,
+        epilog=IMPACT_EPILOG,
     )
     impact.add_argument("root_path", help="Repository root to inspect.")
     impact.add_argument("--symbol-json", help="Exact symbol object as JSON, usually from `xray find`.")
@@ -148,7 +246,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     impact.add_argument("--end-line", type=int, default=None, help="Definition end line for manual symbols.")
     impact.add_argument("--context-lines", type=int, default=2, help="Context lines around each reference.")
-    impact.add_argument("--format", choices=("json", "text"), default="json")
+    impact.add_argument(
+        "--format",
+        choices=("json", "text"),
+        default="json",
+        help="Output format. json is the default for automation; YAML is not supported.",
+    )
     impact.set_defaults(handler=handle_impact)
 
     return parser

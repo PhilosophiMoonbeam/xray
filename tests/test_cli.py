@@ -1100,18 +1100,45 @@ def test_cli_version_returns_without_system_exit(capsys):
     assert capsys.readouterr().out.strip() == "xray 0.6.1"
 
 
-def test_cli_help_mentions_path_and_symbol_constraints(capsys):
+def test_cli_help_documents_agent_workflow_json_and_safety(capsys):
+    root_exit = cli.main(["--help"])
+    root_help = " ".join(capsys.readouterr().out.split())
+
+    explore_exit = cli.main(["explore", "--help"])
+    explore_help = " ".join(capsys.readouterr().out.split())
+
+    find_exit = cli.main(["find", "--help"])
+    find_help = " ".join(capsys.readouterr().out.split())
+
     interface_exit = cli.main(["interface", "--help"])
     interface_help = " ".join(capsys.readouterr().out.split())
 
     impact_exit = cli.main(["impact", "--help"])
     impact_help = " ".join(capsys.readouterr().out.split())
 
+    assert root_exit == 0
+    assert "Progressive workflow" in root_help
+    assert "xray explore ROOT --max-depth 2" in root_help
+    assert "jq -c '.symbols[0]'" in root_help
+    assert "YAML is intentionally unsupported" in root_help
+    assert explore_exit == 0
+    assert "Start shallow" in explore_help
+    assert "xray map ROOT --format json" in explore_help
+    assert "invoked_as" in explore_help
+    assert "YAML is not supported" in explore_help
+    assert find_exit == 0
+    assert "owner-qualified symbol path" in find_help
+    assert "Symbols include path, abs_path, start_line, end_line, type, and score" in find_help
+    assert "jq and impact handoff" in find_help
     assert interface_exit == 0
     assert "must resolve inside the root" in interface_help
+    assert "rejects parent traversal and symlink escapes" in interface_help
     assert impact_exit == 0
     assert "Provide exactly one symbol source" in impact_help
     assert "required with --name and --path" in impact_help
+    assert "--symbol-file -" in impact_help
+    assert "CLI symbol paths must resolve inside ROOT" in impact_help
+    assert "total_count, raw_count, filtered_count" in impact_help
 
 
 def test_explore_focus_keeps_root_and_focused_top_level_dir(tmp_path, capsys):
