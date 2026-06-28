@@ -19,3 +19,6 @@ uv.lock
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Reference Projects
+.reference_projects/
