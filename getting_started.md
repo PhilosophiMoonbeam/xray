@@ -247,7 +247,7 @@ Expected: Should find `hello_world` function
 What would break if I change the multiply method? use XRAY tools
 ```
 
-Expected: Impact analysis showing any dependencies
+Expected: Impact analysis showing likely symbol-name code references
 
 ## Usage Examples
 
@@ -319,7 +319,7 @@ XRAY is stateless. It runs on-demand analysis against the repository path you pa
    - `explore_repo` - Visual file tree of your repository
    - `read_interface` - File signatures and docstrings without implementation bodies
    - `find_symbol` - Fuzzy search for functions, classes, and methods
-   - `what_breaks` - Find code references that may break if a symbol changes
+   - `what_breaks` - Find likely symbol-name code references for impact review
    
    Note: Results may include matches from comments or strings. The AI assistant will intelligently filter based on context.
 

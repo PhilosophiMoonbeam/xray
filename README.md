@@ -34,7 +34,7 @@ uvx --from . xray find . "XRayIndexer" --min-score 60
 # Inspect a file interface
 uvx --from . xray interface . src/xray/core/indexer.py
 
-# Assess impact from a symbol found by `xray find`
+# Review likely symbol-name references from a symbol found by `xray find`
 symbol=$(uvx --from . xray find . "XRayIndexer" --limit 1 | jq -c '.symbols[0]')
 uvx --from . xray impact . --symbol-json "$symbol"
 ```
@@ -148,7 +148,9 @@ Provide exactly one symbol source:
 - `--name` with `--path` and `--start-line` for manual symbols.
 
 Manual symbols require `--start-line` so XRAY can exclude the definition line
-from impact results. Symbol paths must resolve inside `ROOT`.
+from impact results. Symbol paths must resolve inside `ROOT`. Impact analysis
+is name-based; review results for same-name symbols because XRAY is not a
+type-aware caller or dependency graph.
 
 ## JSON Output
 
@@ -216,7 +218,7 @@ The transformed MCP surface exposes compact metadata and tags for:
 - `explore_repo`: structured map with `tree_text`, `entries`, `options`, and optional symbol skeletons.
 - `find_symbol`: find code symbols by fuzzy name or behavior phrase.
 - `read_interface`: read a text file interface without implementation bodies.
-- `what_breaks`: assess references to a returned symbol object.
+- `what_breaks`: assess likely symbol-name code references to a returned symbol object.
 
 Detailed guidance is available on demand:
 

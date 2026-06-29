@@ -995,7 +995,7 @@ class XRayIndexer:
 
     def what_breaks(self, exact_symbol: Mapping[str, Any], context_lines: int = 2) -> ImpactResult:
         """
-        Find what uses a symbol (reverse dependencies) using structural search.
+        Find likely code references to a symbol name using structural search.
         Prioritizes ast-grep for code references, falls back to text search.
         """
         symbol_name = exact_symbol["name"]
@@ -1045,7 +1045,7 @@ class XRayIndexer:
         }
 
     def _ast_grep_search(self, symbol_name: str, context_lines: int) -> list[ImpactReference]:
-        """Search for symbol usages using ast-grep."""
+        """Search for symbol-name code references using ast-grep."""
         references: list[ImpactReference] = []
         try:
             result = run_ast_grep(

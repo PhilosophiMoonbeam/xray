@@ -1,6 +1,6 @@
 ---
 name: xray-cli
-description: "Use the XRAY command-line interface for agentic code discovery: map repositories, find symbols, inspect file interfaces, assess symbol impact, and automate JSON or jq handoffs. Use when a coding agent can run shell commands and needs the handwritten xray CLI rather than the XRAY MCP search_tools/call_tool workflow."
+description: "Use the XRAY command-line interface for agentic code discovery: map repositories, find symbols, inspect file interfaces, review likely symbol-name impact, and automate JSON or jq handoffs. Use when a coding agent can run shell commands and needs the handwritten xray CLI rather than the XRAY MCP search_tools/call_tool workflow."
 ---
 
 # XRAY CLI
@@ -38,7 +38,7 @@ Inspect interfaces before reading implementation:
 xray interface ROOT src/package/module.py
 ```
 
-Assess impact from exact symbol JSON:
+Assess likely symbol-name references from full symbol JSON:
 
 ```bash
 symbol=$(xray find ROOT "target_function" --limit 1 | jq -c '.symbols[0]')
@@ -54,6 +54,7 @@ Use `xray map` only as an alias for `xray explore`; JSON still reports `command:
 - Use `--format text` only for lossy, token-friendly scans.
 - Do not request YAML.
 - Preserve full symbol objects: `path`, `abs_path`, `start_line`, `end_line`, `type`.
+- Treat `xray impact` as a name-based reference search, not a type-aware caller, dependent, or dependency graph.
 
 ```bash
 xray find ROOT "target_function" --limit 1 \

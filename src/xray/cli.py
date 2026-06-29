@@ -36,7 +36,7 @@ Progressive workflow:
   xray find ROOT "target symbol" --min-score 60
   xray interface ROOT path/from/find.py
   symbol=$(xray find ROOT "target symbol" --limit 1 | jq -c '.symbols[0]')
-  xray impact ROOT --symbol-json "$symbol"
+  xray impact ROOT --symbol-json "$symbol"  # likely symbol-name references
 
 Subcommands emit compact JSON by default. Use subcommand --pretty for indented
 JSON or --format text for compact lossy scans. YAML is intentionally unsupported.
@@ -62,7 +62,7 @@ Examples:
   xray find ROOT "AuthService.validate_user" --limit 5 --min-score 60
   xray find ROOT "target_function" --format text
 
-Default JSON symbols are exact inputs for impact analysis: path, abs_path,
+Default JSON symbols are complete inputs for name-based impact analysis: path, abs_path,
 start_line, end_line, type, and score.
 Use --min-score 60 or higher to suppress weak fuzzy matches.
 """
@@ -82,8 +82,9 @@ rejects parent traversal and symlink escapes rather than reading outside files.
 """
 
 IMPACT_HELP = """\
-Find references that may break if a symbol changes. Provide exactly one symbol
-source: --symbol-json, --symbol-file, or --name with --path and --start-line.
+Find likely symbol-name code references for impact review. This is not a
+type-aware caller or dependency graph. Provide exactly one symbol source:
+--symbol-json, --symbol-file, or --name with --path and --start-line.
 """
 
 IMPACT_EPILOG = """\
@@ -95,6 +96,7 @@ Examples:
 
 Symbols returned by xray find are the safest input. Symbol paths must resolve
 inside ROOT. Default JSON includes impact.strategy, counts, references, and note.
+Review results for same-name symbols; impact analysis is name-based.
 """
 
 
@@ -142,7 +144,7 @@ def get_version() -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = XRayArgumentParser(
         prog="xray",
-        description="Agent-centric code intelligence CLI: map, find, inspect, and assess impact.",
+        description="Agent-centric code intelligence CLI: map, find, inspect, and review name-based impact.",
         epilog=ROOT_HELP_EPILOG,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {get_version()}")
@@ -229,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     impact = subparsers.add_parser(
         "impact",
-        help="Find references that may break if a symbol changes.",
+        help="Find likely symbol-name code references for impact review.",
         description=IMPACT_HELP,
         epilog=IMPACT_EPILOG,
     )

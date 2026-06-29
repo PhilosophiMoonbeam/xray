@@ -4,7 +4,7 @@
 1. explore_repo() - Start with directory structure, then zoom in with symbols
 2. find_symbol() - Find specific functions/classes you need to analyze
 3. read_interface() - Peek at a file's structure (signatures/docs) without reading implementation
-4. what_breaks() - See where that symbol is used (impact analysis)
+4. what_breaks() - Find likely code references to that symbol name
 
 PROGRESSIVE DISCOVERY EXAMPLE:
 ```python
@@ -17,12 +17,12 @@ symbols = find_symbol("/Users/john/myproject", "validate user")
 # Step 3: Check the file interface if unsure
 interface = read_interface("/Users/john/myproject", symbols[0]['path'])
 
-# Step 4: See impact
+# Step 4: Review likely symbol-name references
 impact = what_breaks(symbols[0])
 ```
 
 KEY FEATURES:
-- Structural Analysis: Uses ast-grep to find ACTUAL code references, ignoring comments/strings.
+- Structural Analysis: Uses ast-grep to find likely symbol-name code references.
 - Progressive Discovery: Start simple, then add detail.
 - Smart Caching: Instant re-runs.
 - Stateless: No database to manage.
@@ -64,8 +64,9 @@ Use XRAY as map -> find -> interface -> impact:
    Keep the returned symbol object, including path and line data.
 3. Inspect contracts with `read_interface`.
    It returns text signatures/classes/docstrings without implementation bodies.
-4. Check change impact with `what_breaks`.
+4. Check likely symbol-name code references with `what_breaks`.
    Pass the entire symbol object from `find_symbol`.
+   This is not a type-aware caller, dependent, or dependency graph.
 
 Use `search_tools` to discover operations, then execute one through `call_tool`.
 """
@@ -102,7 +103,8 @@ def xray_discovery_plan(goal: str = "understand a code change") -> str:
         "1. Call explore_repo; use entries for file selection and tree_text for scanning.\n"
         "2. Call find_symbol with the most relevant symbol or behavior phrase.\n"
         "3. Call read_interface for text contracts when needed.\n"
-        "4. Call what_breaks with the full symbol object before changing public code.\n\n"
+        "4. Call what_breaks with the full symbol object before changing public code; "
+        "treat results as name-based references, not a type-aware dependency graph.\n\n"
         "Fetch xray://workflow only if more detailed XRAY usage guidance is needed."
     )
 
@@ -248,7 +250,7 @@ def read_interface(root_path: str, file_path: str) -> str:
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def what_breaks(exact_symbol: dict[str, Any]) -> dict[str, Any]:
-    """Find structural code references that may break if a symbol changes."""
+    """Find likely symbol-name code references for impact review."""
     try:
         exact_symbol = validate_symbol_input(exact_symbol)
         symbol_path_value = exact_symbol.get("abs_path") or exact_symbol["path"]
@@ -313,10 +315,12 @@ mcp.add_transform(
             ),
             "what_breaks": ToolTransformConfig(
                 description=(
-                    "Find breaking change impact, usage, and dependency impact: where a symbol is used by code; "
-                    "uses, callers, references, dependencies, dependents, and blast radius."
+                    "Find likely symbol-name code references for change impact review. "
+                    "Use before breaking changes to inspect name-based usage and code that uses the same symbol name. "
+                    "For 'used by' questions, this is an approximation. "
+                    "This is not a type-aware caller, dependent, or dependency graph."
                 ),
-                tags={"impact", "usage", "references", "callers", "dependencies"},
+                tags={"impact", "usage", "references", "symbol-name", "approximate"},
                 arguments={
                     "exact_symbol": ArgTransformConfig(
                         description="Full symbol object from find_symbol, including absolute path and line data."

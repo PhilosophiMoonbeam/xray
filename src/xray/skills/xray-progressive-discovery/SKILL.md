@@ -7,7 +7,7 @@ Use this skill when an MCP client needs to inspect a repository with XRAY while 
 1. Map with `search_tools` using terms like `map`, then call `call_tool` with `name="explore_repo"`; use `entries` for file selection.
 2. Find symbols with `search_tools` using terms like `symbol`, `function`, `class`, or `find`, then call `call_tool` with `name="find_symbol"`.
 3. Read contracts with `search_tools` using terms like `interface`, `signature`, `contract`, or `docstring`, then call `call_tool` with `name="read_interface"` before loading implementations.
-4. Assess change impact with `search_tools` using terms like `impact`, `usage`, `caller`, `reference`, or `dependency`, then call `call_tool` with `name="what_breaks"` and pass the full symbol object returned from `find_symbol`.
+4. Assess likely symbol-name code references with `search_tools` using terms like `impact`, `usage`, or `reference`, then call `call_tool` with `name="what_breaks"` and pass the full symbol object returned from `find_symbol`.
 
 ## Guidance
 
@@ -15,4 +15,5 @@ Use this skill when an MCP client needs to inspect a repository with XRAY while 
 - Use `tree_text` only for visual scanning.
 - Keep `include_symbols` false for an initial map; enable it only when zooming into a focused directory.
 - Preserve full symbol objects so impact analysis has path and line data.
+- Treat `what_breaks` as a name-based reference search, not a type-aware caller, dependent, or dependency graph.
 - Fetch `xray://workflow` for a longer reference when a client needs detailed examples.

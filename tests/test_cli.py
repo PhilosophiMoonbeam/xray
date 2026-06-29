@@ -648,7 +648,8 @@ def test_mcp_tool_surface_is_search_first_with_compact_metadata(tmp_path):
     assert all("PROGRESSIVE DISCOVERY WORKFLOW" not in (tool.description or "") for tool in tools)
     matches = structured_content(search_result)["result"]
     assert [match["name"] for match in matches] == ["what_breaks"]
-    assert matches[0]["description"].startswith("Find breaking change impact")
+    assert matches[0]["description"].startswith("Find likely symbol-name code references")
+    assert "not a type-aware caller" in matches[0]["description"]
     assert matches[0]["inputSchema"]["properties"]["exact_symbol"]["description"].startswith("Full symbol object")
     explore = structured_content(call_result)
     assert explore["tree_text"].startswith(str(repo))
@@ -699,9 +700,6 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
                     "body",
                     "uses",
                     "used by",
-                    "dependencies",
-                    "dependents",
-                    "blast radius",
                     "breaking change",
                     "change impact",
                     "root path",
@@ -746,6 +744,8 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
     assert searches["usage"][0]["name"] == "what_breaks"
     assert searches["caller"][0]["name"] == "what_breaks"
     assert searches["dependency"][0]["name"] == "what_breaks"
+    assert "not a type-aware caller" in searches["caller"][0]["description"]
+    assert "dependency graph" in searches["dependency"][0]["description"]
     assert searches["overview"][0]["name"] == "explore_repo"
     assert searches["layout"][0]["name"] == "explore_repo"
     assert searches["file tree"][0]["name"] == "explore_repo"
@@ -758,9 +758,6 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
     assert searches["body"][0]["name"] == "read_interface"
     assert searches["uses"][0]["name"] == "what_breaks"
     assert searches["used by"][0]["name"] == "what_breaks"
-    assert searches["dependencies"][0]["name"] == "what_breaks"
-    assert searches["dependents"][0]["name"] == "what_breaks"
-    assert searches["blast radius"][0]["name"] == "what_breaks"
     assert searches["breaking change"][0]["name"] == "what_breaks"
     assert searches["change impact"][0]["name"] == "what_breaks"
     assert {match["name"] for match in searches["root path"]} >= {
@@ -1004,10 +1001,12 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     assert "search_tools" in skill_text
     assert "`entries` for file selection" in skill_text
     assert "signature" in skill_text
-    assert "dependency" in skill_text
+    assert "name-based reference search" in skill_text
+    assert "dependency graph" in skill_text
     prompt_text = text_content(prompt.messages[0].content)
     assert prompt_text.startswith("Goal: review impact")
     assert "use entries for file selection and tree_text for scanning" in prompt_text
+    assert "name-based references" in prompt_text
     assert "Fetch xray://workflow" in prompt_text
 
 
@@ -1190,10 +1189,13 @@ def test_cli_help_documents_agent_workflow_json_and_safety(capsys):
     assert "rejects parent traversal and symlink escapes" in interface_help
     assert impact_exit == 0
     assert "Provide exactly one symbol source" in impact_help
+    assert "likely symbol-name code references" in impact_help
+    assert "not a type-aware caller or dependency graph" in impact_help
     assert "--format {json,text}" in impact_help
     assert "required with --name and --path" in impact_help
     assert "--symbol-file -" in impact_help
     assert "Symbol paths must resolve inside ROOT" in impact_help
+    assert "Review results for same-name symbols" in impact_help
     assert "impact.strategy, counts, references, and note" in impact_help
 
 
