@@ -110,7 +110,7 @@ type UserID int
 def test_explore_cli_prints_tree(tmp_path, capsys):
     repo = write_sample_repo(tmp_path)
 
-    exit_code = cli.main(["explore", str(repo), "--max-depth", "2", "--include-symbols"])
+    exit_code = cli.main(["explore", str(repo), "--max-depth", "2", "--include-symbols", "--format", "text"])
 
     assert exit_code == 0
     output = capsys.readouterr().out
@@ -122,7 +122,7 @@ def test_explore_cli_prints_tree(tmp_path, capsys):
 def test_interface_cli_prints_file_skeleton(tmp_path, capsys):
     repo = write_sample_repo(tmp_path)
 
-    exit_code = cli.main(["interface", str(repo), "src/sample.py"])
+    exit_code = cli.main(["interface", str(repo), "src/sample.py", "--format", "text"])
 
     assert exit_code == 0
     output = capsys.readouterr().out
@@ -150,7 +150,7 @@ def test_interface_cli_rejects_parent_traversal_outside_root(tmp_path, capsys):
     outside = tmp_path / "outside.py"
     outside.write_text("def leaked():\n    pass\n", encoding="utf-8")
 
-    exit_code = cli.main(["interface", str(repo), "../outside.py"])
+    exit_code = cli.main(["interface", str(repo), "../outside.py", "--format", "text"])
 
     assert exit_code == 1
     output = capsys.readouterr().out
@@ -221,6 +221,29 @@ def test_find_cli_prints_json_symbols(tmp_path, capsys):
     assert all("abs_path" in symbol for symbol in result["symbols"])
     assert all(not Path(symbol["path"]).is_absolute() for symbol in result["symbols"])
     assert all(symbol["start_line"] >= 1 for symbol in result["symbols"])
+
+
+def test_find_cli_defaults_to_compact_json(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+
+    exit_code = cli.main(["find", str(repo), "target", "--limit", "1"])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert json.loads(output)["command"] == "find"
+    assert output.count("\n") == 1
+    assert "\n  " not in output
+
+
+def test_find_cli_pretty_prints_json(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+
+    exit_code = cli.main(["find", str(repo), "target", "--limit", "1", "--pretty"])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert json.loads(output)["command"] == "find"
+    assert output.startswith("{\n  ")
 
 
 def test_find_cli_filters_by_min_score(tmp_path, capsys):
@@ -627,7 +650,10 @@ def test_mcp_tool_surface_is_search_first_with_compact_metadata(tmp_path):
     assert [match["name"] for match in matches] == ["what_breaks"]
     assert matches[0]["description"].startswith("Find breaking change impact")
     assert matches[0]["inputSchema"]["properties"]["exact_symbol"]["description"].startswith("Full symbol object")
-    assert structured_content(call_result)["result"].startswith(str(repo))
+    explore = structured_content(call_result)
+    assert explore["tree_text"].startswith(str(repo))
+    assert explore["root_path"] == str(repo)
+    assert any(entry["path"] == "src" for entry in explore["entries"])
 
 
 def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path):
@@ -707,6 +733,7 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
     searches, calls = asyncio.run(inspect_search_and_calls())
 
     assert searches["map"][0]["name"] == "explore_repo"
+    assert "entries plus tree_text" in searches["map"][0]["description"]
     assert searches["tree"][0]["name"] == "explore_repo"
     assert searches["find"][0]["name"] == "find_symbol"
     assert any(match["name"] == "find_symbol" for match in searches["function"])
@@ -764,7 +791,9 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
             }
             assert all(property_schema.get("description") for property_schema in properties.values())
 
-    assert structured_content(calls["explore_repo"])["result"].startswith(str(repo))
+    explore = structured_content(calls["explore_repo"])
+    assert explore["tree_text"].startswith(str(repo))
+    assert any(entry["path"] == "src" for entry in explore["entries"])
     assert any(
         symbol_result["name"] == "target_function"
         for symbol_result in structured_content(calls["find_symbol"])["result"]
@@ -806,7 +835,9 @@ def test_mcp_explore_reports_context_progress(tmp_path):
     match = structured_content(search_result)["result"][0]
     assert match["name"] == "explore_repo"
     assert "ctx" not in match["inputSchema"]["properties"]
-    assert structured_content(call_result)["result"].startswith(str(repo))
+    explore = structured_content(call_result)
+    assert explore["tree_text"].startswith(str(repo))
+    assert any(entry["path"] == "src" for entry in explore["entries"])
     assert progress_events == [
         (0.0, 2.0, "normalizing repository path"),
         (1.0, 2.0, "building repository map"),
@@ -919,7 +950,7 @@ def test_mcp_concurrent_call_tool_requests_succeed_same_and_multi_root(tmp_path)
         return content.get("result", content)
 
     same_results = [payload(result) for result in same_root]
-    assert same_results[0].startswith(str(repo_a))
+    assert same_results[0]["tree_text"].startswith(str(repo_a))
     assert any(symbol["name"] == "target_function" for symbol in same_results[1])
     assert "def target_function(value):" in same_results[2]
     assert same_results[3]["total_count"] >= 1
@@ -928,8 +959,8 @@ def test_mcp_concurrent_call_tool_requests_succeed_same_and_multi_root(tmp_path)
     multi_results = [payload(result) for result in multi_root]
     assert any(symbol["name"] == "target_function" for symbol in multi_results[0])
     assert any(symbol["name"] == "target_function" for symbol in multi_results[1])
-    assert multi_results[2].startswith(str(repo_a))
-    assert multi_results[3].startswith(str(repo_b))
+    assert multi_results[2]["tree_text"].startswith(str(repo_a))
+    assert multi_results[3]["tree_text"].startswith(str(repo_b))
 
 
 def test_mcp_workflow_guidance_is_available_on_demand():
@@ -961,6 +992,8 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     workflow_text = text_content(workflow[0])
     assert workflow_text.startswith("# XRAY Progressive Discovery")
     assert "map -> find -> interface -> impact" in workflow_text
+    assert "`entries` for file selection" in workflow_text
+    assert "`tree_text` for visual scanning" in workflow_text
     xray_workflow = next(resource for resource in resources if str(resource.uri) == "xray://workflow")
     annotations = xray_workflow.annotations
     assert annotations is not None
@@ -969,10 +1002,12 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     skill_text = text_content(skill[0])
     assert skill_text.startswith("# XRAY Progressive Discovery")
     assert "search_tools" in skill_text
+    assert "`entries` for file selection" in skill_text
     assert "signature" in skill_text
     assert "dependency" in skill_text
     prompt_text = text_content(prompt.messages[0].content)
     assert prompt_text.startswith("Goal: review impact")
+    assert "use entries for file selection and tree_text for scanning" in prompt_text
     assert "Fetch xray://workflow" in prompt_text
 
 
@@ -1037,7 +1072,7 @@ def test_mcp_what_breaks_validates_symbol_input():
 def test_map_alias_matches_explore(tmp_path, capsys):
     repo = write_sample_repo(tmp_path)
 
-    exit_code = cli.main(["map", str(repo), "--max-depth", "1"])
+    exit_code = cli.main(["map", str(repo), "--max-depth", "1", "--format", "text"])
 
     assert exit_code == 0
     assert "src" in capsys.readouterr().out
@@ -1055,8 +1090,8 @@ def test_explore_cli_rejects_negative_max_depth(tmp_path, capsys):
     assert error["error"] == "--max-depth must be 0 or greater."
 
 
-def test_explore_cli_parse_error_returns_json_when_requested(capsys):
-    exit_code = cli.main(["explore", ".", "--max-depth", "nope", "--format", "json"])
+def test_explore_cli_parse_error_returns_json_by_default(capsys):
+    exit_code = cli.main(["explore", ".", "--max-depth", "nope"])
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
@@ -1066,31 +1101,46 @@ def test_explore_cli_parse_error_returns_json_when_requested(capsys):
     assert "invalid int value" in error["error"]
 
 
-def test_find_cli_missing_argument_returns_text_error(capsys):
+def test_find_cli_missing_argument_returns_json_error_by_default(capsys):
     exit_code = cli.main(["find", "."])
 
     assert exit_code == 2
+    error = json.loads(capsys.readouterr().err)
+    assert error["schema_version"] == "xray.cli.v1"
+    assert error["ok"] is False
+    assert error["command"] == "find"
+    assert "required" in error["error"]
+
+
+def test_find_cli_missing_argument_returns_text_error_when_requested(capsys):
+    exit_code = cli.main(["find", ".", "--format", "text"])
+
+    assert exit_code == 2
     captured = capsys.readouterr()
     assert "xray find: error:" in captured.err
     assert "required" in captured.err
 
 
-def test_find_cli_invalid_format_returns_text_error(capsys):
+def test_find_cli_invalid_format_returns_json_error_by_default(capsys):
     exit_code = cli.main(["find", ".", "target", "--format", "xml"])
 
     assert exit_code == 2
-    captured = capsys.readouterr()
-    assert "xray find: error:" in captured.err
-    assert "invalid choice" in captured.err
+    error = json.loads(capsys.readouterr().err)
+    assert error["schema_version"] == "xray.cli.v1"
+    assert error["ok"] is False
+    assert error["command"] == "find"
+    assert "invalid choice" in error["error"]
 
 
-def test_cli_missing_command_returns_text_error(capsys):
+def test_cli_missing_command_returns_json_error(capsys):
     exit_code = cli.main([])
 
     assert exit_code == 2
-    captured = capsys.readouterr()
-    assert "xray: error:" in captured.err
-    assert "required" in captured.err
+    error = json.loads(capsys.readouterr().err)
+    assert error["schema_version"] == "xray.cli.v1"
+    assert error["ok"] is False
+    assert error["command"] is None
+    assert "required" in error["error"]
 
 
 def test_cli_version_returns_without_system_exit(capsys):
@@ -1120,25 +1170,31 @@ def test_cli_help_documents_agent_workflow_json_and_safety(capsys):
     assert "Progressive workflow" in root_help
     assert "xray explore ROOT --max-depth 2" in root_help
     assert "jq -c '.symbols[0]'" in root_help
+    assert "Subcommands emit compact JSON by default" in root_help
     assert "YAML is intentionally unsupported" in root_help
     assert explore_exit == 0
     assert "Start shallow" in explore_help
-    assert "xray map ROOT --format json" in explore_help
+    assert "--format {json,text}" in explore_help
+    assert "xray map ROOT --format text" in explore_help
     assert "invoked_as" in explore_help
-    assert "YAML is not supported" in explore_help
+    assert "json is the default automation contract" in explore_help
+    assert "--pretty" in explore_help
     assert find_exit == 0
     assert "owner-qualified symbol path" in find_help
-    assert "Symbols include path, abs_path, start_line, end_line, type, and score" in find_help
-    assert "jq and impact handoff" in find_help
+    assert "--format {json,text}" in find_help
+    assert "path, abs_path, start_line, end_line, type, and score" in find_help
+    assert "json is the default automation contract" in find_help
     assert interface_exit == 0
+    assert "--format {json,text}" in interface_help
     assert "must resolve inside the root" in interface_help
     assert "rejects parent traversal and symlink escapes" in interface_help
     assert impact_exit == 0
     assert "Provide exactly one symbol source" in impact_help
+    assert "--format {json,text}" in impact_help
     assert "required with --name and --path" in impact_help
     assert "--symbol-file -" in impact_help
-    assert "CLI symbol paths must resolve inside ROOT" in impact_help
-    assert "total_count, raw_count, filtered_count" in impact_help
+    assert "Symbol paths must resolve inside ROOT" in impact_help
+    assert "impact.strategy, counts, references, and note" in impact_help
 
 
 def test_explore_focus_keeps_root_and_focused_top_level_dir(tmp_path, capsys):

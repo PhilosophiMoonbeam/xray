@@ -27,6 +27,8 @@ from xray.models import (
 
 SCHEMA_VERSION = "xray.cli.v1"
 MAX_SCORE = 100
+OUTPUT_FORMAT_HELP = "Output format. json is the default automation contract; text is a lossy scan mode."
+PRETTY_HELP = "Pretty-print JSON output; ignored with --format text."
 
 ROOT_HELP_EPILOG = """\
 Progressive workflow:
@@ -36,7 +38,8 @@ Progressive workflow:
   symbol=$(xray find ROOT "target symbol" --limit 1 | jq -c '.symbols[0]')
   xray impact ROOT --symbol-json "$symbol"
 
-Use --format json for automation. Supported output formats are text and json only; YAML is intentionally unsupported.
+Subcommands emit compact JSON by default. Use subcommand --pretty for indented
+JSON or --format text for compact lossy scans. YAML is intentionally unsupported.
 """
 
 EXPLORE_HELP = """\
@@ -48,11 +51,10 @@ EXPLORE_EPILOG = """\
 Examples:
   xray explore ROOT --max-depth 2
   xray explore ROOT --focus src --include-symbols --max-symbols-per-file 5
-  xray map ROOT --format json
+  xray map ROOT --format text
 
-JSON output includes schema_version, ok, command, invoked_as, root_path,
-tree_text, entries, options, and warnings. The map alias reports command
-"explore" with invoked_as "map".
+Default JSON includes schema_version, ok, root_path, tree_text, entries,
+options, warnings, and invoked_as. The map alias reports command "explore".
 """
 
 FIND_EPILOG = """\
@@ -60,8 +62,8 @@ Examples:
   xray find ROOT "AuthService.validate_user" --limit 5 --min-score 60
   xray find ROOT "target_function" --format text
 
-JSON is the default because find results are exact symbol objects for impact
-analysis. Symbols include path, abs_path, start_line, end_line, type, and score.
+Default JSON symbols are exact inputs for impact analysis: path, abs_path,
+start_line, end_line, type, and score.
 Use --min-score 60 or higher to suppress weak fuzzy matches.
 """
 
@@ -73,7 +75,7 @@ printing implementation bodies.
 INTERFACE_EPILOG = """\
 Examples:
   xray interface ROOT src/package/module.py
-  xray interface ROOT /absolute/path/inside/root.py --format json
+  xray interface ROOT /absolute/path/inside/root.py --format text
 
 FILE_PATH may be absolute or relative, but it must resolve inside ROOT. XRAY
 rejects parent traversal and symlink escapes rather than reading outside files.
@@ -91,9 +93,8 @@ Examples:
   xray find ROOT "target_function" --limit 1 | jq -c '.symbols[0]' | xray impact ROOT --symbol-file -
   xray impact ROOT --name target_function --path src/app.py --start-line 42 --type function
 
-Symbols returned by xray find are the safest input because they include abs_path
-and line data. CLI symbol paths must resolve inside ROOT. JSON output includes
-impact.strategy, total_count, raw_count, filtered_count, references, and note.
+Symbols returned by xray find are the safest input. Symbol paths must resolve
+inside ROOT. Default JSON includes impact.strategy, counts, references, and note.
 """
 
 
@@ -178,10 +179,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     explore.add_argument(
         "--format",
-        choices=("text", "json"),
-        default="text",
-        help="Output format. Use json for automation; YAML is not supported.",
+        choices=("json", "text"),
+        default="json",
+        help=OUTPUT_FORMAT_HELP,
     )
+    explore.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
     explore.set_defaults(handler=handle_explore)
 
     find = subparsers.add_parser(
@@ -203,8 +205,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--format",
         choices=("json", "text"),
         default="json",
-        help="Output format. json is the default for jq and impact handoff; YAML is not supported.",
+        help=OUTPUT_FORMAT_HELP,
     )
+    find.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
     find.set_defaults(handler=handle_find)
 
     interface = subparsers.add_parser(
@@ -217,10 +220,11 @@ def build_parser() -> argparse.ArgumentParser:
     interface.add_argument("file_path", help="File path, absolute or relative; must resolve inside the root.")
     interface.add_argument(
         "--format",
-        choices=("text", "json"),
-        default="text",
-        help="Output format. Use json for automation; YAML is not supported.",
+        choices=("json", "text"),
+        default="json",
+        help=OUTPUT_FORMAT_HELP,
     )
+    interface.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
     interface.set_defaults(handler=handle_interface)
 
     impact = subparsers.add_parser(
@@ -250,8 +254,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--format",
         choices=("json", "text"),
         default="json",
-        help="Output format. json is the default for automation; YAML is not supported.",
+        help=OUTPUT_FORMAT_HELP,
     )
+    impact.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
     impact.set_defaults(handler=handle_impact)
 
     return parser
@@ -289,7 +294,7 @@ def handle_explore(args: argparse.Namespace) -> int:
                 "warnings": [],
             }
         )
-        print_json(dump_explore_envelope(data))
+        print_json(dump_explore_envelope(data), pretty=args.pretty)
     else:
         print(tree)
     return 0
@@ -331,7 +336,8 @@ def handle_find(args: argparse.Namespace) -> int:
                     "error": "Symbol search failed." if search_failed else None,
                     "warnings": warnings,
                 }
-            )
+            ),
+            pretty=args.pretty,
         )
     return 1 if search_failed else 0
 
@@ -353,7 +359,8 @@ def handle_interface(args: argparse.Namespace) -> int:
                     "error": interface if is_error else None,
                     "warnings": [],
                 }
-            )
+            ),
+            pretty=args.pretty,
         )
     else:
         print(interface)
@@ -388,7 +395,8 @@ def handle_impact(args: argparse.Namespace) -> int:
                     "error": result.get("error") if is_error else None,
                     "warnings": [],
                 }
-            )
+            ),
+            pretty=args.pretty,
         )
     return 1 if is_error else 0
 
@@ -474,10 +482,14 @@ def format_impact(result: Mapping[str, Any]) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def print_json(value: Any, stream: Any = None) -> None:
+def print_json(value: Any, stream: Any = None, *, pretty: bool = False) -> None:
     if stream is None:
         stream = sys.stdout
-    print(json.dumps(value, indent=2, sort_keys=True), file=stream)
+    if pretty:
+        output = json.dumps(value, indent=2, sort_keys=True)
+    else:
+        output = json.dumps(value, separators=(",", ":"), sort_keys=True)
+    print(output, file=stream)
 
 
 def print_error(message: str, args: argparse.Namespace) -> None:
@@ -493,6 +505,7 @@ def print_error(message: str, args: argparse.Namespace) -> None:
                 }
             ),
             stream=sys.stderr,
+            pretty=getattr(args, "pretty", False),
         )
     else:
         print(f"xray: {message}", file=sys.stderr)
@@ -501,11 +514,16 @@ def print_error(message: str, args: argparse.Namespace) -> None:
 def wants_json_output(argv: Sequence[str] | None) -> bool:
     args = list(sys.argv[1:] if argv is None else argv)
     for index, value in enumerate(args):
-        if value == "--format" and index + 1 < len(args) and args[index + 1] == "json":
-            return True
-        if value == "--format=json":
-            return True
-    return False
+        if value == "--format" and index + 1 < len(args) and args[index + 1] == "text":
+            return False
+        if value == "--format=text":
+            return False
+    return True
+
+
+def wants_pretty_output(argv: Sequence[str] | None) -> bool:
+    args = list(sys.argv[1:] if argv is None else argv)
+    return "--pretty" in args
 
 
 def parse_command_name(argv: Sequence[str] | None) -> str | None:
@@ -532,6 +550,7 @@ def print_parse_error(message: str, argv: Sequence[str] | None) -> None:
                 }
             ),
             stream=sys.stderr,
+            pretty=wants_pretty_output(argv),
         )
     else:
         print(message, file=sys.stderr)

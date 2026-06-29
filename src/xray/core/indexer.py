@@ -276,7 +276,7 @@ class XRayIndexer:
         """
         Build structured repository map data for CLI and automation.
 
-        The text tree remains available through explore_repo for MCP compatibility.
+        The text tree remains available through explore_repo and structured payloads include entries for automation.
         """
         gitignore_patterns = self._parse_gitignore()
         entries: list[ExploreEntry] = []

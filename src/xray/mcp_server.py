@@ -9,7 +9,7 @@
 PROGRESSIVE DISCOVERY EXAMPLE:
 ```python
 # Step 1: Get the lay of the land
-tree = explore_repo("/Users/john/myproject")
+repo_map = explore_repo("/Users/john/myproject")
 
 # Step 2: Find the specific function
 symbols = find_symbol("/Users/john/myproject", "validate user")
@@ -42,7 +42,7 @@ from fastmcp.server.transforms.search import RegexSearchTransform
 from fastmcp.tools.tool_transform import ArgTransformConfig, ToolTransformConfig
 
 from xray.core.indexer import XRayIndexer
-from xray.models import dump_impact_result, dump_symbol_output, validate_symbol_input
+from xray.models import dump_explore_data, dump_impact_result, dump_symbol_output, validate_symbol_input
 
 # Initialize FastMCP server
 mcp = FastMCP("XRAY Code Intelligence")
@@ -55,23 +55,19 @@ T = TypeVar("T")
 
 XRAY_WORKFLOW_GUIDE = """# XRAY Progressive Discovery
 
-XRAY is optimized for a map -> find -> interface -> impact workflow:
+Use XRAY as map -> find -> interface -> impact:
 
 1. Map the repository with `explore_repo`.
-   Pass an absolute repository root. Start with directory structure only; add
-   `include_symbols=True`, `focus_dirs`, or `max_depth` when you know where to zoom in.
+   It returns `entries` for file selection and `tree_text` for visual scanning.
+   Start shallow; add `focus_dirs` or `include_symbols=True` only when zooming in.
 2. Locate code with `find_symbol`.
-   Use fuzzy phrases such as "auth service", "validate user", or "parse_json".
-   Keep the returned symbol object, including path and line data, for impact analysis.
-3. Inspect usage contracts with `read_interface`.
-   Read signatures, classes, and docstrings without pulling full implementations
-   into context.
+   Keep the returned symbol object, including path and line data.
+3. Inspect contracts with `read_interface`.
+   It returns text signatures/classes/docstrings without implementation bodies.
 4. Check change impact with `what_breaks`.
-   Pass the entire symbol object from `find_symbol`; XRAY uses structural search
-   to find likely code references while ignoring comments and strings.
+   Pass the entire symbol object from `find_symbol`.
 
-Use `search_tools` to discover XRAY operations by topic without loading every
-tool schema, then execute the selected operation through `call_tool`.
+Use `search_tools` to discover operations, then execute one through `call_tool`.
 """
 
 READ_ONLY_TOOL_ANNOTATIONS = {
@@ -103,9 +99,9 @@ def xray_discovery_plan(goal: str = "understand a code change") -> str:
     return (
         f"Goal: {goal}\n\n"
         "Use XRAY progressively:\n"
-        "1. Call explore_repo on the absolute repository root.\n"
+        "1. Call explore_repo; use entries for file selection and tree_text for scanning.\n"
         "2. Call find_symbol with the most relevant symbol or behavior phrase.\n"
-        "3. Call read_interface for files whose contracts matter.\n"
+        "3. Call read_interface for text contracts when needed.\n"
         "4. Call what_breaks with the full symbol object before changing public code.\n\n"
         "Fetch xray://workflow only if more detailed XRAY usage guidance is needed."
     )
@@ -159,7 +155,7 @@ async def explore_repo(
     include_symbols: bool | str = False,
     focus_dirs: list[str] | None = None,
     max_symbols_per_file: int | str = 5,
-) -> str:
+) -> dict[str, Any]:
     """Map repository structure, optionally including symbol skeletons."""
     try:
         await ctx.info(f"Exploring repository: {root_path}")
@@ -173,21 +169,49 @@ async def explore_repo(
             include_symbols = include_symbols.lower() in ("true", "1", "yes")
 
         await ctx.report_progress(1, 2, "building repository map")
-        tree = await asyncio.to_thread(
+        result = await asyncio.to_thread(
             run_indexer_operation,
             root_path,
-            lambda indexer: indexer.explore_repo(
-                max_depth=max_depth,
-                include_symbols=include_symbols,
-                focus_dirs=focus_dirs,
-                max_symbols_per_file=max_symbols_per_file,
+            lambda indexer: build_explore_result(
+                indexer,
+                max_depth,
+                include_symbols,
+                focus_dirs,
+                max_symbols_per_file,
             ),
         )
         await ctx.report_progress(2, 2, "repository map ready")
-        return tree
+        return result
     except Exception as e:
         await ctx.error(f"Error exploring repository: {e}")
-        return f"Error exploring repository: {e!s}"
+        return {"error": f"Error exploring repository: {e!s}"}
+
+
+def build_explore_result(
+    indexer: XRayIndexer,
+    max_depth: int | None,
+    include_symbols: bool,
+    focus_dirs: list[str] | None,
+    max_symbols_per_file: int,
+) -> dict[str, Any]:
+    """Return structured MCP explore data with the compact text tree included."""
+    tree = indexer.explore_repo(
+        max_depth=max_depth,
+        include_symbols=include_symbols,
+        focus_dirs=focus_dirs,
+        max_symbols_per_file=max_symbols_per_file,
+    )
+    data = dump_explore_data(
+        indexer.explore_repo_data(
+            max_depth=max_depth,
+            include_symbols=include_symbols,
+            focus_dirs=focus_dirs,
+            max_symbols_per_file=max_symbols_per_file,
+        )
+    )
+    data["tree_text"] = tree
+    data["warnings"] = []
+    return data
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
@@ -259,7 +283,8 @@ mcp.add_transform(
         {
             "explore_repo": ToolTransformConfig(
                 description=(
-                    "Map repository overview: file tree, layout, and structure; optionally include symbol skeletons."
+                    "Map repository overview, layout, and file tree as entries plus tree_text; "
+                    "optionally include symbols."
                 ),
                 tags={"map", "tree", "discovery", "repository"},
                 arguments={
@@ -279,10 +304,7 @@ mcp.add_transform(
                 },
             ),
             "read_interface": ToolTransformConfig(
-                description=(
-                    "Read a file API summary: signatures, contracts, classes, and docstrings without implementation "
-                    "body text."
-                ),
+                description="Read text API summary: signatures, contracts, classes, and docstrings without body text.",
                 tags={"interface", "signature", "contract", "docstring", "summary"},
                 arguments={
                     "root_path": ArgTransformConfig(description="Absolute repository root path."),

@@ -25,8 +25,8 @@ uvx --from . xray explore . --max-depth 2
 # Add source symbols when the agent needs more detail
 uvx --from . xray explore . --focus src --include-symbols
 
-# Get a structured repository map for downstream automation
-uvx --from . xray explore . --focus src --include-symbols --format json
+# Use text only for a compact lossy scan
+uvx --from . xray explore . --focus src --include-symbols --format text
 
 # Find symbols as scored JSON, filtering weak matches when needed
 uvx --from . xray find . "XRayIndexer" --min-score 60
@@ -91,7 +91,7 @@ the alias is used.
 
 ```bash
 xray explore ROOT [--max-depth N] [--include-symbols | --symbols] \
-  [--focus DIR ...] [--max-symbols-per-file N] [--format text|json]
+  [--focus DIR ...] [--max-symbols-per-file N] [--format json|text] [--pretty]
 ```
 
 Important options:
@@ -100,7 +100,9 @@ Important options:
 - `--include-symbols` and `--symbols` include compact file skeletons.
 - `--focus DIR` can be repeated to keep output centered on selected top-level directories; root-level files remain visible for repository context.
 - `--max-symbols-per-file N` limits skeleton detail per file and must be zero or greater.
-- `--format json` returns both `tree_text` and structured `entries`.
+- JSON is the default and returns both `tree_text` and structured `entries`.
+- `--format text` returns the compact lossy tree view.
+- `--pretty` indents JSON output for visual inspection.
 
 Explore output excludes common dependency, cache, build, generated metadata, and
 agent/task state directories by default so maps stay focused on maintainable
@@ -109,10 +111,10 @@ project files.
 ### `xray find`
 
 ```bash
-xray find ROOT QUERY [--limit N] [--min-score 0-100] [--format json|text]
+xray find ROOT QUERY [--limit N] [--min-score 0-100] [--format json|text] [--pretty]
 ```
 
-`find` defaults to JSON because symbol objects are usually piped into impact
+JSON is the default because symbol objects are usually piped into impact
 analysis. JSON symbols include repository-relative `path`, absolute `abs_path`,
 one-based `start_line`/`end_line`, `type`, and `score`.
 
@@ -122,7 +124,7 @@ one-based `start_line`/`end_line`, `type`, and `score`.
 ### `xray interface`
 
 ```bash
-xray interface ROOT FILE_PATH [--format text|json]
+xray interface ROOT FILE_PATH [--format json|text] [--pretty]
 ```
 
 `FILE_PATH` may be absolute or relative to `ROOT`, but it must resolve inside the
@@ -151,10 +153,11 @@ from impact results. Symbol paths must resolve inside `ROOT`.
 ## JSON Output
 
 JSON output is wrapped in a stable `schema_version: "xray.cli.v1"` envelope.
-Every successful command includes `ok: true`, `command`, `root_path`, and
-command-specific data. JSON errors use `ok: false`, `error`, and `warnings`.
-Parse errors are JSON only when the caller requested `--format json`; otherwise
-they are plain text for normal terminal ergonomics.
+It is compact by default for token efficiency. Pass `--pretty` for indented JSON,
+or `--format text` for lossy human-readable scans. Every successful command
+includes `ok: true`, `command`, `root_path`, and command-specific data. JSON
+errors use `ok: false`, `error`, and `warnings`. Parse and validation errors are
+JSON unless the caller explicitly requested `--format text`.
 
 Command-specific fields:
 
@@ -210,9 +213,9 @@ with a `{name, arguments}` payload.
 
 The transformed MCP surface exposes compact metadata and tags for:
 
-- `explore_repo`: map repository structure and optional symbol skeletons.
+- `explore_repo`: structured map with `tree_text`, `entries`, `options`, and optional symbol skeletons.
 - `find_symbol`: find code symbols by fuzzy name or behavior phrase.
-- `read_interface`: read a file interface without implementation bodies.
+- `read_interface`: read a text file interface without implementation bodies.
 - `what_breaks`: assess references to a returned symbol object.
 
 Detailed guidance is available on demand:
