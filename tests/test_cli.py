@@ -1,7 +1,6 @@
 import asyncio
 import io
 import json
-import pickle
 import subprocess
 import sys
 import threading
@@ -356,7 +355,7 @@ def test_indexer_cache_dir_is_scoped_by_root_path(tmp_path):
     assert indexer_b.cache_dir.name.endswith("-abc123")
 
 
-def test_indexer_save_cache_writes_readable_pickle(tmp_path):
+def test_indexer_save_cache_writes_validated_json(tmp_path):
     repo = write_sample_repo(tmp_path)
     completed = subprocess.CompletedProcess(
         args=["git", "rev-parse", "HEAD"],
@@ -368,16 +367,68 @@ def test_indexer_save_cache_writes_readable_pickle(tmp_path):
     with patch("xray.core.indexer.subprocess.run", return_value=completed):
         indexer = XRayIndexer(str(repo))
 
-    indexer._cache = {"sample": [{"signature": "def target_function(value):", "doc": ""}]}
+    indexer._set_cached_symbols("sample", [{"signature": "def target_function(value):", "doc": ""}])
     indexer._save_cache()
 
     assert indexer.cache_dir is not None
-    cache_file = indexer.cache_dir / "symbols.pkl"
-    with open(cache_file, "rb") as f:
-        saved = pickle.load(f)
+    cache_file = indexer.cache_dir / "symbols.json"
+    saved = json.loads(cache_file.read_text(encoding="utf-8"))
 
     assert saved == indexer._cache
     assert list(indexer.cache_dir.glob("tmp*")) == []
+
+
+def test_indexer_load_cache_rejects_invalid_json_shape(tmp_path):
+    repo = write_sample_repo(tmp_path)
+    completed = subprocess.CompletedProcess(
+        args=["git", "rev-parse", "HEAD"],
+        returncode=0,
+        stdout="invalid-shape\n",
+        stderr="",
+    )
+
+    with patch("xray.core.indexer.subprocess.run", return_value=completed):
+        indexer = XRayIndexer(str(repo))
+
+    assert indexer.cache_dir is not None
+    (indexer.cache_dir / "symbols.json").write_text(
+        json.dumps(
+            {
+                "valid": [{"signature": "def target_function(value):", "doc": ""}],
+                "not-a-list": {"signature": "bad"},
+                "bad-symbol": [{"signature": 123, "doc": ""}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("xray.core.indexer.subprocess.run", return_value=completed):
+        reloaded = XRayIndexer(str(repo))
+
+    assert dict(reloaded._cache) == {"valid": [{"signature": "def target_function(value):", "doc": ""}]}
+
+
+def test_indexer_symbol_cache_is_bounded(tmp_path, monkeypatch):
+    repo = write_sample_repo(tmp_path)
+    indexer = XRayIndexer(str(repo))
+    monkeypatch.setattr("xray.core.indexer.MAX_SYMBOL_CACHE_ENTRIES", 2)
+
+    indexer._set_cached_symbols("old", [{"signature": "def old():", "doc": ""}])
+    indexer._set_cached_symbols("middle", [{"signature": "def middle():", "doc": ""}])
+    indexer._set_cached_symbols("new", [{"signature": "def new():", "doc": ""}])
+
+    assert list(indexer._cache) == ["middle", "new"]
+
+
+def test_indexer_skips_oversized_files_for_skeleton_extraction(tmp_path, monkeypatch):
+    repo = write_sample_repo(tmp_path)
+    large_file = repo / "src" / "large.py"
+    large_file.write_text("def huge():\n    pass\n" + ("# filler\n" * 20), encoding="utf-8")
+    indexer = XRayIndexer(str(repo))
+    monkeypatch.setattr("xray.core.indexer.MAX_SKELETON_FILE_BYTES", 10)
+
+    assert indexer._get_file_skeleton_enhanced(large_file, max_symbols=5) == []
+    assert indexer._cache == {}
 
 
 def test_find_cli_reports_missing_ast_grep_as_json_error(tmp_path, capsys):
@@ -498,6 +549,41 @@ def test_impact_cli_reads_symbol_from_stdin(tmp_path, capsys, monkeypatch):
     assert exit_code == 0
     result = json.loads(capsys.readouterr().out)
     assert result["impact"]["total_count"] >= 1
+
+
+def test_impact_cli_rejects_missing_symbol_file_as_json_error(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+
+    exit_code = cli.main(["impact", str(repo), "--symbol-file", str(tmp_path / "missing.json")])
+
+    assert exit_code == 2
+    result = json.loads(capsys.readouterr().err)
+    assert result["ok"] is False
+    assert "Could not read symbol file" in result["error"]
+
+
+def test_impact_cli_rejects_empty_stdin_symbol_json(tmp_path, capsys, monkeypatch):
+    repo = write_sample_repo(tmp_path)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+
+    exit_code = cli.main(["impact", str(repo), "--symbol-file", "-"])
+
+    assert exit_code == 2
+    result = json.loads(capsys.readouterr().err)
+    assert result["ok"] is False
+    assert result["error"] == "Symbol JSON from stdin is empty."
+
+
+def test_impact_cli_rejects_oversized_stdin_symbol_json(tmp_path, capsys, monkeypatch):
+    repo = write_sample_repo(tmp_path)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(" " * (cli.MAX_SYMBOL_JSON_CHARS + 1)))
+
+    exit_code = cli.main(["impact", str(repo), "--symbol-file", "-"])
+
+    assert exit_code == 2
+    result = json.loads(capsys.readouterr().err)
+    assert result["ok"] is False
+    assert "exceeds" in result["error"]
 
 
 def test_impact_cli_accepts_relative_symbol_from_find_json(tmp_path, capsys):
@@ -625,6 +711,63 @@ def test_mcp_what_breaks_rejects_bare_relative_symbol_path():
     result = mcp_server.what_breaks(symbol)
 
     assert result == {"error": "what_breaks requires an absolute symbol path or abs_path when called via MCP."}
+
+
+def test_mcp_what_breaks_rejects_absolute_symbol_without_inferable_root(tmp_path, monkeypatch):
+    repo = write_sample_repo(tmp_path)
+    symbol_path = repo / "src" / "sample.py"
+
+    def fail_if_root_scan(path, operation):
+        assert Path(path) != Path("/")
+        raise AssertionError("run_indexer_operation should not be called without an inferable root")
+
+    monkeypatch.setattr(mcp_server, "run_indexer_operation", fail_if_root_scan)
+
+    result = mcp_server.what_breaks(
+        {
+            "name": "target_function",
+            "type": "function",
+            "path": str(symbol_path),
+            "start_line": 1,
+            "end_line": 2,
+        }
+    )
+
+    assert "error" in result
+    assert "requires a CLI find symbol" in result["error"]
+
+
+def test_mcp_what_breaks_infers_root_from_cli_symbol_without_git(tmp_path, monkeypatch):
+    repo = write_sample_repo(tmp_path)
+    symbol_path = repo / "src" / "sample.py"
+    seen = {}
+
+    def fake_run_indexer_operation(path, operation):
+        seen["path"] = path
+        return {
+            "references": [],
+            "total_count": 0,
+            "raw_count": 0,
+            "filtered_count": 0,
+            "strategy": "text",
+            "note": "Found 0 references using text search.",
+        }
+
+    monkeypatch.setattr(mcp_server, "run_indexer_operation", fake_run_indexer_operation)
+
+    result = mcp_server.what_breaks(
+        {
+            "name": "target_function",
+            "type": "function",
+            "path": "src/sample.py",
+            "abs_path": str(symbol_path),
+            "start_line": 1,
+            "end_line": 2,
+        }
+    )
+
+    assert "error" not in result
+    assert seen["path"] == str(repo)
 
 
 def test_mcp_tool_surface_is_search_first_with_compact_metadata(tmp_path):
@@ -960,6 +1103,61 @@ def test_mcp_concurrent_call_tool_requests_succeed_same_and_multi_root(tmp_path)
     assert multi_results[3]["tree_text"].startswith(str(repo_b))
 
 
+def test_mcp_indexer_cache_eviction_is_lru_and_bounded(tmp_path, monkeypatch):
+    repos = [write_sample_repo(tmp_path / str(index)) for index in range(3)]
+    monkeypatch.setenv("XRAY_MCP_INDEXER_CACHE_LIMIT", "2")
+    with mcp_server._indexer_cache_lock:
+        mcp_server._indexer_cache.clear()
+        mcp_server._indexer_locks.clear()
+        mcp_server._indexer_active_operations.clear()
+
+    for repo in repos:
+        mcp_server.get_indexer(str(repo))
+
+    with mcp_server._indexer_cache_lock:
+        cached_paths = list(mcp_server._indexer_cache)
+
+    assert cached_paths == [str(repos[1].resolve()), str(repos[2].resolve())]
+    assert set(mcp_server._indexer_locks) == set(cached_paths)
+
+
+def test_mcp_indexer_cache_does_not_evict_active_operations(tmp_path, monkeypatch):
+    repo_a = write_sample_repo(tmp_path / "a")
+    repo_b = write_sample_repo(tmp_path / "b")
+    release = threading.Event()
+    started = threading.Event()
+    monkeypatch.setenv("XRAY_MCP_INDEXER_CACHE_LIMIT", "1")
+    with mcp_server._indexer_cache_lock:
+        mcp_server._indexer_cache.clear()
+        mcp_server._indexer_locks.clear()
+        mcp_server._indexer_active_operations.clear()
+
+    def long_operation(indexer):
+        started.set()
+        assert release.wait(timeout=2)
+        return indexer.root_path
+
+    worker = threading.Thread(
+        target=mcp_server.run_indexer_operation,
+        args=(str(repo_a), long_operation),
+    )
+    worker.start()
+    assert started.wait(timeout=2)
+
+    mcp_server.get_indexer(str(repo_b))
+    with mcp_server._indexer_cache_lock:
+        assert str(repo_a.resolve()) in mcp_server._indexer_cache
+        assert str(repo_b.resolve()) in mcp_server._indexer_cache
+
+    release.set()
+    worker.join(timeout=2)
+
+    with mcp_server._indexer_cache_lock:
+        cached_paths = list(mcp_server._indexer_cache)
+
+    assert cached_paths == [str(repo_b.resolve())]
+
+
 def test_mcp_workflow_guidance_is_available_on_demand():
     async def inspect_guidance():
         from fastmcp import Client
@@ -1146,7 +1344,7 @@ def test_cli_version_returns_without_system_exit(capsys):
     exit_code = cli.main(["--version"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out.strip() == "xray 0.6.1"
+    assert capsys.readouterr().out.strip() == "xray 0.7.0"
 
 
 def test_cli_help_documents_agent_workflow_json_and_safety(capsys):

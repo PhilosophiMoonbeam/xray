@@ -27,6 +27,7 @@ from xray.models import (
 
 SCHEMA_VERSION = "xray.cli.v1"
 MAX_SCORE = 100
+MAX_SYMBOL_JSON_CHARS = 1024 * 1024
 OUTPUT_FORMAT_HELP = "Output format. json is the default automation contract; text is a lossy scan mode."
 PRETTY_HELP = "Pretty-print JSON output; ignored with --format text."
 
@@ -412,9 +413,13 @@ def load_symbol(args: argparse.Namespace, root_path: Path | None = None) -> dict
         symbol = json.loads(args.symbol_json)
     elif args.symbol_file:
         if args.symbol_file == "-":
-            raw = sys.stdin.read()
+            raw = read_bounded_symbol_json(sys.stdin, "stdin")
         else:
-            raw = Path(args.symbol_file).read_text(encoding="utf-8")
+            symbol_file = Path(args.symbol_file)
+            try:
+                raw = read_bounded_symbol_json_file(symbol_file)
+            except OSError as exc:
+                raise ValueError(f"Could not read symbol file '{args.symbol_file}': {exc.strerror or exc}") from exc
         symbol = json.loads(raw)
     else:
         if not args.name or not args.path:
@@ -439,6 +444,39 @@ def load_symbol(args: argparse.Namespace, root_path: Path | None = None) -> dict
             resolve_inside_root(str(symbol["abs_path"]), root_path, "abs_path")
         symbol["path"] = str(resolve_inside_root(str(symbol["path"]), root_path, "path"))
     return symbol
+
+
+def read_bounded_symbol_json_file(path: Path) -> str:
+    """Read a symbol JSON file with the same size cap as stdin."""
+    try:
+        if path.stat().st_size > MAX_SYMBOL_JSON_CHARS:
+            raise ValueError(f"Symbol JSON exceeds {MAX_SYMBOL_JSON_CHARS} characters.")
+    except FileNotFoundError:
+        raise
+    except OSError:
+        pass
+
+    with open(path, encoding="utf-8") as stream:
+        return read_bounded_symbol_json(stream, str(path))
+
+
+def read_bounded_symbol_json(stream: Any, source: str) -> str:
+    """Read symbol JSON input while preventing accidental unbounded reads."""
+    chunks: list[str] = []
+    total = 0
+    while True:
+        chunk = stream.read(min(65536, MAX_SYMBOL_JSON_CHARS + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > MAX_SYMBOL_JSON_CHARS:
+            raise ValueError(f"Symbol JSON from {source} exceeds {MAX_SYMBOL_JSON_CHARS} characters.")
+
+    raw = "".join(chunks)
+    if not raw.strip():
+        raise ValueError(f"Symbol JSON from {source} is empty.")
+    return raw
 
 
 def resolve_inside_root(path: str, root_path: Path, field_name: str) -> Path:

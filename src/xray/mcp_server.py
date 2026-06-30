@@ -31,6 +31,7 @@ KEY FEATURES:
 import asyncio
 import os
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
@@ -48,8 +49,11 @@ from xray.models import dump_explore_data, dump_impact_result, dump_symbol_outpu
 mcp = FastMCP("XRAY Code Intelligence")
 
 # Cache for indexer instances per repository path
-_indexer_cache: dict[str, XRayIndexer] = {}
+INDEXER_CACHE_LIMIT_ENV = "XRAY_MCP_INDEXER_CACHE_LIMIT"
+DEFAULT_INDEXER_CACHE_LIMIT = 32
+_indexer_cache: OrderedDict[str, XRayIndexer] = OrderedDict()
 _indexer_locks: dict[str, threading.RLock] = {}
+_indexer_active_operations: dict[str, int] = {}
 _indexer_cache_lock = threading.RLock()
 T = TypeVar("T")
 
@@ -129,24 +133,93 @@ def normalize_path(path: str) -> str:
     return path
 
 
+def get_indexer_cache_limit() -> int:
+    """Return the configured MCP indexer cache entry limit."""
+    raw_limit = os.environ.get(INDEXER_CACHE_LIMIT_ENV)
+    if raw_limit is None:
+        return DEFAULT_INDEXER_CACHE_LIMIT
+    try:
+        return max(0, int(raw_limit))
+    except ValueError:
+        return DEFAULT_INDEXER_CACHE_LIMIT
+
+
+def _trim_indexer_cache_locked() -> None:
+    """Evict least-recently-used inactive indexers until the cache is within its limit."""
+    limit = get_indexer_cache_limit()
+    while len(_indexer_cache) > limit:
+        evicted_path = next(iter(_indexer_cache))
+        if _indexer_active_operations.get(evicted_path, 0) > 0:
+            return
+
+        _indexer_cache.pop(evicted_path, None)
+        _indexer_locks.pop(evicted_path, None)
+        _indexer_active_operations.pop(evicted_path, None)
+
+
+def _get_or_create_indexer_locked(path: str) -> tuple[XRayIndexer, threading.RLock]:
+    """Return the cached indexer and lock for an already-normalized path."""
+    if path not in _indexer_cache:
+        _indexer_cache[path] = XRayIndexer(path)
+        _indexer_locks[path] = threading.RLock()
+    else:
+        _indexer_cache.move_to_end(path)
+
+    lock = _indexer_locks.setdefault(path, threading.RLock())
+    return _indexer_cache[path], lock
+
+
 def get_indexer(path: str) -> XRayIndexer:
     """Get or create indexer instance for the given path."""
     path = normalize_path(path)
     with _indexer_cache_lock:
-        if path not in _indexer_cache:
-            _indexer_cache[path] = XRayIndexer(path)
-            _indexer_locks[path] = threading.RLock()
-        return _indexer_cache[path]
+        indexer, _lock = _get_or_create_indexer_locked(path)
+        _trim_indexer_cache_locked()
+        return indexer
 
 
 def run_indexer_operation(path: str, operation: Callable[[XRayIndexer], T]) -> T:
     """Run blocking indexer work with per-repository serialization."""
     path = normalize_path(path)
-    indexer = get_indexer(path)
     with _indexer_cache_lock:
-        lock = _indexer_locks.setdefault(path, threading.RLock())
-    with lock:
-        return operation(indexer)
+        indexer, lock = _get_or_create_indexer_locked(path)
+        _indexer_active_operations[path] = _indexer_active_operations.get(path, 0) + 1
+        _trim_indexer_cache_locked()
+    try:
+        with lock:
+            return operation(indexer)
+    finally:
+        with _indexer_cache_lock:
+            active_count = _indexer_active_operations.get(path, 0) - 1
+            if active_count > 0:
+                _indexer_active_operations[path] = active_count
+            else:
+                _indexer_active_operations.pop(path, None)
+            _trim_indexer_cache_locked()
+
+
+def infer_symbol_root_path(exact_symbol: dict[str, Any], symbol_path: Path) -> Path:
+    """Infer a repository root for MCP impact without falling back to filesystem root."""
+    declared_path = Path(str(exact_symbol["path"]))
+    if not declared_path.is_absolute():
+        try:
+            root_path = symbol_path.parents[len(declared_path.parts) - 1]
+        except IndexError as exc:
+            raise ValueError("what_breaks could not infer a repository root from the symbol path.") from exc
+        if (root_path / declared_path).resolve() != symbol_path:
+            raise ValueError("what_breaks symbol path and abs_path do not describe the same file.")
+        return root_path
+
+    for candidate in [symbol_path.parent, *symbol_path.parents]:
+        if candidate == Path(candidate.anchor):
+            break
+        if (candidate / ".git").exists():
+            return candidate
+
+    raise ValueError(
+        "what_breaks requires a CLI find symbol with relative path and abs_path, "
+        "or an absolute symbol inside a git repo."
+    )
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
@@ -258,21 +331,12 @@ def what_breaks(exact_symbol: dict[str, Any]) -> dict[str, Any]:
         if not symbol_path.is_absolute():
             return {"error": "what_breaks requires an absolute symbol path or abs_path when called via MCP."}
         symbol_path = symbol_path.resolve()
-        root_path = str(symbol_path.parent)
+        root_path = infer_symbol_root_path(exact_symbol, symbol_path)
         symbol_for_indexer = dict(exact_symbol)
         symbol_for_indexer["path"] = str(symbol_path)
 
-        # Find a suitable root (go up until we find a git repo or reach root)
-        while root_path != "/":
-            if (Path(root_path) / ".git").exists():
-                break
-            parent = Path(root_path).parent
-            if parent == Path(root_path):
-                break
-            root_path = str(parent)
-
         result = run_indexer_operation(
-            root_path,
+            str(root_path),
             lambda indexer: indexer.what_breaks(symbol_for_indexer),
         )
         return dump_impact_result(result)

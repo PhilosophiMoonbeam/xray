@@ -5,10 +5,10 @@ import fnmatch
 import hashlib
 import json
 import os
-import pickle
 import re
 import subprocess
 import tempfile
+from collections import OrderedDict
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, TypedDict, cast
@@ -75,6 +75,13 @@ LANGUAGE_MAP = {
     ".tsx": "typescript",
     ".go": "go",
 }
+
+CACHE_FILENAME = "symbols.json"
+MAX_SYMBOL_CACHE_ENTRIES = 2048
+GIT_TIMEOUT_SECONDS = 5
+RG_TIMEOUT_SECONDS = 30
+MAX_RG_OUTPUT_CHARS = 10 * 1024 * 1024
+MAX_SKELETON_FILE_BYTES = 1024 * 1024
 
 
 class SymbolSkeleton(TypedDict):
@@ -152,7 +159,7 @@ class XRayIndexer:
 
     def __init__(self, root_path: str):
         self.root_path = Path(root_path).resolve()
-        self._cache = {}
+        self._cache: OrderedDict[str, list[SymbolSkeleton]] = OrderedDict()
         self.last_warnings: list[str] = []
         self._init_cache()
 
@@ -166,6 +173,7 @@ class XRayIndexer:
                 capture_output=True,
                 check=False,
                 text=True,
+                timeout=GIT_TIMEOUT_SECONDS,
             )
             if result.returncode == 0:
                 self.commit_sha = result.stdout.strip()
@@ -185,24 +193,25 @@ class XRayIndexer:
         if not self.cache_dir:
             return
 
-        cache_file = self.cache_dir / "symbols.pkl"
+        cache_file = self.cache_dir / CACHE_FILENAME
         if cache_file.exists():
             try:
-                with open(cache_file, "rb") as f:
-                    self._cache = pickle.load(f)
+                with open(cache_file, encoding="utf-8") as f:
+                    self._cache = self._coerce_symbol_cache(json.load(f))
             except Exception:
-                self._cache = {}
+                self._cache = OrderedDict()
 
     def _save_cache(self):
         """Save cache to disk."""
         if not self.cache_dir:
             return
 
-        cache_file = self.cache_dir / "symbols.pkl"
+        self._prune_symbol_cache()
+        cache_file = self.cache_dir / CACHE_FILENAME
         temp_path = None
         try:
-            with tempfile.NamedTemporaryFile("wb", dir=self.cache_dir, delete=False) as f:
-                pickle.dump(self._cache, f)
+            with tempfile.NamedTemporaryFile("w", dir=self.cache_dir, delete=False, encoding="utf-8") as f:
+                json.dump(self._cache, f, separators=(",", ":"), sort_keys=True)
                 f.flush()
                 os.fsync(f.fileno())
                 temp_path = Path(f.name)
@@ -215,11 +224,55 @@ class XRayIndexer:
                     pass
             pass
 
+    def _coerce_symbol_cache(self, value: Any) -> OrderedDict[str, list[SymbolSkeleton]]:
+        """Return a bounded cache containing only the symbol skeleton shape XRAY writes."""
+        cache: OrderedDict[str, list[SymbolSkeleton]] = OrderedDict()
+        if not isinstance(value, dict):
+            return cache
+
+        for key, symbols in value.items():
+            if not isinstance(key, str) or not isinstance(symbols, list):
+                continue
+
+            clean_symbols: list[SymbolSkeleton] = []
+            for symbol in symbols:
+                if not isinstance(symbol, dict):
+                    continue
+                signature = symbol.get("signature", "")
+                doc = symbol.get("doc", "")
+                if isinstance(signature, str) and isinstance(doc, str):
+                    clean_symbols.append({"signature": signature, "doc": doc})
+
+            if clean_symbols:
+                cache[key] = clean_symbols
+
+        while len(cache) > MAX_SYMBOL_CACHE_ENTRIES:
+            cache.popitem(last=False)
+        return cache
+
+    def _get_cached_symbols(self, cache_key: str) -> list[SymbolSkeleton] | None:
+        """Return cached symbols and mark the entry as recently used."""
+        symbols = self._cache.get(cache_key)
+        if symbols is not None:
+            self._cache.move_to_end(cache_key)
+        return symbols
+
+    def _set_cached_symbols(self, cache_key: str, symbols: list[SymbolSkeleton]) -> None:
+        """Store symbols while bounding long-running MCP memory use."""
+        self._cache[cache_key] = symbols
+        self._cache.move_to_end(cache_key)
+        self._prune_symbol_cache()
+
+    def _prune_symbol_cache(self) -> None:
+        """Drop least-recently-used symbol entries past the configured cap."""
+        while len(self._cache) > MAX_SYMBOL_CACHE_ENTRIES:
+            self._cache.popitem(last=False)
+
     def _get_cache_key(self, file_path: Path) -> str:
         """Generate cache key for a file."""
         try:
             stat = file_path.stat()
-            return f"{file_path}:{stat.st_mtime}:{stat.st_size}"
+            return f"{file_path}:{stat.st_mtime_ns}:{stat.st_size}"
         except OSError:
             return str(file_path)
 
@@ -439,10 +492,10 @@ class XRayIndexer:
     def _get_file_symbol_data(self, file_path: Path, max_symbols: int) -> list[ExploreSymbol]:
         """Return structured symbol skeleton data for a source file."""
         cache_key = self._get_cache_key(file_path)
-        if cache_key not in self._cache:
+        if self._get_cached_symbols(cache_key) is None:
             self._get_file_skeleton_enhanced(file_path, max_symbols)
 
-        symbols = self._cache.get(cache_key, [])
+        symbols = self._get_cached_symbols(cache_key) or []
         structured_symbols: list[ExploreSymbol] = []
         for symbol in symbols[:max_symbols]:
             signature = symbol.get("signature", "")
@@ -614,8 +667,8 @@ class XRayIndexer:
         """Extract enhanced symbol info including signatures and docstrings."""
         # Check cache first
         cache_key = self._get_cache_key(file_path)
-        if cache_key in self._cache:
-            cached_symbols = self._cache[cache_key]
+        cached_symbols = self._get_cached_symbols(cache_key)
+        if cached_symbols is not None:
             return self._format_enhanced_skeleton(cached_symbols, max_symbols)
 
         language = LANGUAGE_MAP.get(file_path.suffix.lower())
@@ -623,6 +676,9 @@ class XRayIndexer:
             return []
 
         try:
+            if file_path.stat().st_size > MAX_SKELETON_FILE_BYTES:
+                return []
+
             with open(file_path, encoding="utf-8") as f:
                 content = f.read()
 
@@ -631,8 +687,7 @@ class XRayIndexer:
             else:
                 symbols = self._extract_regex_symbols_enhanced(content, language)
 
-            # Cache the results
-            self._cache[cache_key] = symbols
+            self._set_cached_symbols(cache_key, symbols)
 
             return self._format_enhanced_skeleton(symbols, max_symbols)
 
@@ -1142,9 +1197,18 @@ class XRayIndexer:
         # Try ripgrep
         try:
             cmd = ["rg", "-w", "--json", "-C", str(context_lines), symbol_name, str(self.root_path)]
-            result = subprocess.run(cmd, capture_output=True, check=False, text=True)
+            with tempfile.TemporaryFile("w+", encoding="utf-8") as stdout_file:
+                result = subprocess.run(
+                    cmd,
+                    stdout=stdout_file,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    text=True,
+                    timeout=RG_TIMEOUT_SECONDS,
+                )
+                stdout = self._read_limited_process_output(stdout_file, MAX_RG_OUTPUT_CHARS)
             if result.returncode == 0:
-                for line in result.stdout.strip().split("\n"):
+                for line in stdout.strip().split("\n"):
                     if line:
                         try:
                             data = json.loads(line)
@@ -1165,11 +1229,24 @@ class XRayIndexer:
                         except json.JSONDecodeError:
                             continue
                 return references
-        except FileNotFoundError:
+        except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
         # Python fallback (simplified, no context for now to save complexity)
         return self._python_text_search(symbol_name)
+
+    def _read_limited_process_output(self, stream: Any, limit: int) -> str:
+        """Read a temp-backed subprocess stream only when it is within the configured cap."""
+        stream.seek(0, os.SEEK_END)
+        length = stream.tell()
+        if length > limit:
+            return ""
+
+        stream.seek(0)
+        output = stream.read()
+        if len(output) > limit:
+            return ""
+        return output
 
     def _python_text_search(self, symbol_name: str) -> list[ImpactReference]:
         """Fallback text search using Python when ripgrep is not available."""

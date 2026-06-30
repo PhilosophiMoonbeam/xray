@@ -75,6 +75,31 @@ def test_run_ast_grep_raises_when_executable_missing():
             run_ast_grep(["run", "--pattern", "anything", "--json", "."])
 
 
+def test_run_ast_grep_raises_command_error_on_timeout(monkeypatch):
+    monkeypatch.setenv("XRAY_AST_GREP_TIMEOUT_SECONDS", "0.5")
+
+    with patch(
+        "xray.core.ast_grep.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(["ast-grep"], timeout=0.5),
+    ):
+        with pytest.raises(AstGrepCommandError, match=r"timed out after 0\.5 seconds"):
+            run_ast_grep(["run", "--pattern", "anything", "--json", "."])
+
+
+def test_run_ast_grep_rejects_oversized_output(monkeypatch):
+    monkeypatch.setenv("XRAY_AST_GREP_OUTPUT_LIMIT_CHARS", "1024")
+    completed = subprocess.CompletedProcess(
+        args=["ast-grep"],
+        returncode=0,
+        stdout=" " * 1025,
+        stderr="",
+    )
+
+    with patch("xray.core.ast_grep.subprocess.run", return_value=completed):
+        with pytest.raises(AstGrepCommandError, match="stdout exceeded 1024 characters"):
+            run_ast_grep(["run", "--pattern", "anything", "--json", "."])
+
+
 def test_parse_json_array_rejects_non_array_output():
     with pytest.raises(ValueError, match="expected a list"):
         parse_json_array("{}")
