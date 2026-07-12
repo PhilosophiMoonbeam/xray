@@ -81,6 +81,12 @@ READ_ONLY_TOOL_ANNOTATIONS = {
     "idempotentHint": True,
     "openWorldHint": False,
 }
+DESTRUCTIVE_TOOL_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
+    "openWorldHint": False,
+}
 
 
 @mcp.resource(
@@ -230,6 +236,8 @@ async def explore_repo(
     include_symbols: bool | str = False,
     focus_dirs: list[str] | None = None,
     max_symbols_per_file: int | str = 5,
+    symbol_types: list[str] | str | None = None,
+    max_entries: int | str = 5000,
 ) -> dict[str, Any]:
     """Map repository structure, optionally including symbol skeletons."""
     try:
@@ -240,8 +248,14 @@ async def explore_repo(
             max_depth = int(max_depth)
         if isinstance(max_symbols_per_file, str):
             max_symbols_per_file = int(max_symbols_per_file)
+        if isinstance(max_entries, str):
+            max_entries = int(max_entries)
         if isinstance(include_symbols, str):
             include_symbols = include_symbols.lower() in ("true", "1", "yes")
+        if isinstance(symbol_types, str):
+            symbol_types = [value.strip() for value in symbol_types.split(",") if value.strip()]
+        if max_entries < 1:
+            raise ValueError("max_entries must be 1 or greater.")
 
         await ctx.report_progress(1, 2, "building repository map")
         result = await asyncio.to_thread(
@@ -253,6 +267,8 @@ async def explore_repo(
                 include_symbols,
                 focus_dirs,
                 max_symbols_per_file,
+                symbol_types,
+                max_entries,
             ),
         )
         await ctx.report_progress(2, 2, "repository map ready")
@@ -268,24 +284,25 @@ def build_explore_result(
     include_symbols: bool,
     focus_dirs: list[str] | None,
     max_symbols_per_file: int,
+    symbol_types: list[str] | None = None,
+    max_entries: int = 5000,
 ) -> dict[str, Any]:
     """Return structured MCP explore data with the compact text tree included."""
-    tree = indexer.explore_repo(
-        max_depth=max_depth,
-        include_symbols=include_symbols,
-        focus_dirs=focus_dirs,
-        max_symbols_per_file=max_symbols_per_file,
-    )
     data = dump_explore_data(
         indexer.explore_repo_data(
             max_depth=max_depth,
             include_symbols=include_symbols,
             focus_dirs=focus_dirs,
             max_symbols_per_file=max_symbols_per_file,
+            symbol_types=symbol_types,
+            max_entries=max_entries,
         )
     )
-    data["tree_text"] = tree
-    data["warnings"] = []
+    data["warnings"] = (
+        [f"Explore output truncated at {max_entries} entries; narrow with focus_dirs/max_depth or raise max_entries."]
+        if data["truncated"]
+        else []
+    )
     return data
 
 
@@ -344,6 +361,55 @@ def what_breaks(exact_symbol: dict[str, Any]) -> dict[str, Any]:
         return {"error": f"Error finding references: {e!s}"}
 
 
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+def search_pattern(root_path: str, pattern: str, lang: str | None = None) -> dict[str, Any]:
+    """Search a repository with an ast-grep structural pattern."""
+    try:
+        matches = run_indexer_operation(root_path, lambda indexer: indexer.search_pattern(pattern, lang))
+        return {"matches": matches, "match_count": len(matches), "pattern": pattern, "language": lang}
+    except Exception as e:
+        return {"error": f"Error searching pattern: {e!s}"}
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def rewrite_pattern(root_path: str, pattern: str, replacement: str, lang: str | None = None) -> dict[str, Any]:
+    """Apply an ast-grep structural rewrite to repository files in place."""
+    try:
+        return run_indexer_operation(root_path, lambda indexer: indexer.rewrite_pattern(pattern, replacement, lang))
+    except Exception as e:
+        return {"error": f"Error rewriting pattern: {e!s}"}
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def scan_rules(root_path: str, rule_path: str, fix: bool = False) -> dict[str, Any]:
+    """Scan a repository with ast-grep YAML rules, optionally applying fixes."""
+    try:
+        matches = run_indexer_operation(root_path, lambda indexer: indexer.scan_rules(rule_path, fix))
+        return {"matches": matches, "match_count": len(matches), "fixed": fix}
+    except Exception as e:
+        return {"error": f"Error scanning rules: {e!s}"}
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+def file_imports(root_path: str, file_path: str) -> dict[str, Any]:
+    """List imports from one repository file using ast-grep outline."""
+    try:
+        items = run_indexer_operation(root_path, lambda indexer: indexer.file_outline_items(file_path, "imports"))
+        return {"file_path": file_path, "items": items}
+    except Exception as e:
+        return {"error": f"Error listing imports: {e!s}"}
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+def file_exports(root_path: str, file_path: str) -> dict[str, Any]:
+    """List exports from one repository file using ast-grep outline."""
+    try:
+        items = run_indexer_operation(root_path, lambda indexer: indexer.file_outline_items(file_path, "exports"))
+        return {"file_path": file_path, "items": items}
+    except Exception as e:
+        return {"error": f"Error listing exports: {e!s}"}
+
+
 mcp.add_transform(
     ToolTransform(
         {
@@ -359,11 +425,15 @@ mcp.add_transform(
                     "include_symbols": ArgTransformConfig(description="Include function/class skeletons when true."),
                     "focus_dirs": ArgTransformConfig(description="Top-level directories to focus on."),
                     "max_symbols_per_file": ArgTransformConfig(description="Symbol skeleton limit per file."),
+                    "symbol_types": ArgTransformConfig(
+                        description="Optional symbol types to include, as a list or comma-separated string."
+                    ),
+                    "max_entries": ArgTransformConfig(description="Maximum map entries; truncation is reported."),
                 },
             ),
             "find_symbol": ToolTransformConfig(
                 description="Find definitions: functions, methods, classes, types, enums, and code symbols.",
-                tags={"find", "symbol", "search", "function", "class"},
+                tags={"find", "symbol", "search", "function", "class", "type", "method", "enum", "definitions"},
                 arguments={
                     "root_path": ArgTransformConfig(description="Absolute repository root path to search."),
                     "query": ArgTransformConfig(description="Symbol name or behavior phrase to find."),
@@ -389,6 +459,54 @@ mcp.add_transform(
                     "exact_symbol": ArgTransformConfig(
                         description="Full symbol object from find_symbol, including absolute path and line data."
                     ),
+                },
+            ),
+            "search_pattern": ToolTransformConfig(
+                description=(
+                    "Search arbitrary AST structure with an ast-grep pattern and return captured metavariables."
+                ),
+                tags={"search", "structural", "pattern", "ast-grep"},
+                arguments={
+                    "root_path": ArgTransformConfig(description="Absolute repository root path to search."),
+                    "pattern": ArgTransformConfig(
+                        description="ast-grep structural pattern with optional metavariables."
+                    ),
+                    "lang": ArgTransformConfig(description="Optional ast-grep pattern language."),
+                },
+            ),
+            "rewrite_pattern": ToolTransformConfig(
+                description="Rewrite matching AST structure in place across a repository; this modifies files.",
+                tags={"rewrite", "replace", "structural", "ast-grep"},
+                arguments={
+                    "root_path": ArgTransformConfig(description="Absolute repository root path to modify."),
+                    "pattern": ArgTransformConfig(description="ast-grep structural pattern to replace."),
+                    "replacement": ArgTransformConfig(description="ast-grep replacement template."),
+                    "lang": ArgTransformConfig(description="Optional ast-grep pattern language."),
+                },
+            ),
+            "scan_rules": ToolTransformConfig(
+                description="Lint a repository with ast-grep YAML rules and optionally apply configured fixes.",
+                tags={"scan", "lint", "rules", "ast-grep"},
+                arguments={
+                    "root_path": ArgTransformConfig(description="Absolute repository root path to scan."),
+                    "rule_path": ArgTransformConfig(description="Rule file or config directory inside root_path."),
+                    "fix": ArgTransformConfig(description="Apply configured rule fixes in place when true."),
+                },
+            ),
+            "file_imports": ToolTransformConfig(
+                description="List a file's imports for immediate dependency inspection.",
+                tags={"imports", "dependencies", "outline"},
+                arguments={
+                    "root_path": ArgTransformConfig(description="Absolute repository root path."),
+                    "file_path": ArgTransformConfig(description="File path inside root_path."),
+                },
+            ),
+            "file_exports": ToolTransformConfig(
+                description="List a file's exported public API declarations.",
+                tags={"exports", "api", "outline"},
+                arguments={
+                    "root_path": ArgTransformConfig(description="Absolute repository root path."),
+                    "file_path": ArgTransformConfig(description="File path inside root_path."),
                 },
             ),
         }

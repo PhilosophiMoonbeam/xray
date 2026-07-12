@@ -1,17 +1,18 @@
 """Core indexing engine for XRAY - ast-grep based implementation."""
 
-import ast
 import fnmatch
 import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+import time
 from collections import OrderedDict
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Any, TypedDict
 
 from thefuzz import fuzz
 
@@ -77,6 +78,10 @@ LANGUAGE_MAP = {
 }
 
 CACHE_FILENAME = "symbols.json"
+CACHE_ROOT = Path("/tmp/.xray_cache")
+CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+CACHE_MAX_BYTES = 512 * 1024 * 1024
+CACHE_ACTIVE_TEMP_SECONDS = 5 * 60
 MAX_SYMBOL_CACHE_ENTRIES = 2048
 GIT_TIMEOUT_SECONDS = 5
 RG_TIMEOUT_SECONDS = 30
@@ -84,7 +89,9 @@ MAX_RG_OUTPUT_CHARS = 10 * 1024 * 1024
 MAX_SKELETON_FILE_BYTES = 1024 * 1024
 
 
-class SymbolSkeleton(TypedDict):
+class SymbolSkeleton(TypedDict, total=False):
+    name: str
+    type: str
     signature: str
     doc: str
 
@@ -114,12 +121,16 @@ class ExploreOptions(TypedDict):
     include_symbols: bool
     focus_dirs: list[str]
     max_symbols_per_file: int
+    symbol_types: list[str]
+    max_entries: int
 
 
 class ExploreRepoData(TypedDict):
     root_path: str
+    tree_text: str
     entries: list[ExploreEntry]
     options: ExploreOptions
+    truncated: bool
 
 
 class SymbolMatchBase(TypedDict):
@@ -178,7 +189,8 @@ class XRayIndexer:
             if result.returncode == 0:
                 self.commit_sha = result.stdout.strip()
                 root_hash = hashlib.sha256(str(self.root_path).encode("utf-8")).hexdigest()[:16]
-                self.cache_dir = Path(f"/tmp/.xray_cache/{root_hash}-{self.commit_sha}")
+                self.cache_dir = CACHE_ROOT / f"{root_hash}-{self.commit_sha}"
+                self._prune_disk_cache(self.cache_dir)
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
                 self._load_cache()
             else:
@@ -187,6 +199,67 @@ class XRayIndexer:
         except Exception:
             self.commit_sha = None
             self.cache_dir = None
+
+    @staticmethod
+    def _prune_disk_cache(current_dir: Path) -> None:
+        """Remove expired and excess cache entries without disturbing active writes."""
+        cache_root = current_dir.parent
+        try:
+            entries = [entry for entry in cache_root.iterdir() if entry.is_dir() and entry != current_dir]
+        except OSError:
+            return
+
+        now = time.time()
+        candidates: list[tuple[float, int, Path]] = []
+        for entry in entries:
+            try:
+                # NamedTemporaryFile uses a ``tmp`` prefix. Its presence means another
+                # indexer may be between writing and atomically replacing symbols.json.
+                if XRayIndexer._has_active_cache_temp(entry, now):
+                    continue
+                modified = entry.stat().st_mtime
+                size = sum(
+                    child.stat().st_size for child in entry.rglob("*") if child.is_file() and not child.is_symlink()
+                )
+            except OSError:
+                # Concurrent creation/removal and partially readable entries are benign.
+                continue
+            candidates.append((modified, size, entry))
+
+        retained: list[tuple[float, int, Path]] = []
+        for modified, size, entry in candidates:
+            if now - modified > CACHE_MAX_AGE_SECONDS:
+                if not XRayIndexer._remove_cache_entry(entry, now):
+                    retained.append((modified, size, entry))
+            else:
+                retained.append((modified, size, entry))
+
+        total_size = sum(size for _, size, _ in retained)
+        for _, size, entry in sorted(retained):
+            if total_size <= CACHE_MAX_BYTES:
+                break
+            if not XRayIndexer._remove_cache_entry(entry, now):
+                continue
+            total_size -= size
+
+    @staticmethod
+    def _has_active_cache_temp(cache_dir: Path, now: float) -> bool:
+        """Return whether a recently touched atomic-write temp file exists."""
+        return any(
+            child.name.startswith("tmp") and now - child.stat().st_mtime <= CACHE_ACTIVE_TEMP_SECONDS
+            for child in cache_dir.iterdir()
+        )
+
+    @staticmethod
+    def _remove_cache_entry(cache_dir: Path, now: float) -> bool:
+        """Remove one entry after rechecking for a concurrent atomic write."""
+        try:
+            if XRayIndexer._has_active_cache_temp(cache_dir, now):
+                return False
+            shutil.rmtree(cache_dir)
+        except OSError:
+            return False
+        return True
 
     def _load_cache(self):
         """Load cache from disk if available."""
@@ -241,7 +314,12 @@ class XRayIndexer:
                 signature = symbol.get("signature", "")
                 doc = symbol.get("doc", "")
                 if isinstance(signature, str) and isinstance(doc, str):
-                    clean_symbols.append({"signature": signature, "doc": doc})
+                    clean_symbol: SymbolSkeleton = {"signature": signature, "doc": doc}
+                    name = symbol.get("name")
+                    symbol_type = symbol.get("type")
+                    if isinstance(name, str) and isinstance(symbol_type, str):
+                        clean_symbol.update({"name": name, "type": symbol_type})
+                    clean_symbols.append(clean_symbol)
 
             if clean_symbols:
                 cache[key] = clean_symbols
@@ -276,12 +354,80 @@ class XRayIndexer:
         except OSError:
             return str(file_path)
 
+    def _resolve_repo_path(self, path: str, *, require_file: bool = False) -> Path:
+        """Resolve a user path inside the repository and optionally require a file."""
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.root_path / candidate
+        candidate = candidate.resolve()
+        try:
+            candidate.relative_to(self.root_path)
+        except ValueError as exc:
+            raise ValueError(f"Path '{path}' is outside repository root '{self.root_path}'.") from exc
+        if not candidate.exists():
+            raise ValueError(f"Path '{path}' does not exist.")
+        if require_file and not candidate.is_file():
+            raise ValueError(f"Path '{path}' is not a file.")
+        return candidate
+
+    def search_pattern(self, pattern: str, lang: str | None = None) -> list[dict[str, Any]]:
+        """Return structural matches for an ast-grep pattern within this repository."""
+        if not pattern:
+            raise ValueError("Pattern must not be empty.")
+        args = ["run", "--pattern", pattern, "--json=compact"]
+        if lang:
+            args.extend(["--lang", lang])
+        args.append(str(self.root_path))
+        return parse_json_array(run_ast_grep(args).stdout)
+
+    def rewrite_pattern(self, pattern: str, replacement: str, lang: str | None = None) -> dict[str, Any]:
+        """Apply a structural rewrite and summarize the affected files and matches."""
+        if not pattern:
+            raise ValueError("Pattern must not be empty.")
+        matches = self.search_pattern(pattern, lang)
+        args = ["run", "--pattern", pattern, "--rewrite", replacement, "--update-all"]
+        if lang:
+            args.extend(["--lang", lang])
+        args.append(str(self.root_path))
+        run_ast_grep(args)
+        files = sorted({str(match.get("file")) for match in matches if match.get("file")})
+        return {"matches": matches, "match_count": len(matches), "files_modified": files, "file_count": len(files)}
+
+    def scan_rules(self, rule_path: str, fix: bool = False) -> list[dict[str, Any]]:
+        """Run ast-grep rules from a config path, optionally applying safe updates."""
+        resolved_rule = self._resolve_repo_path(rule_path)
+        if resolved_rule.is_dir():
+            configs = [resolved_rule / "sgconfig.yml", resolved_rule / "sgconfig.yaml"]
+            config = next((candidate for candidate in configs if candidate.is_file()), None)
+            if config is None:
+                raise ValueError(f"Rule directory '{rule_path}' does not contain sgconfig.yml or sgconfig.yaml.")
+            rule_args = ["--config", str(config)]
+        elif resolved_rule.name in {"sgconfig.yml", "sgconfig.yaml"}:
+            rule_args = ["--config", str(resolved_rule)]
+        else:
+            rule_args = ["--rule", str(resolved_rule)]
+        scan_args = ["scan", *rule_args]
+        matches = parse_json_array(run_ast_grep([*scan_args, "--json=compact", str(self.root_path)]).stdout)
+        if fix:
+            run_ast_grep([*scan_args, "--update-all", str(self.root_path)])
+        return matches
+
+    def file_outline_items(self, file_path: str, item: str) -> list[dict[str, Any]]:
+        """Return imports or exports reported by ast-grep outline for one repository file."""
+        if item not in {"imports", "exports"}:
+            raise ValueError("Outline item must be 'imports' or 'exports'.")
+        resolved_file = self._resolve_repo_path(file_path, require_file=True)
+        result = run_ast_grep(["outline", f"--items={item}", "--json=compact", str(resolved_file)])
+        return parse_json_array(result.stdout)
+
     def explore_repo(
         self,
         max_depth: int | None = None,
         include_symbols: bool = False,
         focus_dirs: list[str] | None = None,
         max_symbols_per_file: int = 5,
+        symbol_types: list[str] | None = None,
+        max_entries: int = 5000,
     ) -> str:
         """
         Build a visual file tree with optional symbol skeletons.
@@ -291,16 +437,38 @@ class XRayIndexer:
             include_symbols: Include symbol skeletons in output
             focus_dirs: Only include these top-level directories
             max_symbols_per_file: Max symbols to show per file
+            symbol_types: Optional ast-grep outline symbol types to include
 
         Returns:
             Formatted tree string
         """
-        # Get gitignore patterns if available
-        gitignore_patterns = self._parse_gitignore()
+        return self.explore_repo_data(
+            max_depth=max_depth,
+            include_symbols=include_symbols,
+            focus_dirs=focus_dirs,
+            max_symbols_per_file=max_symbols_per_file,
+            symbol_types=symbol_types,
+            max_entries=max_entries,
+        )["tree_text"]
 
-        # Build the tree
-        tree_lines = []
-        self._build_tree_recursive_enhanced(
+    def explore_repo_data(
+        self,
+        max_depth: int | None = None,
+        include_symbols: bool = False,
+        focus_dirs: list[str] | None = None,
+        max_symbols_per_file: int = 5,
+        symbol_types: list[str] | None = None,
+        max_entries: int = 5000,
+    ) -> ExploreRepoData:
+        """
+        Build structured repository map data for CLI and automation.
+
+        The text tree remains available through explore_repo and structured payloads include entries for automation.
+        """
+        gitignore_patterns = self._parse_gitignore()
+        tree_lines: list[str] = []
+        entries: list[ExploreEntry] = []
+        truncated = self._build_tree_recursive_enhanced(
             self.root_path,
             tree_lines,
             "",
@@ -310,38 +478,10 @@ class XRayIndexer:
             include_symbols=include_symbols,
             focus_dirs=focus_dirs,
             max_symbols_per_file=max_symbols_per_file,
+            symbol_types=symbol_types,
             is_last=True,
-        )
-
-        # Save cache after building tree
-        if include_symbols:
-            self._save_cache()
-
-        return "\n".join(tree_lines)
-
-    def explore_repo_data(
-        self,
-        max_depth: int | None = None,
-        include_symbols: bool = False,
-        focus_dirs: list[str] | None = None,
-        max_symbols_per_file: int = 5,
-    ) -> ExploreRepoData:
-        """
-        Build structured repository map data for CLI and automation.
-
-        The text tree remains available through explore_repo and structured payloads include entries for automation.
-        """
-        gitignore_patterns = self._parse_gitignore()
-        entries: list[ExploreEntry] = []
-        self._collect_tree_entries(
-            self.root_path,
-            entries,
-            gitignore_patterns,
-            current_depth=0,
-            max_depth=max_depth,
-            include_symbols=include_symbols,
-            focus_dirs=focus_dirs,
-            max_symbols_per_file=max_symbols_per_file,
+            entries=entries,
+            max_entries=max_entries,
         )
 
         if include_symbols:
@@ -349,12 +489,16 @@ class XRayIndexer:
 
         return {
             "root_path": str(self.root_path),
+            "tree_text": "\n".join(tree_lines),
             "entries": entries,
+            "truncated": truncated,
             "options": {
                 "max_depth": max_depth,
                 "include_symbols": include_symbols,
                 "focus_dirs": focus_dirs or [],
                 "max_symbols_per_file": max_symbols_per_file,
+                "symbol_types": symbol_types or [],
+                "max_entries": max_entries,
             },
         }
 
@@ -432,6 +576,7 @@ class XRayIndexer:
         include_symbols: bool,
         focus_dirs: list[str] | None,
         max_symbols_per_file: int,
+        symbol_types: list[str] | None,
     ):
         """Collect a flat, structured repository map."""
         if self._should_exclude(path, gitignore_patterns):
@@ -461,7 +606,7 @@ class XRayIndexer:
             entry["language"] = language
 
         if path.is_file() and include_symbols and language:
-            entry["symbols"] = self._get_file_symbol_data(path, max_symbols_per_file)
+            entry["symbols"] = self._get_file_symbol_data(path, max_symbols_per_file, symbol_types)
 
         entries.append(entry)
 
@@ -485,15 +630,18 @@ class XRayIndexer:
                     include_symbols,
                     focus_dirs,
                     max_symbols_per_file,
+                    symbol_types,
                 )
         except PermissionError:
             pass
 
-    def _get_file_symbol_data(self, file_path: Path, max_symbols: int) -> list[ExploreSymbol]:
+    def _get_file_symbol_data(
+        self, file_path: Path, max_symbols: int, symbol_types: list[str] | None = None
+    ) -> list[ExploreSymbol]:
         """Return structured symbol skeleton data for a source file."""
-        cache_key = self._get_cache_key(file_path)
+        cache_key = self._get_skeleton_cache_key(file_path, symbol_types)
         if self._get_cached_symbols(cache_key) is None:
-            self._get_file_skeleton_enhanced(file_path, max_symbols)
+            self._get_file_skeleton_enhanced(file_path, max_symbols, symbol_types)
 
         symbols = self._get_cached_symbols(cache_key) or []
         structured_symbols: list[ExploreSymbol] = []
@@ -501,8 +649,8 @@ class XRayIndexer:
             signature = symbol.get("signature", "")
             structured_symbols.append(
                 {
-                    "name": self._extract_symbol_name(signature) or signature,
-                    "type": self._infer_symbol_type(signature),
+                    "name": symbol.get("name") or self._extract_symbol_name(signature) or signature,
+                    "type": symbol.get("type") or self._infer_symbol_type(signature),
                     "signature": signature,
                     "doc": symbol.get("doc", ""),
                 }
@@ -545,19 +693,40 @@ class XRayIndexer:
         include_symbols: bool,
         focus_dirs: list[str] | None,
         max_symbols_per_file: int,
+        symbol_types: list[str] | None,
         is_last: bool = False,
-    ):
+        entries: list[ExploreEntry] | None = None,
+        max_entries: int = 5000,
+    ) -> bool:
         """Recursively build the tree representation with enhanced features."""
+        if entries is not None and len(entries) >= max_entries:
+            return True
         if self._should_exclude(path, gitignore_patterns):
-            return
+            return False
 
         # Check depth limit
         if max_depth is not None and current_depth > max_depth:
-            return
+            return False
 
         # Check focus_dirs for directories
         if path.is_dir() and not self._should_include_dir(path, focus_dirs, current_depth):
-            return
+            return False
+
+        if entries is not None:
+            relative_path = "." if path == self.root_path else path.relative_to(self.root_path).as_posix()
+            entry: ExploreEntry = {
+                "path": relative_path,
+                "abs_path": str(path),
+                "name": path.name if path != self.root_path else self.root_path.name,
+                "kind": "directory" if path.is_dir() else "file",
+                "depth": current_depth,
+            }
+            language = LANGUAGE_MAP.get(path.suffix.lower()) if path.is_file() else None
+            if language:
+                entry["language"] = language
+            if path.is_file() and include_symbols and language:
+                entry["symbols"] = self._get_file_symbol_data(path, max_symbols_per_file, symbol_types)
+            entries.append(entry)
 
         # Add current item
         name = path.name if path != self.root_path else str(path)
@@ -565,7 +734,7 @@ class XRayIndexer:
 
         # For files, add skeleton if requested
         if path.is_file() and include_symbols and path.suffix.lower() in LANGUAGE_MAP:
-            skeleton = self._get_file_skeleton_enhanced(path, max_symbols_per_file)
+            skeleton = self._get_file_skeleton_enhanced(path, max_symbols_per_file, symbol_types)
             if skeleton:
                 # Format with indented skeleton
                 if path == self.root_path:
@@ -607,7 +776,7 @@ class XRayIndexer:
                     extension = "    " if is_last else "│   "
                     new_prefix = prefix + extension if path != self.root_path else ""
 
-                    self._build_tree_recursive_enhanced(
+                    truncated = self._build_tree_recursive_enhanced(
                         child,
                         tree_lines,
                         new_prefix,
@@ -617,10 +786,16 @@ class XRayIndexer:
                         include_symbols,
                         focus_dirs,
                         max_symbols_per_file,
+                        symbol_types,
                         is_last_child,
+                        entries,
+                        max_entries,
                     )
+                    if truncated:
+                        return True
             except PermissionError:
                 pass
+        return False
 
     def read_interface(self, file_path: str) -> str:
         """
@@ -663,10 +838,17 @@ class XRayIndexer:
 
         return target_path
 
-    def _get_file_skeleton_enhanced(self, file_path: Path, max_symbols: int) -> list[str]:
-        """Extract enhanced symbol info including signatures and docstrings."""
+    def _get_skeleton_cache_key(self, file_path: Path, symbol_types: list[str] | None) -> str:
+        """Include outline filters in the skeleton cache identity."""
+        types_key = ",".join(symbol_types or [])
+        return f"{self._get_cache_key(file_path)}:outline-types={types_key}"
+
+    def _get_file_skeleton_enhanced(
+        self, file_path: Path, max_symbols: int, symbol_types: list[str] | None = None
+    ) -> list[str]:
+        """Extract symbol signatures using ast-grep outline."""
         # Check cache first
-        cache_key = self._get_cache_key(file_path)
+        cache_key = self._get_skeleton_cache_key(file_path, symbol_types)
         cached_symbols = self._get_cached_symbols(cache_key)
         if cached_symbols is not None:
             return self._format_enhanced_skeleton(cached_symbols, max_symbols)
@@ -679,13 +861,23 @@ class XRayIndexer:
             if file_path.stat().st_size > MAX_SKELETON_FILE_BYTES:
                 return []
 
-            with open(file_path, encoding="utf-8") as f:
-                content = f.read()
-
-            if language == "python":
-                symbols = self._extract_python_symbols_enhanced(content)
-            else:
-                symbols = self._extract_regex_symbols_enhanced(content, language)
+            args = ["outline", "--json=compact", "--view=expanded"]
+            if symbol_types:
+                args.extend(["--type", ",".join(symbol_types)])
+            args.append(str(file_path))
+            result = run_ast_grep(args)
+            outlines = parse_json_array(result.stdout)
+            symbols: list[SymbolSkeleton] = []
+            for outline in outlines:
+                if not isinstance(outline, Mapping):
+                    continue
+                items = outline.get("items", [])
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, Mapping):
+                        continue
+                    self._append_outline_symbol(symbols, item)
 
             self._set_cached_symbols(cache_key, symbols)
 
@@ -693,6 +885,20 @@ class XRayIndexer:
 
         except Exception:
             return []
+
+    def _append_outline_symbol(self, symbols: list[SymbolSkeleton], item: Mapping[str, Any]) -> None:
+        """Append an outline item and its expanded direct members."""
+        name = item.get("name")
+        symbol_type = item.get("symbolType")
+        signature = item.get("signature")
+        if isinstance(name, str) and isinstance(symbol_type, str) and isinstance(signature, str):
+            symbols.append({"name": name, "type": symbol_type, "signature": signature, "doc": ""})
+
+        members = item.get("members", [])
+        if isinstance(members, list):
+            for member in members:
+                if isinstance(member, Mapping):
+                    self._append_outline_symbol(symbols, member)
 
     def _format_enhanced_skeleton(self, symbols: list[SymbolSkeleton], max_symbols: int) -> list[str]:
         """Format enhanced symbol info for display."""
@@ -703,9 +909,10 @@ class XRayIndexer:
         shown_count = min(len(symbols), max_symbols)
 
         for symbol in symbols[:shown_count]:
-            line = symbol["signature"]
-            if symbol.get("doc"):
-                line += f" # {symbol['doc']}"
+            line = symbol.get("signature", "")
+            doc = symbol.get("doc", "")
+            if doc:
+                line += f" # {doc}"
             lines.append(line)
 
         if len(symbols) > max_symbols:
@@ -713,113 +920,6 @@ class XRayIndexer:
             lines.append(f"... and {remaining} more")
 
         return lines
-
-    def _extract_python_symbols_enhanced(self, content: str) -> list[SymbolSkeleton]:
-        """Extract Python symbols with signatures and docstrings."""
-        symbols: list[SymbolSkeleton] = []
-        try:
-            tree = ast.parse(content)
-            for node in ast.iter_child_nodes(tree):
-                if isinstance(node, ast.ClassDef):
-                    sig = f"class {node.name}"
-                    if node.bases:
-                        base_names = []
-                        for base in node.bases:
-                            if isinstance(base, ast.Name):
-                                base_names.append(base.id)
-                            elif isinstance(base, ast.Attribute):
-                                base_names.append(ast.unparse(base))
-                        if base_names:
-                            sig += f"({', '.join(base_names)})"
-                    sig += ":"
-
-                    doc = ast.get_docstring(node)
-                    if doc:
-                        doc = doc.split("\n")[0].strip()[:50]
-
-                    symbols.append({"signature": sig, "doc": doc or ""})
-
-                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    # Build function signature
-                    sig = "async def " if isinstance(node, ast.AsyncFunctionDef) else "def "
-                    sig += f"{node.name}("
-
-                    # Add parameters
-                    args = []
-                    for arg in node.args.args:
-                        args.append(arg.arg)
-                    if args:
-                        sig += ", ".join(args)
-                    sig += "):"
-
-                    doc = ast.get_docstring(node)
-                    if doc:
-                        doc = doc.split("\n")[0].strip()[:50]
-
-                    symbols.append({"signature": sig, "doc": doc or ""})
-        except Exception:
-            pass
-        return symbols
-
-    def _extract_regex_symbols_enhanced(self, content: str, language: str) -> list[SymbolSkeleton]:
-        """Extract symbols with signatures and comments for JS/TS/Go."""
-        symbols: list[SymbolSkeleton] = []
-
-        # Language-specific patterns
-        if language in ["javascript", "typescript"]:
-            patterns = [
-                # Function with preceding comment
-                (
-                    r"(?://\s*(.+?)\n)?^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\((.*?)\)",
-                    lambda m: {"signature": f"function {m.group(2)}({m.group(3)}):", "doc": (m.group(1) or "").strip()},
-                ),
-                # Class with preceding comment
-                (
-                    r"(?://\s*(.+?)\n)?^\s*(?:export\s+)?class\s+(\w+)(?:\s+extends\s+(\w+))?",
-                    lambda m: {
-                        "signature": f"class {m.group(2)}" + (f" extends {m.group(3)}" if m.group(3) else "") + ":",
-                        "doc": (m.group(1) or "").strip(),
-                    },
-                ),
-                # Arrow function with const
-                (
-                    r"(?://\s*(.+?)\n)?^\s*(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s*)?\((.*?)\)\s*=>",
-                    lambda m: {
-                        "signature": f"const {m.group(2)} = ({m.group(3)}) =>",
-                        "doc": (m.group(1) or "").strip(),
-                    },
-                ),
-            ]
-        elif language == "go":
-            patterns = [
-                # Function with preceding comment
-                (
-                    r"(?://\s*(.+?)\n)?^func\s+(\w+)\s*\((.*?)\)",
-                    lambda m: {"signature": f"func {m.group(2)}({m.group(3)})", "doc": (m.group(1) or "").strip()},
-                ),
-                # Method with preceding comment
-                (
-                    r"(?://\s*(.+?)\n)?^func\s*\((\w+\s+[*]?\w+)\)\s*(\w+)\s*\((.*?)\)",
-                    lambda m: {
-                        "signature": f"func ({m.group(2)}) {m.group(3)}({m.group(4)})",
-                        "doc": (m.group(1) or "").strip(),
-                    },
-                ),
-                # Type struct with preceding comment
-                (
-                    r"(?://\s*(.+?)\n)?^type\s+(\w+)\s+struct",
-                    lambda m: {"signature": f"type {m.group(2)} struct", "doc": (m.group(1) or "").strip()},
-                ),
-            ]
-        else:
-            return symbols
-
-        # Apply patterns
-        for pattern, extractor in patterns:
-            for match in re.finditer(pattern, content, re.MULTILINE):
-                symbols.append(cast(SymbolSkeleton, extractor(match)))
-
-        return symbols
 
     def find_symbol(
         self, query: str, limit: int = 10, min_score: int = 0, include_scores: bool = False

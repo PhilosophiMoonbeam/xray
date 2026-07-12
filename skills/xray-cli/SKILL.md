@@ -66,6 +66,19 @@ xray find ROOT "target_function" --limit 1 \
 
 Pass roots explicitly. `interface` paths and `impact` symbol paths must resolve inside `ROOT`; symbols from `xray find` are the safest input.
 
+Use structural operations when symbol-name discovery is not enough:
+
+```bash
+xray search ROOT -p 'old_api($ARG)' -l python
+xray imports ROOT src/package/module.py
+xray exports ROOT src/package/module.py
+xray scan ROOT --rule sgconfig.yml
+xray rewrite ROOT -p 'old_api($ARG)' -r 'new_api($ARG)'
+```
+
+`rewrite` and `scan --fix` modify files in place. Review their JSON summaries and
+the worktree after running them.
+
 Expected outside-root failures:
 
 ```bash

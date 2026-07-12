@@ -68,14 +68,18 @@ class ExploreOptions(PublicModel):
     include_symbols: bool
     focus_dirs: list[str] = Field(default_factory=list)
     max_symbols_per_file: int
+    symbol_types: list[str] = Field(default_factory=list)
+    max_entries: int = 5000
 
 
 class ExploreData(PublicModel):
     """Structured repository map payload before CLI envelope fields are added."""
 
     root_path: str
+    tree_text: str
     entries: list[ExploreEntry]
     options: ExploreOptions
+    truncated: bool = False
 
 
 class ExploreEnvelope(ExploreData):
@@ -85,7 +89,6 @@ class ExploreEnvelope(ExploreData):
     ok: bool
     command: str
     invoked_as: str
-    tree_text: str
     warnings: list[str] = Field(default_factory=list)
 
 

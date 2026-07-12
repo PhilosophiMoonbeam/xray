@@ -91,7 +91,8 @@ the alias is used.
 
 ```bash
 xray explore ROOT [--max-depth N] [--include-symbols | --symbols] \
-  [--focus DIR ...] [--max-symbols-per-file N] [--format json|text] [--pretty]
+  [--focus DIR ...] [--max-symbols-per-file N] [--type TYPE[,TYPE...]] [--max-entries N] \
+  [--format json|text] [--pretty]
 ```
 
 Important options:
@@ -100,6 +101,7 @@ Important options:
 - `--include-symbols` and `--symbols` include compact file skeletons.
 - `--focus DIR` can be repeated to keep output centered on selected top-level directories; root-level files remain visible for repository context.
 - `--max-symbols-per-file N` limits skeleton detail per file and must be zero or greater.
+- `--max-entries N` bounds files and directories in the map (default: 5000) and must be at least one.
 - JSON is the default and returns both `tree_text` and structured `entries`.
 - `--format text` returns the compact lossy tree view.
 - `--pretty` indents JSON output for visual inspection.
@@ -107,6 +109,17 @@ Important options:
 Explore output excludes common dependency, cache, build, generated metadata, and
 agent/task state directories by default so maps stay focused on maintainable
 project files.
+
+Explore uses one traversal to produce both `tree_text` and `entries`. When the
+entry bound is reached, JSON and MCP payloads set `truncated: true` and include
+a warning; text output appends a truncation notice. Narrow with `--focus` or
+`--max-depth`, or explicitly raise `--max-entries`, to continue exploration.
+
+`xray explore --include-symbols --type class,interface` filters skeletons to the
+requested top-level ast-grep outline symbol types. The filter is recorded as
+`options.symbol_types` in JSON output. ast-grep's expanded outline supplies the
+signatures used by both `explore` and `interface`, improving consistent extraction
+across Python, JavaScript/TypeScript, and Go.
 
 ### `xray find`
 
@@ -152,6 +165,22 @@ from impact results. Symbol paths must resolve inside `ROOT`. Impact analysis
 is name-based; review results for same-name symbols because XRAY is not a
 type-aware caller or dependency graph.
 
+### Structural search, rewrite, rules, imports, and exports
+
+```bash
+xray search ROOT -p 'old_api($ARG)' [-l python]
+xray rewrite ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' [-l python]
+xray scan ROOT --rule sgconfig.yml [--fix]
+xray imports ROOT src/package/module.py
+xray exports ROOT src/package/module.py
+```
+
+`search` returns ast-grep matches, including captured metavariables. `rewrite`
+applies every structural replacement in place and reports match and modified-file
+counts. `scan` runs a rule configuration inside `ROOT`; `--fix` applies configured
+fixes without prompting. Import/export paths are confined to `ROOT` and use
+ast-grep outline for file dependency and public-API inspection.
+
 ## JSON Output
 
 JSON output is wrapped in a stable `schema_version: "xray.cli.v1"` envelope.
@@ -163,10 +192,13 @@ JSON unless the caller explicitly requested `--format text`.
 
 Command-specific fields:
 
-- `explore`: `invoked_as`, `tree_text`, `entries`, `options`, `warnings`.
+- `explore`: `invoked_as`, `tree_text`, `entries`, `options`, `truncated`, `warnings`.
 - `find`: `query`, `limit`, `min_score`, `symbols`, `error`, `warnings`.
 - `interface`: `file_path`, `interface`, `error`, `warnings`.
 - `impact`: `symbol`, `impact`, `error`, `warnings`. Impact payloads include `strategy`, `total_count`, `raw_count`, and `filtered_count` so callers can see when non-source, duplicate, or definition-range matches were removed.
+- `search` / `scan`: `matches` plus the pattern or rule options.
+- `rewrite`: `matches`, `match_count`, `files_modified`, and `file_count`.
+- `imports` / `exports`: `file_path` and `items`.
 
 Example:
 
@@ -208,16 +240,20 @@ with a `{name, arguments}` payload.
   "arguments": {
     "root_path": "/path/to/repo",
     "max_depth": 2,
-    "include_symbols": true
+    "include_symbols": true,
+    "symbol_types": ["class", "interface"]
   }
 }
 ```
 
 The transformed MCP surface exposes compact metadata and tags for:
 
-- `explore_repo`: structured map with `tree_text`, `entries`, `options`, and optional symbol skeletons.
+- `explore_repo`: bounded structured map with `tree_text`, `entries`, `options`, `truncated`, warnings, and optional symbol skeletons. Pass `symbol_types` (a list or comma-separated string) to filter top-level outline types, and `max_entries` to override the 5000-entry default.
 - `find_symbol`: find code symbols by fuzzy name or behavior phrase.
 - `read_interface`: read a text file interface without implementation bodies.
+- `search_pattern` and `rewrite_pattern`: arbitrary structural search and in-place replacement.
+- `scan_rules`: ast-grep YAML rule linting with optional fixes.
+- `file_imports` and `file_exports`: file dependency and public-API outlines.
 - `what_breaks`: assess likely symbol-name code references to a returned symbol object.
 
 Detailed guidance is available on demand:

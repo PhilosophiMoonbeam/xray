@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from xray import __version__
+from xray.core.ast_grep import AstGrepError
 from xray.core.indexer import XRayIndexer
 from xray.models import (
     dump_error_envelope,
@@ -181,6 +182,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum skeleton symbols shown per file when symbols are included.",
     )
     explore.add_argument(
+        "--type",
+        dest="symbol_types",
+        help="Comma-separated ast-grep outline symbol types, such as class,interface.",
+    )
+    explore.add_argument(
+        "--max-entries",
+        type=int,
+        default=5000,
+        help="Maximum files and directories returned (default: 5000); truncation is reported.",
+    )
+    explore.add_argument(
         "--format",
         choices=("json", "text"),
         default="json",
@@ -262,6 +274,35 @@ def build_parser() -> argparse.ArgumentParser:
     impact.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
     impact.set_defaults(handler=handle_impact)
 
+    search = subparsers.add_parser("search", help="Search code with an ast-grep structural pattern.")
+    search.add_argument("root_path", help="Repository root to search.")
+    search.add_argument("-p", "--pattern", required=True, help="ast-grep structural pattern.")
+    search.add_argument("-l", "--lang", help="Pattern language when it cannot be inferred.")
+    search.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    search.set_defaults(handler=handle_search, format="json")
+
+    rewrite = subparsers.add_parser("rewrite", help="Apply an ast-grep structural rewrite in place.")
+    rewrite.add_argument("root_path", help="Repository root to rewrite.")
+    rewrite.add_argument("-p", "--pattern", required=True, help="ast-grep structural pattern.")
+    rewrite.add_argument("-r", "--replacement", required=True, help="Replacement template.")
+    rewrite.add_argument("-l", "--lang", help="Pattern language when it cannot be inferred.")
+    rewrite.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    rewrite.set_defaults(handler=handle_rewrite, format="json")
+
+    scan = subparsers.add_parser("scan", help="Scan code with ast-grep YAML rules.")
+    scan.add_argument("root_path", help="Repository root to scan.")
+    scan.add_argument("--rule", required=True, help="Rule configuration file or directory inside the root.")
+    scan.add_argument("--fix", action="store_true", help="Apply every rule fix without prompting.")
+    scan.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    scan.set_defaults(handler=handle_scan, format="json")
+
+    for command in ("imports", "exports"):
+        outline = subparsers.add_parser(command, help=f"List file {command} using ast-grep outline.")
+        outline.add_argument("root_path", help="Repository root containing the file.")
+        outline.add_argument("file_path", help="File path, absolute or relative; must stay inside the root.")
+        outline.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+        outline.set_defaults(handler=handle_outline_items, format="json", outline_item=command)
+
     return parser
 
 
@@ -270,21 +311,20 @@ def handle_explore(args: argparse.Namespace) -> int:
         raise ValueError("--max-depth must be 0 or greater.")
     if args.max_symbols_per_file < 0:
         raise ValueError("--max-symbols-per-file must be 0 or greater.")
+    if args.max_entries < 1:
+        raise ValueError("--max-entries must be 1 or greater.")
+    symbol_types = [value.strip() for value in (args.symbol_types or "").split(",") if value.strip()]
 
     indexer = XRayIndexer(normalize_path(args.root_path))
-    tree = indexer.explore_repo(
+    data = indexer.explore_repo_data(
         max_depth=args.max_depth,
         include_symbols=args.include_symbols,
         focus_dirs=args.focus_dirs,
         max_symbols_per_file=args.max_symbols_per_file,
+        symbol_types=symbol_types,
+        max_entries=args.max_entries,
     )
     if args.format == "json":
-        data = indexer.explore_repo_data(
-            max_depth=args.max_depth,
-            include_symbols=args.include_symbols,
-            focus_dirs=args.focus_dirs,
-            max_symbols_per_file=args.max_symbols_per_file,
-        )
         data = dump_explore_data(data)
         invoked_as = args.command
         data.update(
@@ -293,13 +333,24 @@ def handle_explore(args: argparse.Namespace) -> int:
                 "ok": True,
                 "command": "explore",
                 "invoked_as": invoked_as,
-                "tree_text": tree,
-                "warnings": [],
+                "warnings": (
+                    [
+                        f"Explore output truncated at {args.max_entries} entries; "
+                        "narrow with --focus/--max-depth or raise --max-entries."
+                    ]
+                    if data["truncated"]
+                    else []
+                ),
             }
         )
         print_json(dump_explore_envelope(data), pretty=args.pretty)
     else:
-        print(tree)
+        print(data["tree_text"])
+        if data["truncated"]:
+            print(
+                f"... output truncated at {args.max_entries} entries; "
+                "narrow with --focus/--max-depth or raise --max-entries."
+            )
     return 0
 
 
@@ -402,6 +453,64 @@ def handle_impact(args: argparse.Namespace) -> int:
             pretty=args.pretty,
         )
     return 1 if is_error else 0
+
+
+def _command_envelope(command: str, root_path: Path, **payload: Any) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "ok": True,
+        "command": command,
+        "root_path": str(root_path),
+        **payload,
+        "warnings": [],
+    }
+
+
+def handle_search(args: argparse.Namespace) -> int:
+    indexer = XRayIndexer(normalize_path(args.root_path))
+    matches = indexer.search_pattern(args.pattern, args.lang)
+    print_json(
+        _command_envelope("search", indexer.root_path, pattern=args.pattern, language=args.lang, matches=matches),
+        pretty=args.pretty,
+    )
+    return 0
+
+
+def handle_rewrite(args: argparse.Namespace) -> int:
+    indexer = XRayIndexer(normalize_path(args.root_path))
+    summary = indexer.rewrite_pattern(args.pattern, args.replacement, args.lang)
+    print_json(
+        _command_envelope(
+            "rewrite",
+            indexer.root_path,
+            pattern=args.pattern,
+            replacement=args.replacement,
+            language=args.lang,
+            **summary,
+        ),
+        pretty=args.pretty,
+    )
+    return 0
+
+
+def handle_scan(args: argparse.Namespace) -> int:
+    indexer = XRayIndexer(normalize_path(args.root_path))
+    matches = indexer.scan_rules(args.rule, args.fix)
+    print_json(
+        _command_envelope("scan", indexer.root_path, rule=args.rule, fixed=args.fix, matches=matches),
+        pretty=args.pretty,
+    )
+    return 0
+
+
+def handle_outline_items(args: argparse.Namespace) -> int:
+    indexer = XRayIndexer(normalize_path(args.root_path))
+    items = indexer.file_outline_items(args.file_path, args.outline_item)
+    print_json(
+        _command_envelope(args.outline_item, indexer.root_path, file_path=args.file_path, items=items),
+        pretty=args.pretty,
+    )
+    return 0
 
 
 def load_symbol(args: argparse.Namespace, root_path: Path | None = None) -> dict[str, Any]:
@@ -617,6 +726,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         print_error(str(exc), args)
         return 2
+    except AstGrepError as exc:
+        print_error(str(exc), args)
+        return 1
     except BrokenPipeError:
         return 1
 

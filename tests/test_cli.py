@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
@@ -116,6 +117,60 @@ def test_explore_cli_prints_tree(tmp_path, capsys):
     assert "sample.py" in output
     assert "def target_function(value):" in output
     assert "class SampleService:" in output
+
+
+def test_explore_cli_filters_outline_symbol_types(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+
+    exit_code = cli.main(
+        ["explore", str(repo), "--max-depth", "2", "--include-symbols", "--type", "class", "--format", "json"]
+    )
+
+    assert exit_code == 0
+    result = json.loads(capsys.readouterr().out)
+    sample = next(entry for entry in result["entries"] if entry["path"] == "src/sample.py")
+    assert result["options"]["symbol_types"] == ["class"]
+    assert [symbol["name"] for symbol in sample["symbols"]] == ["SampleService"]
+    assert sample["symbols"][0]["type"] == "class"
+
+
+def test_outline_extraction_uses_expanded_json_and_type_filter(tmp_path):
+    repo = write_sample_repo(tmp_path)
+    indexer = XRayIndexer(str(repo))
+    outline = [
+        {
+            "path": "src/sample.py",
+            "items": [
+                {
+                    "name": "SampleService",
+                    "symbolType": "class",
+                    "signature": "class SampleService:",
+                    "members": [{"name": "run", "symbolType": "method", "signature": "def run(self):"}],
+                }
+            ],
+        }
+    ]
+
+    with patch(
+        "xray.core.indexer.run_ast_grep",
+        return_value=AstGrepResult(json.dumps(outline), "", 0),
+    ) as run:
+        symbols = indexer._get_file_symbol_data(repo / "src" / "sample.py", 5, ["class", "interface"])
+
+    run.assert_called_once_with(
+        [
+            "outline",
+            "--json=compact",
+            "--view=expanded",
+            "--type",
+            "class,interface",
+            str(repo / "src" / "sample.py"),
+        ]
+    )
+    assert [(symbol["name"], symbol["type"]) for symbol in symbols] == [
+        ("SampleService", "class"),
+        ("run", "method"),
+    ]
 
 
 def test_interface_cli_prints_file_skeleton(tmp_path, capsys):
@@ -353,6 +408,91 @@ def test_indexer_cache_dir_is_scoped_by_root_path(tmp_path):
     assert indexer_a.cache_dir != indexer_b.cache_dir
     assert indexer_a.cache_dir.name.endswith("-abc123")
     assert indexer_b.cache_dir.name.endswith("-abc123")
+
+
+def test_indexer_prunes_expired_disk_cache_entries(tmp_path, monkeypatch):
+    cache_root = tmp_path / "cache"
+    expired = cache_root / "expired"
+    recent = cache_root / "recent"
+    expired.mkdir(parents=True)
+    recent.mkdir()
+    (expired / "symbols.json").write_text("{}", encoding="utf-8")
+    (recent / "symbols.json").write_text("{}", encoding="utf-8")
+    old = time.time() - 100
+    import os
+
+    os.utime(expired, (old, old))
+    monkeypatch.setattr("xray.core.indexer.CACHE_MAX_AGE_SECONDS", 50)
+
+    XRayIndexer._prune_disk_cache(cache_root / "current")
+
+    assert not expired.exists()
+    assert recent.exists()
+
+
+def test_indexer_prunes_oldest_disk_cache_entries_to_size_limit(tmp_path, monkeypatch):
+    cache_root = tmp_path / "cache"
+    oldest = cache_root / "oldest"
+    newest = cache_root / "newest"
+    oldest.mkdir(parents=True)
+    newest.mkdir()
+    (oldest / "symbols.json").write_bytes(b"x" * 8)
+    (newest / "symbols.json").write_bytes(b"x" * 8)
+    now = time.time()
+    import os
+
+    os.utime(oldest, (now - 10, now - 10))
+    monkeypatch.setattr("xray.core.indexer.CACHE_MAX_BYTES", 8)
+
+    XRayIndexer._prune_disk_cache(cache_root / "current")
+
+    assert not oldest.exists()
+    assert newest.exists()
+
+
+def test_indexer_disk_cache_cleanup_preserves_current_and_active_temp_entries(tmp_path, monkeypatch):
+    cache_root = tmp_path / "cache"
+    current = cache_root / "current"
+    active = cache_root / "active"
+    current.mkdir(parents=True)
+    active.mkdir()
+    (current / "symbols.json").write_bytes(b"x" * 8)
+    (active / "tmp-in-progress").write_bytes(b"x" * 8)
+    monkeypatch.setattr("xray.core.indexer.CACHE_MAX_AGE_SECONDS", -1)
+    monkeypatch.setattr("xray.core.indexer.CACHE_MAX_BYTES", 0)
+
+    XRayIndexer._prune_disk_cache(current)
+
+    assert current.exists()
+    assert active.exists()
+
+
+def test_indexer_disk_cache_cleanup_removes_abandoned_temp_entries(tmp_path, monkeypatch):
+    cache_root = tmp_path / "cache"
+    abandoned = cache_root / "abandoned"
+    abandoned.mkdir(parents=True)
+    temp_file = abandoned / "tmp-abandoned"
+    temp_file.write_bytes(b"x" * 8)
+    old = time.time() - 100
+    import os
+
+    os.utime(temp_file, (old, old))
+    os.utime(abandoned, (old, old))
+    monkeypatch.setattr("xray.core.indexer.CACHE_ACTIVE_TEMP_SECONDS", 50)
+    monkeypatch.setattr("xray.core.indexer.CACHE_MAX_AGE_SECONDS", 50)
+
+    XRayIndexer._prune_disk_cache(cache_root / "current")
+
+    assert not abandoned.exists()
+
+
+def test_indexer_disk_cache_cleanup_tolerates_concurrent_removal(tmp_path):
+    cache_root = tmp_path / "cache"
+    entry = cache_root / "vanishing"
+    entry.mkdir(parents=True)
+
+    with patch("xray.core.indexer.Path.stat", side_effect=FileNotFoundError):
+        XRayIndexer._prune_disk_cache(cache_root / "current")
 
 
 def test_indexer_save_cache_writes_validated_json(tmp_path):
@@ -894,7 +1034,8 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
     assert searches["file tree"][0]["name"] == "explore_repo"
     assert searches["definitions"][0]["name"] == "find_symbol"
     assert searches["method"][0]["name"] == "find_symbol"
-    assert searches["type"][0]["name"] == "find_symbol"
+    assert searches["type"][0]["name"] == "explore_repo"
+    assert any(match["name"] == "find_symbol" for match in searches["type"])
     assert searches["enum"][0]["name"] == "find_symbol"
     assert searches["api"][0]["name"] == "read_interface"
     assert searches["summary"][0]["name"] == "read_interface"
@@ -914,6 +1055,11 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
         "find_symbol",
         "read_interface",
         "what_breaks",
+        "search_pattern",
+        "rewrite_pattern",
+        "scan_rules",
+        "file_imports",
+        "file_exports",
     ]
     assert searches["["] == []
 
@@ -923,12 +1069,20 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
             properties = match["inputSchema"]["properties"]
             assert "ctx" not in properties
             assert match["description"]
-            assert match["annotations"] == {
-                "readOnlyHint": True,
-                "destructiveHint": False,
-                "idempotentHint": True,
-                "openWorldHint": False,
-            }
+            if match["name"] in {"rewrite_pattern", "scan_rules"}:
+                assert match["annotations"] == {
+                    "readOnlyHint": False,
+                    "destructiveHint": True,
+                    "idempotentHint": False,
+                    "openWorldHint": False,
+                }
+            else:
+                assert match["annotations"] == {
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                    "idempotentHint": True,
+                    "openWorldHint": False,
+                }
             assert all(property_schema.get("description") for property_schema in properties.values())
 
     explore = structured_content(calls["explore_repo"])
@@ -1344,7 +1498,7 @@ def test_cli_version_returns_without_system_exit(capsys):
     exit_code = cli.main(["--version"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out.strip() == "xray 0.7.0"
+    assert capsys.readouterr().out.strip() == "xray 0.8.0"
 
 
 def test_cli_help_documents_agent_workflow_json_and_safety(capsys):
@@ -1462,12 +1616,64 @@ def test_explore_json_includes_structured_entries(tmp_path, capsys):
     assert result["root_path"] == str(repo)
     assert "tree_text" in result
     assert result["options"]["include_symbols"] is True
+    assert result["options"]["max_entries"] == 5000
+    assert result["truncated"] is False
     entries = {entry["path"]: entry for entry in result["entries"]}
     assert entries["."]["kind"] == "directory"
     assert entries["src"]["kind"] == "directory"
     assert entries["src/sample.py"]["language"] == "python"
     assert entries["src/sample.py"]["abs_path"] == str(repo / "src" / "sample.py")
     assert any(symbol["signature"] == "def target_function(value):" for symbol in entries["src/sample.py"]["symbols"])
+
+
+def test_explore_cli_bounds_and_reports_truncated_output(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+
+    exit_code = cli.main(["explore", str(repo), "--max-entries", "2"])
+
+    assert exit_code == 0
+    result = json.loads(capsys.readouterr().out)
+    assert len(result["entries"]) == 2
+    assert result["truncated"] is True
+    assert result["options"]["max_entries"] == 2
+    assert "truncated at 2 entries" in result["warnings"][0]
+    assert len(result["tree_text"].splitlines()) == 2
+
+
+def test_explore_text_reports_truncated_output(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+
+    exit_code = cli.main(["explore", str(repo), "--max-entries", "1", "--format", "text"])
+
+    assert exit_code == 0
+    assert "output truncated at 1 entries" in capsys.readouterr().out
+
+
+def test_mcp_explore_result_reports_truncated_output(tmp_path):
+    repo = write_sample_repo(tmp_path)
+
+    result = mcp_server.build_explore_result(
+        XRayIndexer(str(repo)),
+        max_depth=None,
+        include_symbols=False,
+        focus_dirs=None,
+        max_symbols_per_file=5,
+        max_entries=2,
+    )
+
+    assert len(result["entries"]) == 2
+    assert result["truncated"] is True
+    assert result["options"]["max_entries"] == 2
+    assert "truncated at 2 entries" in result["warnings"][0]
+
+
+def test_explore_cli_rejects_nonpositive_max_entries(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+
+    exit_code = cli.main(["explore", str(repo), "--max-entries", "0"])
+
+    assert exit_code == 2
+    assert json.loads(capsys.readouterr().err)["error"] == "--max-entries must be 1 or greater."
 
 
 def test_map_json_uses_explore_command_with_invoked_alias(tmp_path, capsys):
