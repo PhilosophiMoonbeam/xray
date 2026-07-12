@@ -40,8 +40,14 @@ Progressive workflow:
   symbol=$(xray find ROOT "target symbol" --limit 1 | jq -c '.symbols[0]')
   xray impact ROOT --symbol-json "$symbol"  # likely symbol-name references
 
+Structural workflow:
+  xray search ROOT -p 'old_api($ARG)' -l python
+  xray imports ROOT src/package/module.py
+
 Subcommands emit compact JSON by default. Use subcommand --pretty for indented
-JSON or --format text for compact lossy scans. YAML is intentionally unsupported.
+JSON or --format text for compact lossy scans. YAML output is unsupported.
+Commands rewrite and scan --fix modify files in place.
+Exit codes: 0 success, 1 command failure, 2 parse or validation error.
 """
 
 EXPLORE_HELP = """\
@@ -146,7 +152,10 @@ def get_version() -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = XRayArgumentParser(
         prog="xray",
-        description="Agent-centric code intelligence CLI: map, find, inspect, and review name-based impact.",
+        description=(
+            "Agent-centric code intelligence CLI: explore repositories, find and inspect symbols,\n"
+            "review name-based impact, and structurally search, rewrite, scan, or outline code."
+        ),
         epilog=ROOT_HELP_EPILOG,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {get_version()}")

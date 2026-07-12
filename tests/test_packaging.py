@@ -100,9 +100,12 @@ def test_top_level_cli_skill_is_agent_skills_compliant():
     assert "xray find" in body
     assert "xray interface" in body
     assert "xray impact" in body
+    assert "xray search" in body
+    assert "xray rewrite" in body
+    assert "xray scan" in body
+    assert "xray imports" in body
+    assert "xray exports" in body
     assert "Do not request YAML" in body
-    assert "search_tools" in content
-    assert "call_tool" in content
 
 
 def test_mcp_server_imports_with_verified_fastmcp_surface():

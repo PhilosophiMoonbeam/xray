@@ -1498,7 +1498,7 @@ def test_cli_version_returns_without_system_exit(capsys):
     exit_code = cli.main(["--version"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out.strip() == "xray 0.8.1"
+    assert capsys.readouterr().out.strip() == "xray 0.8.2"
 
 
 def test_cli_help_documents_agent_workflow_json_and_safety(capsys):
@@ -1521,8 +1521,14 @@ def test_cli_help_documents_agent_workflow_json_and_safety(capsys):
     assert "Progressive workflow" in root_help
     assert "xray explore ROOT --max-depth 2" in root_help
     assert "jq -c '.symbols[0]'" in root_help
+    assert "structurally search, rewrite, scan, or outline code" in root_help
+    assert "Structural workflow" in root_help
+    assert "xray search ROOT -p 'old_api($ARG)' -l python" in root_help
+    assert "xray imports ROOT src/package/module.py" in root_help
     assert "Subcommands emit compact JSON by default" in root_help
-    assert "YAML is intentionally unsupported" in root_help
+    assert "YAML output is unsupported" in root_help
+    assert "Commands rewrite and scan --fix modify files in place" in root_help
+    assert "Exit codes: 0 success, 1 command failure, 2 parse or validation error" in root_help
     assert explore_exit == 0
     assert "Start shallow" in explore_help
     assert "--format {json,text}" in explore_help
