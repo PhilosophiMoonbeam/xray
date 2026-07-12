@@ -1,6 +1,6 @@
 ---
 name: xray-cli
-description: "Use the XRAY command-line interface for agentic code discovery: map repositories, find symbols, inspect file interfaces, review likely symbol-name impact, and automate JSON or jq handoffs. Use when a coding agent can run shell commands and needs the handwritten xray CLI rather than the XRAY MCP search_tools/call_tool workflow."
+description: "Use the XRAY command-line interface for agentic code discovery: map repositories, find symbols, inspect interfaces and likely symbol-name impact, structurally search or rewrite code, scan rules, inspect imports or exports, and automate JSON or jq handoffs. Use when a coding agent can run shell commands and needs the handwritten xray CLI rather than the XRAY MCP search_tools/call_tool workflow."
 ---
 
 # XRAY CLI
@@ -53,7 +53,7 @@ Use `xray map` only as an alias for `xray explore`; JSON still reports `command:
 - Use `--pretty` only for indented JSON inspection.
 - Use `--format text` only for lossy, token-friendly scans.
 - Do not request YAML.
-- Preserve full symbol objects: `path`, `abs_path`, `start_line`, `end_line`, `type`.
+- Preserve full symbol objects: `name`, `path`, `abs_path`, `start_line`, `end_line`, `type`, `score`.
 - Treat `xray impact` as a name-based reference search, not a type-aware caller, dependent, or dependency graph.
 
 ```bash
