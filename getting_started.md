@@ -126,9 +126,11 @@ Most clients initially list only:
 - `search_tools` - find XRAY operations by terms such as `map`, `find`, `interface`, or `impact`
 - `call_tool` - run the discovered operation with a `{ "name": "...", "arguments": {...} }` payload
 
-The underlying operations are still `explore_repo`, `find_symbol`,
-`read_interface`, and `what_breaks`. Longer workflow guidance is available only
-when the client asks for it:
+Underlying operations include `explore_repo`, `find_symbol`, `read_interface`,
+`what_breaks`, `search_pattern`, `rewrite_pattern`, `scan_rules`, `file_imports`,
+and `file_exports`. Structural reads use compact bounded output and continuation
+cursors by default; request full detail only when raw metadata is necessary.
+Longer workflow guidance is available only when the client asks for it:
 
 - Resource: `xray://workflow`
 - Prompt: `xray_discovery_plan`
@@ -321,10 +323,13 @@ XRAY is stateless. It runs on-demand analysis against the repository path you pa
 
 2. **Explore the tools**:
    - In MCP clients, start with `search_tools`, then call the selected operation with `call_tool`.
-   - `explore_repo` - Visual file tree of your repository
+   - `explore_repo` - Compact relative-path repository entries, with a full visual tree available on request
    - `read_interface` - File signatures and docstrings without implementation bodies
    - `find_symbol` - Fuzzy search for functions, classes, and methods
    - `what_breaks` - Find likely symbol-name code references for impact review
+   - `search_pattern` - Bounded compact structural search with cursor continuation
+   - `file_imports` / `file_exports` - Bounded compact dependency and API outlines
+   - `scan_rules` / `rewrite_pattern` - Rule diagnostics and explicit all-match mutations
    
    Note: Results may include matches from comments or strings. The AI assistant will intelligently filter based on context.
 

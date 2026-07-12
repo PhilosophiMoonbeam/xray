@@ -44,6 +44,14 @@ from fastmcp.tools.tool_transform import ArgTransformConfig, ToolTransformConfig
 
 from xray.core.indexer import XRayIndexer
 from xray.models import dump_explore_data, dump_impact_result, dump_symbol_output, validate_symbol_input
+from xray.presentation import (
+    DEFAULT_RESULT_LIMIT,
+    compact_explore,
+    compact_structural_items,
+    cursor_fingerprint,
+    decode_cursor,
+    page_items,
+)
 
 # Initialize FastMCP server
 mcp = FastMCP("XRAY Code Intelligence")
@@ -62,7 +70,7 @@ XRAY_WORKFLOW_GUIDE = """# XRAY Progressive Discovery
 Use XRAY as map -> find -> interface -> impact:
 
 1. Map the repository with `explore_repo`.
-   It returns `entries` for file selection and `tree_text` for visual scanning.
+   Compact output returns relative-path `entries`; request `detail="full"` only when `tree_text` is needed.
    Start shallow; add `focus_dirs` or `include_symbols=True` only when zooming in.
 2. Locate code with `find_symbol`.
    Keep the returned symbol object, including path and line data.
@@ -71,6 +79,12 @@ Use XRAY as map -> find -> interface -> impact:
 4. Check likely symbol-name code references with `what_breaks`.
    Pass the entire symbol object from `find_symbol`.
    This is not a type-aware caller, dependent, or dependency graph.
+
+For structural discovery, `search_pattern`, read-only `scan_rules`, `file_imports`, and `file_exports`
+return at most 50 compact items by default. Check `returned`, `total`, and `truncated`; pass
+`next_cursor` back as `cursor` only with the identical root and arguments. Request `detail="full"`
+only for raw ast-grep metadata. `rewrite_pattern` and `scan_rules(fix=True)` modify every match
+regardless of the reporting limit and never support continuation after mutation.
 
 Use `search_tools` to discover operations, then execute one through `call_tool`.
 """
@@ -110,11 +124,13 @@ def xray_discovery_plan(goal: str = "understand a code change") -> str:
     return (
         f"Goal: {goal}\n\n"
         "Use XRAY progressively:\n"
-        "1. Call explore_repo; use entries for file selection and tree_text for scanning.\n"
+        "1. Call explore_repo; use compact entries for file selection and request detail='full' only for tree_text.\n"
         "2. Call find_symbol with the most relevant symbol or behavior phrase.\n"
         "3. Call read_interface for text contracts when needed.\n"
         "4. Call what_breaks with the full symbol object before changing public code; "
         "treat results as name-based references, not a type-aware dependency graph.\n\n"
+        "For structural reads, keep compact detail, inspect returned/total/truncated, and continue next_cursor "
+        "only with identical arguments. Rewrite and scan fixes apply every match and cannot be continued.\n\n"
         "Fetch xray://workflow only if more detailed XRAY usage guidance is needed."
     )
 
@@ -238,6 +254,7 @@ async def explore_repo(
     max_symbols_per_file: int | str = 5,
     symbol_types: list[str] | str | None = None,
     max_entries: int | str = 5000,
+    detail: str = "compact",
 ) -> dict[str, Any]:
     """Map repository structure, optionally including symbol skeletons."""
     try:
@@ -256,6 +273,7 @@ async def explore_repo(
             symbol_types = [value.strip() for value in symbol_types.split(",") if value.strip()]
         if max_entries < 1:
             raise ValueError("max_entries must be 1 or greater.")
+        _validate_detail(detail)
 
         await ctx.report_progress(1, 2, "building repository map")
         result = await asyncio.to_thread(
@@ -269,6 +287,7 @@ async def explore_repo(
                 max_symbols_per_file,
                 symbol_types,
                 max_entries,
+                detail,
             ),
         )
         await ctx.report_progress(2, 2, "repository map ready")
@@ -286,8 +305,10 @@ def build_explore_result(
     max_symbols_per_file: int,
     symbol_types: list[str] | None = None,
     max_entries: int = 5000,
+    detail: str = "compact",
 ) -> dict[str, Any]:
-    """Return structured MCP explore data with the compact text tree included."""
+    """Return compact repository entries or the full legacy map payload."""
+    _validate_detail(detail)
     data = dump_explore_data(
         indexer.explore_repo_data(
             max_depth=max_depth,
@@ -298,12 +319,66 @@ def build_explore_result(
             max_entries=max_entries,
         )
     )
-    data["warnings"] = (
+    result = data if detail == "full" else compact_explore(data)
+    warnings = (
         [f"Explore output truncated at {max_entries} entries; narrow with focus_dirs/max_depth or raise max_entries."]
         if data["truncated"]
         else []
     )
-    return data
+    if warnings:
+        result["warnings"] = warnings
+    elif detail == "full":
+        result["warnings"] = []
+    return result
+
+
+def _validate_detail(detail: str) -> None:
+    if detail not in {"compact", "full"}:
+        raise ValueError("detail must be 'compact' or 'full'.")
+
+
+def _prepare_page(
+    root_path: str,
+    command: str,
+    identity: dict[str, Any],
+    limit: int | str,
+    cursor: str | None,
+) -> tuple[str, int]:
+    """Validate paging before running an operation that may mutate files."""
+    normalized = normalize_path(root_path)
+    try:
+        parsed_limit = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be an integer.") from exc
+    if parsed_limit < 0:
+        raise ValueError("limit must be 0 or greater.")
+    decode_cursor(cursor, cursor_fingerprint(command, Path(normalized), identity))
+    return normalized, parsed_limit
+
+
+def _present_items(
+    raw_items: list[dict[str, Any]],
+    *,
+    root_path: str,
+    command: str,
+    identity: dict[str, Any],
+    detail: str,
+    limit: int,
+    cursor: str | None,
+    continuable: bool = True,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    _validate_detail(detail)
+    items = raw_items if detail == "full" else compact_structural_items(raw_items, Path(root_path))
+    page, metadata = page_items(
+        items,
+        command=command,
+        root_path=Path(root_path),
+        identity=identity,
+        limit=limit,
+        cursor=cursor,
+        continuable=continuable,
+    )
+    return [dict(item) for item in page], metadata
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
@@ -362,50 +437,163 @@ def what_breaks(exact_symbol: dict[str, Any]) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
-def search_pattern(root_path: str, pattern: str, lang: str | None = None) -> dict[str, Any]:
-    """Search a repository with an ast-grep structural pattern."""
+def search_pattern(
+    root_path: str,
+    pattern: str,
+    lang: str | None = None,
+    limit: int | str = DEFAULT_RESULT_LIMIT,
+    cursor: str | None = None,
+    detail: str = "compact",
+) -> dict[str, Any]:
+    """Return bounded compact structural matches, with full detail available on request."""
     try:
-        matches = run_indexer_operation(root_path, lambda indexer: indexer.search_pattern(pattern, lang))
-        return {"matches": matches, "match_count": len(matches), "pattern": pattern, "language": lang}
+        _validate_detail(detail)
+        identity = {"pattern": pattern, "lang": lang}
+        normalized, parsed_limit = _prepare_page(root_path, "search", identity, limit, cursor)
+        matches = run_indexer_operation(normalized, lambda indexer: indexer.search_pattern(pattern, lang))
+        page, metadata = _present_items(
+            matches,
+            root_path=normalized,
+            command="search",
+            identity=identity,
+            detail=detail,
+            limit=parsed_limit,
+            cursor=cursor,
+        )
+        result = {"matches": page, **metadata}
+        if detail == "full":
+            result.update({"match_count": len(matches), "pattern": pattern, "language": lang})
+        return result
     except Exception as e:
         return {"error": f"Error searching pattern: {e!s}"}
 
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
-def rewrite_pattern(root_path: str, pattern: str, replacement: str, lang: str | None = None) -> dict[str, Any]:
-    """Apply an ast-grep structural rewrite to repository files in place."""
+def rewrite_pattern(
+    root_path: str,
+    pattern: str,
+    replacement: str,
+    lang: str | None = None,
+    limit: int | str = DEFAULT_RESULT_LIMIT,
+    detail: str = "compact",
+) -> dict[str, Any]:
+    """Rewrite every match in place and return a compact summary or bounded full diagnostics."""
     try:
-        return run_indexer_operation(root_path, lambda indexer: indexer.rewrite_pattern(pattern, replacement, lang))
+        _validate_detail(detail)
+        identity = {"pattern": pattern, "replacement": replacement, "lang": lang}
+        normalized, parsed_limit = _prepare_page(root_path, "rewrite", identity, limit, None)
+        summary = run_indexer_operation(normalized, lambda indexer: indexer.rewrite_pattern(pattern, replacement, lang))
+        matches = summary.pop("matches", [])
+        if detail == "full":
+            page, metadata = _present_items(
+                matches,
+                root_path=normalized,
+                command="rewrite",
+                identity=identity,
+                detail="full",
+                limit=parsed_limit,
+                cursor=None,
+                continuable=False,
+            )
+            summary.update({"matches": page, **metadata})
+        return summary
     except Exception as e:
         return {"error": f"Error rewriting pattern: {e!s}"}
 
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
-def scan_rules(root_path: str, rule_path: str, fix: bool = False) -> dict[str, Any]:
-    """Scan a repository with ast-grep YAML rules, optionally applying fixes."""
+def scan_rules(
+    root_path: str,
+    rule_path: str,
+    fix: bool = False,
+    limit: int | str = DEFAULT_RESULT_LIMIT,
+    cursor: str | None = None,
+    detail: str = "compact",
+) -> dict[str, Any]:
+    """Return bounded rule diagnostics or apply every configured fix without continuation."""
     try:
-        matches = run_indexer_operation(root_path, lambda indexer: indexer.scan_rules(rule_path, fix))
-        return {"matches": matches, "match_count": len(matches), "fixed": fix}
+        _validate_detail(detail)
+        if fix and cursor:
+            raise ValueError("cursor cannot be used when fix is true because fixes mutate the result set.")
+        identity = {"rule_path": rule_path, "fix": fix}
+        normalized, parsed_limit = _prepare_page(root_path, "scan", identity, limit, cursor)
+        matches = run_indexer_operation(normalized, lambda indexer: indexer.scan_rules(rule_path, fix))
+        page, metadata = _present_items(
+            matches,
+            root_path=normalized,
+            command="scan",
+            identity=identity,
+            detail=detail,
+            limit=parsed_limit,
+            cursor=cursor,
+            continuable=not fix,
+        )
+        result = {"matches": page, "fixed": fix, **metadata}
+        if detail == "full":
+            result["match_count"] = len(matches)
+        return result
     except Exception as e:
         return {"error": f"Error scanning rules: {e!s}"}
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
-def file_imports(root_path: str, file_path: str) -> dict[str, Any]:
-    """List imports from one repository file using ast-grep outline."""
+def file_imports(
+    root_path: str,
+    file_path: str,
+    limit: int | str = DEFAULT_RESULT_LIMIT,
+    cursor: str | None = None,
+    detail: str = "compact",
+) -> dict[str, Any]:
+    """Return bounded compact imports, flattening ast-grep outline wrappers."""
     try:
-        items = run_indexer_operation(root_path, lambda indexer: indexer.file_outline_items(file_path, "imports"))
-        return {"file_path": file_path, "items": items}
+        _validate_detail(detail)
+        identity = {"file_path": file_path}
+        normalized, parsed_limit = _prepare_page(root_path, "imports", identity, limit, cursor)
+        items = run_indexer_operation(normalized, lambda indexer: indexer.file_outline_items(file_path, "imports"))
+        page, metadata = _present_items(
+            items,
+            root_path=normalized,
+            command="imports",
+            identity=identity,
+            detail=detail,
+            limit=parsed_limit,
+            cursor=cursor,
+        )
+        result = {"items": page, **metadata}
+        if detail == "full":
+            result["file_path"] = file_path
+        return result
     except Exception as e:
         return {"error": f"Error listing imports: {e!s}"}
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
-def file_exports(root_path: str, file_path: str) -> dict[str, Any]:
-    """List exports from one repository file using ast-grep outline."""
+def file_exports(
+    root_path: str,
+    file_path: str,
+    limit: int | str = DEFAULT_RESULT_LIMIT,
+    cursor: str | None = None,
+    detail: str = "compact",
+) -> dict[str, Any]:
+    """Return bounded compact exports, flattening ast-grep outline wrappers."""
     try:
-        items = run_indexer_operation(root_path, lambda indexer: indexer.file_outline_items(file_path, "exports"))
-        return {"file_path": file_path, "items": items}
+        _validate_detail(detail)
+        identity = {"file_path": file_path}
+        normalized, parsed_limit = _prepare_page(root_path, "exports", identity, limit, cursor)
+        items = run_indexer_operation(normalized, lambda indexer: indexer.file_outline_items(file_path, "exports"))
+        page, metadata = _present_items(
+            items,
+            root_path=normalized,
+            command="exports",
+            identity=identity,
+            detail=detail,
+            limit=parsed_limit,
+            cursor=cursor,
+        )
+        result = {"items": page, **metadata}
+        if detail == "full":
+            result["file_path"] = file_path
+        return result
     except Exception as e:
         return {"error": f"Error listing exports: {e!s}"}
 
@@ -415,8 +603,8 @@ mcp.add_transform(
         {
             "explore_repo": ToolTransformConfig(
                 description=(
-                    "Map repository overview, layout, and file tree as entries plus tree_text; "
-                    "optionally include symbols."
+                    "Map repository overview, layout, and file tree as compact relative-path entries; optionally "
+                    "include symbols or request full detail for tree_text and absolute paths."
                 ),
                 tags={"map", "tree", "discovery", "repository"},
                 arguments={
@@ -429,6 +617,7 @@ mcp.add_transform(
                         description="Optional symbol types to include, as a list or comma-separated string."
                     ),
                     "max_entries": ArgTransformConfig(description="Maximum map entries; truncation is reported."),
+                    "detail": ArgTransformConfig(description="compact (default) or full repository-map detail."),
                 },
             ),
             "find_symbol": ToolTransformConfig(
@@ -463,7 +652,9 @@ mcp.add_transform(
             ),
             "search_pattern": ToolTransformConfig(
                 description=(
-                    "Search arbitrary AST structure with an ast-grep pattern and return captured metavariables."
+                    "Search arbitrary AST structure and return at most 50 compact matches by default, including "
+                    "useful captured metavariables. Continue truncated read-only results with next_cursor and "
+                    "request full detail only for raw ast-grep metadata."
                 ),
                 tags={"search", "structural", "pattern", "ast-grep"},
                 arguments={
@@ -472,41 +663,77 @@ mcp.add_transform(
                         description="ast-grep structural pattern with optional metavariables."
                     ),
                     "lang": ArgTransformConfig(description="Optional ast-grep pattern language."),
+                    "limit": ArgTransformConfig(description="Maximum returned matches; defaults to 50."),
+                    "cursor": ArgTransformConfig(
+                        description="Opaque next_cursor from the identical root, pattern, and language query."
+                    ),
+                    "detail": ArgTransformConfig(description="compact (default) or full ast-grep match detail."),
                 },
             ),
             "rewrite_pattern": ToolTransformConfig(
-                description="Rewrite matching AST structure in place across a repository; this modifies files.",
+                description=(
+                    "Rewrite every matching AST structure in place. Compact output is a count/path summary; "
+                    "full diagnostics are bounded and never support continuation after mutation."
+                ),
                 tags={"rewrite", "replace", "structural", "ast-grep"},
                 arguments={
                     "root_path": ArgTransformConfig(description="Absolute repository root path to modify."),
                     "pattern": ArgTransformConfig(description="ast-grep structural pattern to replace."),
                     "replacement": ArgTransformConfig(description="ast-grep replacement template."),
                     "lang": ArgTransformConfig(description="Optional ast-grep pattern language."),
+                    "limit": ArgTransformConfig(
+                        description="Maximum full-detail diagnostics returned; every match is still rewritten."
+                    ),
+                    "detail": ArgTransformConfig(description="compact summary (default) or full match detail."),
                 },
             ),
             "scan_rules": ToolTransformConfig(
-                description="Lint a repository with ast-grep YAML rules and optionally apply configured fixes.",
+                description=(
+                    "Lint with bounded compact ast-grep diagnostics and read-only continuation. When fix is true, "
+                    "apply every configured fix and do not continue against the changed worktree."
+                ),
                 tags={"scan", "lint", "rules", "ast-grep"},
                 arguments={
                     "root_path": ArgTransformConfig(description="Absolute repository root path to scan."),
                     "rule_path": ArgTransformConfig(description="Rule file or config directory inside root_path."),
-                    "fix": ArgTransformConfig(description="Apply configured rule fixes in place when true."),
+                    "fix": ArgTransformConfig(description="Apply every configured rule fix in place when true."),
+                    "limit": ArgTransformConfig(
+                        description="Maximum returned diagnostics; does not limit fixes and defaults to 50."
+                    ),
+                    "cursor": ArgTransformConfig(description="Opaque next_cursor; invalid when fix is true."),
+                    "detail": ArgTransformConfig(description="compact (default) or full ast-grep diagnostic detail."),
                 },
             ),
             "file_imports": ToolTransformConfig(
-                description="List a file's imports for immediate dependency inspection.",
+                description=(
+                    "List at most 50 compact flattened imports by default for dependency inspection; continue "
+                    "truncated results with next_cursor or request full outline wrappers."
+                ),
                 tags={"imports", "dependencies", "outline"},
                 arguments={
                     "root_path": ArgTransformConfig(description="Absolute repository root path."),
                     "file_path": ArgTransformConfig(description="File path inside root_path."),
+                    "limit": ArgTransformConfig(description="Maximum returned imports; defaults to 50."),
+                    "cursor": ArgTransformConfig(
+                        description="Opaque next_cursor from the identical root and file query."
+                    ),
+                    "detail": ArgTransformConfig(description="compact (default) or full ast-grep outline detail."),
                 },
             ),
             "file_exports": ToolTransformConfig(
-                description="List a file's exported public API declarations.",
+                description=(
+                    "List at most 50 compact flattened exports by default for public-API inspection; continue "
+                    "truncated results with next_cursor or request full outline wrappers."
+                ),
                 tags={"exports", "api", "outline"},
                 arguments={
                     "root_path": ArgTransformConfig(description="Absolute repository root path."),
                     "file_path": ArgTransformConfig(description="File path inside root_path."),
+                    "limit": ArgTransformConfig(description="Maximum returned exports; defaults to 50."),
+                    "cursor": ArgTransformConfig(
+                        description="Opaque next_cursor from the identical root and file query."
+                    ),
+                    "detail": ArgTransformConfig(description="compact (default) or full ast-grep outline detail."),
                 },
             ),
         }

@@ -278,12 +278,13 @@ with a `{name, arguments}` payload.
 
 The transformed MCP surface exposes compact metadata and tags for:
 
-- `explore_repo`: bounded structured map with `tree_text`, `entries`, `options`, `truncated`, warnings, and optional symbol skeletons. Pass `symbol_types` (a list or comma-separated string) to filter top-level outline types, and `max_entries` to override the 5000-entry default.
+- `explore_repo`: bounded compact map with relative-path `entries`, `options`, `truncated`, warnings when present, and optional symbol skeletons. Pass `detail: "full"` only when `tree_text` and absolute paths are needed. `symbol_types` filters top-level outline types, and `max_entries` overrides the 5000-entry default.
 - `find_symbol`: find code symbols by fuzzy name or behavior phrase.
 - `read_interface`: read a text file interface without implementation bodies.
-- `search_pattern` and `rewrite_pattern`: arbitrary structural search and in-place replacement.
-- `scan_rules`: ast-grep YAML rule linting with optional fixes.
-- `file_imports` and `file_exports`: file dependency and public-API outlines.
+- `search_pattern`: compact structural matches, bounded to 50 by default, with `returned`, `total`, `truncated`, and query-bound `next_cursor` continuation. Set `detail: "full"` for raw ast-grep matches.
+- `rewrite_pattern`: in-place replacement with a compact count/path summary by default. Full detail is bounded but never advertises continuation after mutation.
+- `scan_rules`: compact ast-grep YAML diagnostics with the same paging contract when read-only. With `fix: true`, all fixes are applied and no continuation cursor is returned.
+- `file_imports` and `file_exports`: compact flattened dependency and public-API outlines with limits and continuation cursors.
 - `what_breaks`: assess likely symbol-name code references to a returned symbol object.
 
 Detailed guidance is available on demand:

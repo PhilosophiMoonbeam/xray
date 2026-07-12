@@ -10,6 +10,8 @@ Implemented in the working tree: compact v2 projections are now the default for 
 
 Post-implementation measurements against the same repository show `explore` at 2,059 B (down 57%), representative `search` at 9,238 B (down 87%), `imports` at 1,738 B (down 55%), and `exports` at 7,263 B (down 75%). Exact content varies as the repository changes; the bounds and compact field contract provide the durable improvement.
 
+The same compact projection and paging primitives are now used by safe MCP boundaries. `explore_repo`, `search_pattern`, read-only `scan_rules`, `file_imports`, and `file_exports` default to compact output; read-only structural results support bounded query-bound continuation. Mutating `rewrite_pattern` returns a summary by default, while `scan_rules(fix=true)` applies every fix but never advertises continuation against the changed worktree. Full detail remains opt-in.
+
 ## Measurements
 
 Representative outputs were measured using the installed XRAY 0.8.2 binary against this repository. Sizes are bytes, not tokenizer-specific token counts, but the ratios reliably expose relative overhead.

@@ -935,9 +935,10 @@ def test_mcp_tool_surface_is_search_first_with_compact_metadata(tmp_path):
     assert "not a type-aware caller" in matches[0]["description"]
     assert matches[0]["inputSchema"]["properties"]["exact_symbol"]["description"].startswith("Full symbol object")
     explore = structured_content(call_result)
-    assert explore["tree_text"].startswith(str(repo))
+    assert "tree_text" not in explore
     assert explore["root_path"] == str(repo)
     assert any(entry["path"] == "src" for entry in explore["entries"])
+    assert all("abs_path" not in entry for entry in explore["entries"])
 
 
 def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path):
@@ -1014,7 +1015,7 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
     searches, calls = asyncio.run(inspect_search_and_calls())
 
     assert searches["map"][0]["name"] == "explore_repo"
-    assert "entries plus tree_text" in searches["map"][0]["description"]
+    assert "compact relative-path entries" in searches["map"][0]["description"]
     assert searches["tree"][0]["name"] == "explore_repo"
     assert searches["find"][0]["name"] == "find_symbol"
     assert any(match["name"] == "find_symbol" for match in searches["function"])
@@ -1063,6 +1064,23 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
     ]
     assert searches["["] == []
 
+    all_tools = {match["name"]: match for match in searches["."]}
+    detail_tools = {"explore_repo", "search_pattern", "rewrite_pattern", "scan_rules", "file_imports", "file_exports"}
+    limited_tools = {"search_pattern", "rewrite_pattern", "scan_rules", "file_imports", "file_exports"}
+    cursor_tools = {"search_pattern", "scan_rules", "file_imports", "file_exports"}
+    for name in detail_tools:
+        assert all_tools[name]["inputSchema"]["properties"]["detail"]["default"] == "compact"
+    for name in limited_tools:
+        assert all_tools[name]["inputSchema"]["properties"]["limit"]["default"] == 50
+    for name in cursor_tools:
+        assert "cursor" in all_tools[name]["inputSchema"]["properties"]
+    assert "cursor" not in all_tools["rewrite_pattern"]["inputSchema"]["properties"]
+    assert "at most 50 compact matches" in all_tools["search_pattern"]["description"]
+    assert "Rewrite every matching" in all_tools["rewrite_pattern"]["description"]
+    assert "never support continuation" in all_tools["rewrite_pattern"]["description"]
+    assert "apply every configured fix" in all_tools["scan_rules"]["description"]
+    assert "identical root" in all_tools["search_pattern"]["inputSchema"]["properties"]["cursor"]["description"]
+
     for matches in searches.values():
         assert len(matches) <= 10
         for match in matches:
@@ -1086,7 +1104,7 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
             assert all(property_schema.get("description") for property_schema in properties.values())
 
     explore = structured_content(calls["explore_repo"])
-    assert explore["tree_text"].startswith(str(repo))
+    assert "tree_text" not in explore
     assert any(entry["path"] == "src" for entry in explore["entries"])
     assert any(
         symbol_result["name"] == "target_function"
@@ -1130,7 +1148,7 @@ def test_mcp_explore_reports_context_progress(tmp_path):
     assert match["name"] == "explore_repo"
     assert "ctx" not in match["inputSchema"]["properties"]
     explore = structured_content(call_result)
-    assert explore["tree_text"].startswith(str(repo))
+    assert "tree_text" not in explore
     assert any(entry["path"] == "src" for entry in explore["entries"])
     assert progress_events == [
         (0.0, 2.0, "normalizing repository path"),
@@ -1244,7 +1262,7 @@ def test_mcp_concurrent_call_tool_requests_succeed_same_and_multi_root(tmp_path)
         return content.get("result", content)
 
     same_results = [payload(result) for result in same_root]
-    assert same_results[0]["tree_text"].startswith(str(repo_a))
+    assert same_results[0]["root_path"] == str(repo_a)
     assert any(symbol["name"] == "target_function" for symbol in same_results[1])
     assert "def target_function(value):" in same_results[2]
     assert same_results[3]["total_count"] >= 1
@@ -1253,8 +1271,8 @@ def test_mcp_concurrent_call_tool_requests_succeed_same_and_multi_root(tmp_path)
     multi_results = [payload(result) for result in multi_root]
     assert any(symbol["name"] == "target_function" for symbol in multi_results[0])
     assert any(symbol["name"] == "target_function" for symbol in multi_results[1])
-    assert multi_results[2]["tree_text"].startswith(str(repo_a))
-    assert multi_results[3]["tree_text"].startswith(str(repo_b))
+    assert multi_results[2]["root_path"] == str(repo_a)
+    assert multi_results[3]["root_path"] == str(repo_b)
 
 
 def test_mcp_indexer_cache_eviction_is_lru_and_bounded(tmp_path, monkeypatch):
@@ -1341,8 +1359,10 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     workflow_text = text_content(workflow[0])
     assert workflow_text.startswith("# XRAY Progressive Discovery")
     assert "map -> find -> interface -> impact" in workflow_text
-    assert "`entries` for file selection" in workflow_text
-    assert "`tree_text` for visual scanning" in workflow_text
+    assert "relative-path `entries`" in workflow_text
+    assert 'detail="full"' in workflow_text
+    assert "return at most 50 compact items" in workflow_text
+    assert "regardless of the reporting limit" in workflow_text
     xray_workflow = next(resource for resource in resources if str(resource.uri) == "xray://workflow")
     annotations = xray_workflow.annotations
     assert annotations is not None
@@ -1357,7 +1377,10 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     assert "dependency graph" in skill_text
     prompt_text = text_content(prompt.messages[0].content)
     assert prompt_text.startswith("Goal: review impact")
-    assert "use entries for file selection and tree_text for scanning" in prompt_text
+    assert "use compact entries for file selection" in prompt_text
+    assert "detail='full' only for tree_text" in prompt_text
+    assert "inspect returned/total/truncated" in prompt_text
+    assert "Rewrite and scan fixes apply every match" in prompt_text
     assert "name-based references" in prompt_text
     assert "Fetch xray://workflow" in prompt_text
 
@@ -1498,7 +1521,7 @@ def test_cli_version_returns_without_system_exit(capsys):
     exit_code = cli.main(["--version"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out.strip() == "xray 0.8.2"
+    assert capsys.readouterr().out.strip() == "xray 0.8.3"
 
 
 def test_cli_help_documents_agent_workflow_json_and_safety(capsys):

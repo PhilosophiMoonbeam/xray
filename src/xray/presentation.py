@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+
+DEFAULT_RESULT_LIMIT = 50
 
 
 def _relative_path(value: Any, root_path: Path) -> str:
@@ -105,3 +111,56 @@ def compact_explore(data: Mapping[str, Any]) -> dict[str, Any]:
         "options": data["options"],
         "truncated": data.get("truncated", False),
     }
+
+
+def cursor_fingerprint(command: str, root_path: Path, identity: Mapping[str, Any]) -> str:
+    """Return a stable query binding for an opaque result cursor."""
+    value = json.dumps([command, str(root_path.resolve()), identity], separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(value.encode()).hexdigest()[:16]
+
+
+def encode_cursor(offset: int, fingerprint: str) -> str:
+    """Encode an offset and query fingerprint as an opaque cursor."""
+    raw = json.dumps({"o": offset, "q": fingerprint}, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode_cursor(cursor: str | None, fingerprint: str) -> int:
+    """Decode and validate a query-bound cursor."""
+    if not cursor:
+        return 0
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        value = json.loads(raw)
+        offset = value["o"]
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError, binascii.Error) as exc:
+        raise ValueError("cursor is invalid.") from exc
+    if not isinstance(offset, int) or offset < 0 or value.get("q") != fingerprint:
+        raise ValueError("cursor does not match this command or query.")
+    return offset
+
+
+def page_items(
+    items: Sequence[Mapping[str, Any]],
+    *,
+    command: str,
+    root_path: Path,
+    identity: Mapping[str, Any],
+    limit: int = DEFAULT_RESULT_LIMIT,
+    cursor: str | None = None,
+    continuable: bool = True,
+) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
+    """Page items and return truthful compact result metadata."""
+    if limit < 0:
+        raise ValueError("limit must be 0 or greater.")
+    fingerprint = cursor_fingerprint(command, root_path, identity)
+    offset = decode_cursor(cursor, fingerprint)
+    total = len(items)
+    if offset > total:
+        raise ValueError("cursor is past the available results.")
+    end = min(offset + limit, total)
+    page = list(items[offset:end])
+    metadata: dict[str, Any] = {"returned": len(page), "total": total, "truncated": end < total}
+    if continuable and end < total:
+        metadata["next_cursor"] = encode_cursor(end, fingerprint)
+    return page, metadata
