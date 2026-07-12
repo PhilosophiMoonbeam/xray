@@ -1078,6 +1078,9 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
     assert "at most 50 compact matches" in all_tools["search_pattern"]["description"]
     assert "Rewrite every matching" in all_tools["rewrite_pattern"]["description"]
     assert "never support continuation" in all_tools["rewrite_pattern"]["description"]
+    assert "Pass lang whenever the target language is known" in all_tools["rewrite_pattern"]["description"]
+    lang_description = all_tools["rewrite_pattern"]["inputSchema"]["properties"]["lang"]["description"]
+    assert "constrain destructive rewrite scope" in lang_description
     assert "apply every configured fix" in all_tools["scan_rules"]["description"]
     assert "identical root" in all_tools["search_pattern"]["inputSchema"]["properties"]["cursor"]["description"]
 
@@ -1540,6 +1543,9 @@ def test_cli_help_documents_agent_workflow_json_and_safety(capsys):
     impact_exit = cli.main(["impact", "--help"])
     impact_help = " ".join(capsys.readouterr().out.split())
 
+    rewrite_exit = cli.main(["rewrite", "--help"])
+    rewrite_help = " ".join(capsys.readouterr().out.split())
+
     assert root_exit == 0
     assert "Progressive workflow" in root_help
     assert "xray explore ROOT --max-depth 2" in root_help
@@ -1564,6 +1570,9 @@ def test_cli_help_documents_agent_workflow_json_and_safety(capsys):
     assert "--format {json,text}" in find_help
     assert "path, abs_path, start_line, end_line, type, and score" in find_help
     assert "json is the default automation contract" in find_help
+    assert rewrite_exit == 0
+    assert "specify it when known" in rewrite_help
+    assert "pattern-like non-code text" in rewrite_help
     assert interface_exit == 0
     assert "--format {json,text}" in interface_help
     assert "must resolve inside the root" in interface_help

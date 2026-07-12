@@ -52,6 +52,8 @@ Structural CLI commands use compact stable JSON and return at most 50 reported
 items by default. Use `--limit`, continue with the opaque `next_cursor` via
 `--cursor`, or request lossless ast-grep payloads with `--detail full`. Output
 limits never reduce the edits applied by `rewrite` or `scan --fix`.
+When rewriting, pass `-l/--lang` whenever the target language is known so a
+broad scan does not also mutate pattern-like text in configuration or documentation.
 
 ### Option 3: Install as a Tool (Recommended for Regular Use)
 
@@ -331,7 +333,9 @@ XRAY is stateless. It runs on-demand analysis against the repository path you pa
    - `file_imports` / `file_exports` - Bounded compact dependency and API outlines
    - `scan_rules` / `rewrite_pattern` - Rule diagnostics and explicit all-match mutations
    
-   Note: Results may include matches from comments or strings. The AI assistant will intelligently filter based on context.
+   Note: Results may include matches from comments or strings. Pass `lang` to
+   `rewrite_pattern` whenever the target language is known to avoid mutating
+   pattern-like text in configuration or documentation.
 
 3. **Read the documentation**: Check out the [README](README.md) for detailed examples and API reference
 

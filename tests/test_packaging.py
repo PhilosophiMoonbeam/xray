@@ -101,7 +101,8 @@ def test_top_level_cli_skill_is_agent_skills_compliant():
     assert "xray interface" in body
     assert "xray impact" in body
     assert "xray search" in body
-    assert "xray rewrite" in body
+    assert "xray rewrite ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' -l python" in body
+    assert "pass `-l/--lang` whenever the target language is known" in body
     assert "xray scan" in body
     assert "xray imports" in body
     assert "xray exports" in body

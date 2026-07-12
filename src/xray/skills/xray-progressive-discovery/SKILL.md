@@ -22,5 +22,5 @@ Use this skill when an MCP client needs to inspect a repository with XRAY while 
 - Use `file_imports` and `file_exports` for compact, flattened immediate dependencies and public APIs.
 - Use `detail="full"` only when raw ast-grep matches or outline wrappers are necessary.
 - Use `scan_rules` to verify YAML-defined invariants. Set `fix=true` only when file mutation is intended; fixes apply to every match and do not support continuation afterward.
-- Use `rewrite_pattern` only when structural in-place replacement is intended. It is destructive, applies every match, and returns a compact summary by default.
+- Use `rewrite_pattern` only when structural in-place replacement is intended. It is destructive, applies every match, and returns a compact summary by default. Pass `lang` whenever the target language is known so pattern-like text in configuration or documentation is not also rewritten.
 - Fetch `xray://workflow` for a longer reference when a client needs detailed examples.

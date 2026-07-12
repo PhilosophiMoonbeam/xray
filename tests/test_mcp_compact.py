@@ -94,8 +94,9 @@ def test_mcp_mutating_tools_validate_first_and_do_not_offer_continuation(tmp_pat
     assert "limit must be 0 or greater" in invalid["error"]
 
     summary = {"matches": raw_matches(repo), "match_count": 3, "files_modified": ["sample.py"], "file_count": 1}
-    with patch.object(XRayIndexer, "rewrite_pattern", return_value=summary):
-        compact = mcp_server.rewrite_pattern(str(repo), "old($A)", "new($A)")
+    with patch.object(XRayIndexer, "rewrite_pattern", return_value=summary) as rewrite:
+        compact = mcp_server.rewrite_pattern(str(repo), "old($A)", "new($A)", lang="python")
+    rewrite.assert_called_once_with("old($A)", "new($A)", "python")
     assert compact == {"match_count": 3, "files_modified": ["sample.py"], "file_count": 1}
 
     with patch.object(XRayIndexer, "scan_rules") as scan:

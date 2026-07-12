@@ -83,8 +83,10 @@ xray search ROOT -p 'old_api($ARG)' -l python
 xray imports ROOT src/package/module.py
 xray exports ROOT src/package/module.py
 xray scan ROOT --rule sgconfig.yml
-xray rewrite ROOT -p 'old_api($ARG)' -r 'new_api($ARG)'
+xray rewrite ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' -l python
 ```
+
+For mutations, pass `-l/--lang` whenever the target language is known. Without an explicit language, a repository-wide rewrite can also match pattern-like text in configuration or documentation files.
 
 Structural output defaults to at most 50 returned items. Compact matches use stable fields such as `path`, one-based `line` and `column`, `text`, and `captures`. Check `returned`, `total`, and `truncated`; when `next_cursor` is present, continue the same read-only query by passing it unchanged:
 

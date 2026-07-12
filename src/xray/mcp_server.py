@@ -85,6 +85,8 @@ return at most 50 compact items by default. Check `returned`, `total`, and `trun
 `next_cursor` back as `cursor` only with the identical root and arguments. Request `detail="full"`
 only for raw ast-grep metadata. `rewrite_pattern` and `scan_rules(fix=True)` modify every match
 regardless of the reporting limit and never support continuation after mutation.
+For `rewrite_pattern`, pass `lang` whenever the target language is known so a broad scan does not
+also mutate pattern-like text in configuration or documentation files.
 
 Use `search_tools` to discover operations, then execute one through `call_tool`.
 """
@@ -673,14 +675,17 @@ mcp.add_transform(
             "rewrite_pattern": ToolTransformConfig(
                 description=(
                     "Rewrite every matching AST structure in place. Compact output is a count/path summary; "
-                    "full diagnostics are bounded and never support continuation after mutation."
+                    "full diagnostics are bounded and never support continuation after mutation. Pass lang "
+                    "whenever the target language is known to avoid matching pattern-like non-code text."
                 ),
                 tags={"rewrite", "replace", "structural", "ast-grep"},
                 arguments={
                     "root_path": ArgTransformConfig(description="Absolute repository root path to modify."),
                     "pattern": ArgTransformConfig(description="ast-grep structural pattern to replace."),
                     "replacement": ArgTransformConfig(description="ast-grep replacement template."),
-                    "lang": ArgTransformConfig(description="Optional ast-grep pattern language."),
+                    "lang": ArgTransformConfig(
+                        description="Target language; supply it when known to constrain destructive rewrite scope."
+                    ),
                     "limit": ArgTransformConfig(
                         description="Maximum full-detail diagnostics returned; every match is still rewritten."
                     ),

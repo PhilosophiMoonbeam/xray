@@ -309,7 +309,11 @@ def build_parser() -> argparse.ArgumentParser:
     rewrite.add_argument("root_path", help="Repository root to rewrite.")
     rewrite.add_argument("-p", "--pattern", required=True, help="ast-grep structural pattern.")
     rewrite.add_argument("-r", "--replacement", required=True, help="Replacement template.")
-    rewrite.add_argument("-l", "--lang", help="Pattern language when it cannot be inferred.")
+    rewrite.add_argument(
+        "-l",
+        "--lang",
+        help="Target language; specify it when known to keep mutations from matching pattern-like non-code text.",
+    )
     add_structural_output_args(rewrite, supports_cursor=False)
     rewrite.set_defaults(handler=handle_rewrite)
 

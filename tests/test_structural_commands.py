@@ -345,6 +345,21 @@ def test_structural_search_and_rewrite_run_end_to_end(tmp_path: Path) -> None:
     assert "return new(1)" in (repo / "sample.py").read_text(encoding="utf-8")
 
 
+def test_language_scoped_rewrite_does_not_mutate_pattern_text_in_yaml(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    rule = repo / "no-old.yml"
+    original_rule = "id: no-old-call\nlanguage: Python\nrule:\n  pattern: old($A)\nseverity: warning\n"
+    rule.write_text(original_rule, encoding="utf-8")
+
+    summary = XRayIndexer(str(repo)).rewrite_pattern("old($A)", "new($A)", "python")
+
+    assert summary["match_count"] == 1
+    assert summary["file_count"] == 1
+    assert summary["files_modified"] == [str(repo / "sample.py")]
+    assert "return new(1)" in (repo / "sample.py").read_text(encoding="utf-8")
+    assert rule.read_text(encoding="utf-8") == original_rule
+
+
 def test_rule_scan_fix_runs_end_to_end(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     (repo / "no-old.yml").write_text(

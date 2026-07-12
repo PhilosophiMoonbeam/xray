@@ -176,7 +176,7 @@ definition range and `--context-lines N` to control reference context.
 
 ```bash
 xray search ROOT -p 'old_api($ARG)' [-l python]
-xray rewrite ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' [-l python]
+xray rewrite ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' -l python
 xray scan ROOT --rule sgconfig.yml [--fix]
 xray imports ROOT src/package/module.py
 xray exports ROOT src/package/module.py
@@ -204,6 +204,10 @@ modified paths. Use `--detail full` when the match payload is required.
 
 `rewrite` and `scan --fix` modify files in place. Review their JSON summaries and
 the worktree after running them.
+
+For rewrites, pass `-l/--lang` whenever the target language is known. Inference
+can still produce an overly broad repository scan that matches pattern-like text
+inside configuration or documentation files.
 
 ## JSON Output
 
