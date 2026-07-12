@@ -5,16 +5,19 @@
 [![ast-grep](https://img.shields.io/badge/Powered_by-ast--grep-orange)](https://ast-grep.github.io)
 
 XRAY gives agents a compact way to map a repository, find symbols, inspect file
-interfaces, and estimate symbol impact without running a language server. Use the
-handwritten `xray` CLI in shell workflows, or run `xray-mcp` from an MCP-capable
-assistant.
+interfaces, estimate symbol impact, and perform structural code operations without
+running a language server. Use the handwritten `xray` CLI in shell workflows, or
+run `xray-mcp` from an MCP-capable assistant.
 
-XRAY focuses on four operations:
+Progressive discovery starts with four operations:
 
 - **Map** (`xray explore`, `xray map`, `explore_repo`) - show repository structure with optional symbol skeletons.
 - **Find** (`xray find`, `find_symbol`) - locate functions, classes, methods, interfaces, types, enums, and common JS/TS/Go definitions by fuzzy name.
-- **Interface** (`xray interface`, `read_interface`) - read signatures, class definitions, and docstrings without implementation bodies.
+- **Interface** (`xray interface`, `read_interface`) - read signatures, types, and public members without implementation bodies.
 - **Impact** (`xray impact`, `what_breaks`) - find likely references to a symbol name.
+
+Structural search, rewrite, rule scanning, and import/export outlines complement
+that workflow when symbol-name analysis is not enough.
 
 ## Quick Start
 
@@ -41,15 +44,20 @@ uvx --from . xray impact . --symbol-json "$symbol"
 
 ## Install
 
-XRAY requires Python 3.10 or later. Runtime dependencies include FastMCP 3.4.x,
-RapidFuzz, and `ast-grep-cli>=0.39.0`.
+XRAY requires Python 3.10 or later. Its direct runtime dependencies are
+`fastmcp>=3.4.2,<4`, `ast-grep-cli>=0.44.1`, `thefuzz>=0.20.0`, and
+`pydantic>=2,<3`.
+
+XRAY requires the `ast-grep` executable. The installation commands below provide
+it automatically through `ast-grep-cli`; no separate installation is normally
+required.
 
 ```bash
 # Install uv if needed
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install XRAY as a persistent tool
-git clone https://github.com/srijanshukla18/xray.git
+git clone https://github.com/PhilosophiMoonbeam/xray.git
 cd xray
 uv tool install .
 
@@ -61,9 +69,7 @@ xray-mcp
 For local development:
 
 ```bash
-uv venv
-source .venv/bin/activate
-uv pip install -e .
+uv sync --dev
 uv run pytest
 uv run xray explore . --max-depth 2
 uv run xray-mcp
@@ -79,9 +85,8 @@ data so MCP clients can fetch the progressive-discovery skill resource.
 
 ## CLI Reference
 
-The `xray` command is the supported user-facing CLI. It returns process exit
-codes instead of letting `argparse` terminate the Python process, so tests and
-agent wrappers can call `xray.cli.main()` directly.
+The `xray` command is the supported user-facing CLI. Run `xray COMMAND --help`
+for complete command options.
 
 ### `xray explore` / `xray map`
 
@@ -91,7 +96,7 @@ the alias is used.
 
 ```bash
 xray explore ROOT [--max-depth N] [--include-symbols | --symbols] \
-  [--focus DIR ...] [--max-symbols-per-file N] [--type TYPE[,TYPE...]] [--max-entries N] \
+  [--focus DIR]... [--max-symbols-per-file N] [--type TYPE[,TYPE...]] [--max-entries N] \
   [--format json|text] [--pretty]
 ```
 
@@ -128,8 +133,8 @@ xray find ROOT QUERY [--limit N] [--min-score 0-100] [--format json|text] [--pre
 ```
 
 JSON is the default because symbol objects are usually piped into impact
-analysis. JSON symbols include repository-relative `path`, absolute `abs_path`,
-one-based `start_line`/`end_line`, `type`, and `score`.
+analysis. JSON symbols include `name`, repository-relative `path`, absolute
+`abs_path`, one-based `start_line`/`end_line`, `type`, and `score`.
 
 `--limit` must be zero or greater. `--min-score` must be between 0 and 100; use
 60 or higher when an agent should suppress weak fuzzy matches.
@@ -163,7 +168,8 @@ Provide exactly one symbol source:
 Manual symbols require `--start-line` so XRAY can exclude the definition line
 from impact results. Symbol paths must resolve inside `ROOT`. Impact analysis
 is name-based; review results for same-name symbols because XRAY is not a
-type-aware caller or dependency graph.
+type-aware caller or dependency graph. Use `--end-line` to supply the full
+definition range and `--context-lines N` to control reference context.
 
 ### Structural search, rewrite, rules, imports, and exports
 
@@ -175,11 +181,16 @@ xray imports ROOT src/package/module.py
 xray exports ROOT src/package/module.py
 ```
 
+These commands also accept `--format json|text` and `--pretty`.
+
 `search` returns ast-grep matches, including captured metavariables. `rewrite`
 applies every structural replacement in place and reports match and modified-file
 counts. `scan` runs a rule configuration inside `ROOT`; `--fix` applies configured
 fixes without prompting. Import/export paths are confined to `ROOT` and use
 ast-grep outline for file dependency and public-API inspection.
+
+`rewrite` and `scan --fix` modify files in place. Review their JSON summaries and
+the worktree after running them.
 
 ## JSON Output
 
@@ -189,6 +200,9 @@ or `--format text` for lossy human-readable scans. Every successful command
 includes `ok: true`, `command`, `root_path`, and command-specific data. JSON
 errors use `ok: false`, `error`, and `warnings`. Parse and validation errors are
 JSON unless the caller explicitly requested `--format text`.
+
+Exit codes are `0` for success, `1` for command failure, and `2` for parse or
+validation errors.
 
 Command-specific fields:
 
@@ -287,7 +301,7 @@ XRAY supports two common MCP setup styles:
 Install the persistent tool from a checkout:
 
 ```bash
-git clone https://github.com/srijanshukla18/xray.git
+git clone https://github.com/PhilosophiMoonbeam/xray.git
 cd xray
 uv tool install .
 command -v xray-mcp
@@ -380,23 +394,22 @@ the CLI or MCP tool. It does not maintain a database or project-wide service.
 For speed, symbol skeleton extraction can be cached under:
 
 ```text
-/tmp/.xray_cache/{root_hash}-{git_commit}/symbols.pkl
+/tmp/.xray_cache/{root_hash}-{git_commit}/symbols.json
 ```
 
-The root hash prevents repositories at the same commit from sharing cache files.
-Cache writes are atomic to avoid partially written pickle files.
+The root hash prevents repositories at the same commit from sharing cache files;
+JSON cache writes are atomic.
 
-MCP requests run blocking indexer work in worker threads with
-`asyncio.to_thread`. Shared indexer instances are cached per normalized root path,
-and per-repository locks serialize operations that mutate or read shared indexer
-state. Same-root and multi-root concurrent MCP calls are supported.
+MCP indexer instances are cached per normalized root path, and per-repository
+locks serialize operations against shared indexer state. Same-root and multi-root
+concurrent calls are supported.
 
 ## Performance Characteristics
 
 - Startup is lightweight; XRAY launches subprocesses on demand.
 - Directory maps use Python filesystem traversal and honor focus/depth options.
 - Symbol search runs multiple ast-grep patterns, so cost scales with repository size and language mix.
-- Interface reads use Python AST for Python and regex skeleton extraction for other supported languages.
+- Interface reads use ast-grep's expanded outline for supported languages.
 - Impact analysis first tries ast-grep reference search, then falls back to text search when structural search returns no references.
 - Memory use is low; the only persistent runtime artifact is the optional temp cache.
 

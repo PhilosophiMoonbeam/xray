@@ -136,6 +136,22 @@ def test_readme_documents_generated_cli_decision():
     assert "source-checkout configuration" in readme
 
 
+def test_readme_documents_current_installation_and_cli_contract():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    normalized_readme = " ".join(readme.split())
+
+    assert "https://github.com/PhilosophiMoonbeam/xray.git" in readme
+    assert "`fastmcp>=3.4.2,<4`" in readme
+    assert "`ast-grep-cli>=0.44.1`" in readme
+    assert "no separate installation is normally required" in normalized_readme
+    assert "JSON symbols include `name`" in readme
+    assert "`rewrite` and `scan --fix` modify files in place" in readme
+    assert "Exit codes are `0` for success" in readme
+    assert "symbols.json" in readme
+    assert "symbols.pkl" not in readme
+    assert "Interface reads use ast-grep's expanded outline" in readme
+
+
 def test_getting_started_documents_search_first_mcp_usage():
     guide = (ROOT / "getting_started.md").read_text(encoding="utf-8")
 
