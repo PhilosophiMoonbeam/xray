@@ -278,30 +278,34 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("root_path", help="Repository root to search.")
     search.add_argument("-p", "--pattern", required=True, help="ast-grep structural pattern.")
     search.add_argument("-l", "--lang", help="Pattern language when it cannot be inferred.")
+    search.add_argument("--format", choices=("json", "text"), default="json", help=OUTPUT_FORMAT_HELP)
     search.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    search.set_defaults(handler=handle_search, format="json")
+    search.set_defaults(handler=handle_search)
 
     rewrite = subparsers.add_parser("rewrite", help="Apply an ast-grep structural rewrite in place.")
     rewrite.add_argument("root_path", help="Repository root to rewrite.")
     rewrite.add_argument("-p", "--pattern", required=True, help="ast-grep structural pattern.")
     rewrite.add_argument("-r", "--replacement", required=True, help="Replacement template.")
     rewrite.add_argument("-l", "--lang", help="Pattern language when it cannot be inferred.")
+    rewrite.add_argument("--format", choices=("json", "text"), default="json", help=OUTPUT_FORMAT_HELP)
     rewrite.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    rewrite.set_defaults(handler=handle_rewrite, format="json")
+    rewrite.set_defaults(handler=handle_rewrite)
 
     scan = subparsers.add_parser("scan", help="Scan code with ast-grep YAML rules.")
     scan.add_argument("root_path", help="Repository root to scan.")
     scan.add_argument("--rule", required=True, help="Rule configuration file or directory inside the root.")
     scan.add_argument("--fix", action="store_true", help="Apply every rule fix without prompting.")
+    scan.add_argument("--format", choices=("json", "text"), default="json", help=OUTPUT_FORMAT_HELP)
     scan.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    scan.set_defaults(handler=handle_scan, format="json")
+    scan.set_defaults(handler=handle_scan)
 
     for command in ("imports", "exports"):
         outline = subparsers.add_parser(command, help=f"List file {command} using ast-grep outline.")
         outline.add_argument("root_path", help="Repository root containing the file.")
         outline.add_argument("file_path", help="File path, absolute or relative; must stay inside the root.")
+        outline.add_argument("--format", choices=("json", "text"), default="json", help=OUTPUT_FORMAT_HELP)
         outline.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-        outline.set_defaults(handler=handle_outline_items, format="json", outline_item=command)
+        outline.set_defaults(handler=handle_outline_items, outline_item=command)
 
     return parser
 
@@ -469,6 +473,9 @@ def _command_envelope(command: str, root_path: Path, **payload: Any) -> dict[str
 def handle_search(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
     matches = indexer.search_pattern(args.pattern, args.lang)
+    if args.format == "text":
+        print_structural_items(matches)
+        return 0
     print_json(
         _command_envelope("search", indexer.root_path, pattern=args.pattern, language=args.lang, matches=matches),
         pretty=args.pretty,
@@ -479,6 +486,13 @@ def handle_search(args: argparse.Namespace) -> int:
 def handle_rewrite(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
     summary = indexer.rewrite_pattern(args.pattern, args.replacement, args.lang)
+    if args.format == "text":
+        match_label = "match" if summary["match_count"] == 1 else "matches"
+        file_label = "file" if summary["file_count"] == 1 else "files"
+        print(f"{summary['match_count']} {match_label} rewritten in {summary['file_count']} {file_label}")
+        for path in summary["files_modified"]:
+            print(path)
+        return 0
     print_json(
         _command_envelope(
             "rewrite",
@@ -496,6 +510,9 @@ def handle_rewrite(args: argparse.Namespace) -> int:
 def handle_scan(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
     matches = indexer.scan_rules(args.rule, args.fix)
+    if args.format == "text":
+        print_structural_items(matches)
+        return 0
     print_json(
         _command_envelope("scan", indexer.root_path, rule=args.rule, fixed=args.fix, matches=matches),
         pretty=args.pretty,
@@ -506,11 +523,52 @@ def handle_scan(args: argparse.Namespace) -> int:
 def handle_outline_items(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
     items = indexer.file_outline_items(args.file_path, args.outline_item)
+    if args.format == "text":
+        print_structural_items(items)
+        return 0
     print_json(
         _command_envelope(args.outline_item, indexer.root_path, file_path=args.file_path, items=items),
         pretty=args.pretty,
     )
     return 0
+
+
+def print_structural_items(items: Sequence[Mapping[str, Any]]) -> None:
+    """Print concise, lossy ast-grep results for human scanning."""
+    for item in items:
+        nested_items = item.get("items")
+        if isinstance(nested_items, list):
+            group_path = item.get("path") or item.get("file") or ""
+            for nested_item in nested_items:
+                if isinstance(nested_item, Mapping):
+                    print_structural_item(nested_item, default_path=str(group_path))
+            continue
+        print_structural_item(item)
+
+
+def print_structural_item(item: Mapping[str, Any], *, default_path: str = "") -> None:
+    """Print one ast-grep match or outline item as a tab-separated scan line."""
+    path = item.get("file") or item.get("path") or default_path
+    range_data = item.get("range")
+    start = range_data.get("start", {}) if isinstance(range_data, Mapping) else {}
+    line = start.get("line") if isinstance(start, Mapping) else None
+    location = str(path)
+    if line is not None:
+        location = f"{location}:{int(line) + 1}" if location else str(int(line) + 1)
+
+    label = (
+        item.get("text")
+        or item.get("lines")
+        or item.get("signature")
+        or item.get("name")
+        or item.get("kind")
+        or item.get("ruleId")
+        or item.get("id")
+    )
+    if label is None:
+        label = json.dumps(item, separators=(",", ":"), sort_keys=True)
+    label = " ".join(str(label).split())
+    print(f"{location}\t{label}" if location else label)
 
 
 def load_symbol(args: argparse.Namespace, root_path: Path | None = None) -> dict[str, Any]:

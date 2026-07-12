@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from xray import cli
-from xray.core.ast_grep import AstGrepResult
+from xray.core.ast_grep import AstGrepError, AstGrepResult
 from xray.core.indexer import XRayIndexer
 
 
@@ -139,6 +139,92 @@ def test_structural_cli_commands_emit_standard_envelopes(
     assert output["ok"] is True
     assert output["command"] == command
     assert payload_key in output
+
+
+@pytest.mark.parametrize(
+    ("argv", "method", "return_value", "expected"),
+    [
+        (
+            ["search", "{root}", "-p", "old($A)"],
+            "search_pattern",
+            [{"file": "sample.py", "range": {"start": {"line": 4}}, "text": "old(1)"}],
+            "sample.py:5\told(1)\n",
+        ),
+        (
+            ["rewrite", "{root}", "-p", "old($A)", "-r", "new($A)"],
+            "rewrite_pattern",
+            {"matches": [], "match_count": 2, "files_modified": ["sample.py"], "file_count": 1},
+            "2 matches rewritten in 1 file\nsample.py\n",
+        ),
+        (
+            ["scan", "{root}", "--rule", "sgconfig.yml"],
+            "scan_rules",
+            [{"file": "sample.py", "ruleId": "no-old", "text": "old(1)"}],
+            "sample.py\told(1)\n",
+        ),
+        (
+            ["imports", "{root}", "sample.py"],
+            "file_outline_items",
+            [
+                {
+                    "path": "sample.py",
+                    "items": [
+                        {
+                            "name": "pathlib",
+                            "signature": "from pathlib import Path",
+                            "range": {"start": {"line": 2}},
+                        }
+                    ],
+                }
+            ],
+            "sample.py:3\tfrom pathlib import Path\n",
+        ),
+        (
+            ["exports", "{root}", "sample.py"],
+            "file_outline_items",
+            [{"name": "caller"}],
+            "caller\n",
+        ),
+    ],
+)
+def test_structural_cli_commands_support_lossy_text(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    method: str,
+    return_value: object,
+    expected: str,
+) -> None:
+    repo = make_repo(tmp_path)
+    argv = [str(repo) if value == "{root}" else value for value in argv]
+    argv.extend(["--format", "text", "--pretty"])
+    with patch.object(XRayIndexer, method, return_value=return_value):
+        assert cli.main(argv) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == expected
+    assert captured.err == ""
+
+
+def test_structural_text_parse_error_is_plain_text(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["search", ".", "--format", "text"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("xray search: error:")
+    assert not captured.err.lstrip().startswith("{")
+
+
+def test_structural_text_runtime_error_is_plain_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = make_repo(tmp_path)
+    with patch.object(XRayIndexer, "search_pattern", side_effect=AstGrepError("bad pattern")):
+        assert cli.main(["search", str(repo), "-p", "(", "--format", "text"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "xray: bad pattern\n"
 
 
 def test_structural_search_and_rewrite_run_end_to_end(tmp_path: Path) -> None:

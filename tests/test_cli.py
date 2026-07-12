@@ -1498,7 +1498,7 @@ def test_cli_version_returns_without_system_exit(capsys):
     exit_code = cli.main(["--version"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out.strip() == "xray 0.8.0"
+    assert capsys.readouterr().out.strip() == "xray 0.8.1"
 
 
 def test_cli_help_documents_agent_workflow_json_and_safety(capsys):
