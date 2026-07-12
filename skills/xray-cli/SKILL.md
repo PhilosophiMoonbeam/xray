@@ -1,11 +1,11 @@
 ---
 name: xray-cli
-description: "Use the XRAY command-line interface for agentic code discovery: map repositories, find symbols, inspect interfaces and likely symbol-name impact, structurally search or rewrite code, scan rules, inspect imports or exports, and automate JSON or jq handoffs. Use when a coding agent can run shell commands and needs the handwritten xray CLI rather than the XRAY MCP search_tools/call_tool workflow."
+description: "Use the XRAY command-line interface for agentic code discovery: map repositories, find symbols, inspect interfaces and likely symbol-name impact, structurally search or rewrite code, scan rules, inspect imports or exports, and automate JSON or jq handoffs. Use when a coding agent can run shell commands and needs concise XRAY CLI workflows."
 ---
 
 # XRAY CLI
 
-Use XRAY for progressive code discovery before reading large files. Prefer the CLI when shell access is available; use the XRAY MCP skill only in MCP-only clients.
+Use XRAY for progressive code discovery before reading large files.
 
 ## Command Form
 
