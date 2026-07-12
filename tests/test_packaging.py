@@ -153,19 +153,6 @@ def test_readme_documents_current_installation_and_cli_contract():
     assert "Interface reads use ast-grep's expanded outline" in readme
 
 
-def test_getting_started_documents_search_first_mcp_usage():
-    guide = (ROOT / "getting_started.md").read_text(encoding="utf-8")
-
-    assert "XRAY's MCP server uses a search-first FastMCP surface" in guide
-    assert "`search_tools` - find XRAY operations" in guide
-    assert "`call_tool` - run the discovered operation" in guide
-    assert "Resource: `xray://workflow`" in guide
-    assert "FastMCP can generate an ad hoc CLI" in guide
-    assert "What code references PaymentProcessor before I change it?" in guide
-    assert "Find likely symbol-name code references for impact review" in guide
-    assert "What function is defined at line 125" not in guide
-
-
 def test_package_fallback_version_matches_pyproject():
     from xray import __version__
 

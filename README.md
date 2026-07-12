@@ -473,6 +473,5 @@ The tests cover:
 
 ## More Details
 
-See [`getting_started.md`](getting_started.md) for a longer installation-oriented
-guide and `src/xray/skills/xray-progressive-discovery/SKILL.md` for the MCP skill
-that clients can fetch at runtime.
+See `src/xray/skills/xray-progressive-discovery/SKILL.md` for the MCP skill that
+clients can fetch at runtime.
