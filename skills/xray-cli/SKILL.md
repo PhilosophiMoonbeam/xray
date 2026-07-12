@@ -50,11 +50,21 @@ Use `xray map` only as an alias for `xray explore`; JSON still reports `command:
 ## Output Modes
 
 - Compact JSON is the default for all commands.
+- `explore`, `search`, `scan`, `rewrite`, `imports`, and `exports` emit the sparse `xray.cli.v2` contract by default.
+- Use `--detail full` on those commands only when lossless upstream metadata or the verbose v1-compatible payload is required.
 - Use `--pretty` only for indented JSON inspection.
 - Use `--format text` only for lossy, token-friendly scans.
 - Do not request YAML.
 - Preserve full symbol objects: `name`, `path`, `abs_path`, `start_line`, `end_line`, `type`, `score`.
 - Treat `xray impact` as a name-based reference search, not a type-aware caller, dependent, or dependency graph.
+
+Compact `explore` JSON contains structured relative-path entries and omits the duplicated `tree_text` and per-entry absolute paths. Use text format for a visual tree or `--detail full` for both representations:
+
+```bash
+xray explore ROOT --max-depth 2
+xray explore ROOT --max-depth 2 --format text
+xray explore ROOT --max-depth 2 --detail full
+```
 
 ```bash
 xray find ROOT "target_function" --limit 1 \
@@ -76,8 +86,17 @@ xray scan ROOT --rule sgconfig.yml
 xray rewrite ROOT -p 'old_api($ARG)' -r 'new_api($ARG)'
 ```
 
-`rewrite` and `scan --fix` modify files in place. Review their JSON summaries and
-the worktree after running them.
+Structural output defaults to at most 50 returned items. Compact matches use stable fields such as `path`, one-based `line` and `column`, `text`, and `captures`. Check `returned`, `total`, and `truncated`; when `next_cursor` is present, continue the same read-only query by passing it unchanged:
+
+```bash
+first=$(xray search ROOT -p 'old_api($ARG)' -l python --limit 25)
+cursor=$(printf '%s' "$first" | jq -r '.next_cursor // empty')
+test -z "$cursor" || xray search ROOT -p 'old_api($ARG)' -l python --limit 25 --cursor "$cursor"
+```
+
+Cursors are bound to the command, root, and query. Do not reuse one with different arguments. `imports` and `exports` page flattened outline items rather than raw wrapper groups.
+
+`rewrite` and `scan --fix` modify every match even when `--limit` reports fewer diagnostics. Compact `rewrite` intentionally returns only match/file counts and modified paths; use `--detail full` only when pre-rewrite matches are necessary. Mutating results do not support continuation because the worktree has changed. Review their JSON summaries and the worktree after running them.
 
 Expected outside-root failures:
 

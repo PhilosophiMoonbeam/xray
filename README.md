@@ -97,7 +97,7 @@ the alias is used.
 ```bash
 xray explore ROOT [--max-depth N] [--include-symbols | --symbols] \
   [--focus DIR]... [--max-symbols-per-file N] [--type TYPE[,TYPE...]] [--max-entries N] \
-  [--format json|text] [--pretty]
+  [--detail compact|full] [--format json|text] [--pretty]
 ```
 
 Important options:
@@ -107,7 +107,8 @@ Important options:
 - `--focus DIR` can be repeated to keep output centered on selected top-level directories; root-level files remain visible for repository context.
 - `--max-symbols-per-file N` limits skeleton detail per file and must be zero or greater.
 - `--max-entries N` bounds files and directories in the map (default: 5000) and must be at least one.
-- JSON is the default and returns both `tree_text` and structured `entries`.
+- Compact JSON is the default and returns structured `entries` without duplicated `tree_text`, absolute paths, names derivable from paths, or empty envelope fields.
+- `--detail full` preserves the v1 JSON tree and entry payload.
 - `--format text` returns the compact lossy tree view.
 - `--pretty` indents JSON output for visual inspection.
 
@@ -181,7 +182,16 @@ xray imports ROOT src/package/module.py
 xray exports ROOT src/package/module.py
 ```
 
-These commands also accept `--format json|text` and `--pretty`.
+These commands also accept `--detail compact|full`, `--limit N`, `--cursor TOKEN`,
+`--format json|text`, and `--pretty`. Compact detail is the default and returns
+XRAY-owned fields such as relative `path`, one-based `line`/`column`, `text`, and
+`captures`. Full detail retains lossless upstream ast-grep JSON.
+
+The default limit is 50 returned items. Read-only responses include `returned`,
+`total`, and `truncated`; when more results exist, pass the opaque `next_cursor`
+back as `--cursor`. Cursors are bound to the command, root, and query. Limits
+only bound reported diagnostics: `rewrite` and `scan --fix` still apply every
+matching edit and do not advertise continuation after mutation.
 
 `search` returns ast-grep matches, including captured metavariables. `rewrite`
 applies every structural replacement in place and reports match and modified-file
@@ -189,30 +199,36 @@ counts. `scan` runs a rule configuration inside `ROOT`; `--fix` applies configur
 fixes without prompting. Import/export paths are confined to `ROOT` and use
 ast-grep outline for file dependency and public-API inspection.
 
+Compact `rewrite` output omits pre-rewrite matches and reports only counts and
+modified paths. Use `--detail full` when the match payload is required.
+
 `rewrite` and `scan --fix` modify files in place. Review their JSON summaries and
 the worktree after running them.
 
 ## JSON Output
 
-JSON output is wrapped in a stable `schema_version: "xray.cli.v1"` envelope.
-It is compact by default for token efficiency. Pass `--pretty` for indented JSON,
-or `--format text` for lossy human-readable scans. Every successful command
-includes `ok: true`, `command`, `root_path`, and command-specific data. JSON
-errors use `ok: false`, `error`, and `warnings`. Parse and validation errors are
-JSON unless the caller explicitly requested `--format text`.
+Compact explore and structural output use the sparse `schema_version:
+"xray.cli.v2"` contract. `--detail full` preserves the verbose v1 envelope for
+compatibility. Find, interface, impact, and errors remain v1. JSON is one line by
+default for token efficiency. Pass `--pretty` for indented JSON,
+or `--format text` for lossy human-readable scans. Compact v2 responses retain
+`schema_version` and `command`, but omit `ok: true`, empty warnings, repeated root
+paths, and echoed query fields. JSON errors use `ok: false`, `error`, and
+`warnings`. Parse and validation errors are JSON unless the caller explicitly
+requested `--format text`.
 
 Exit codes are `0` for success, `1` for command failure, and `2` for parse or
 validation errors.
 
 Command-specific fields:
 
-- `explore`: `invoked_as`, `tree_text`, `entries`, `options`, `truncated`, `warnings`.
+- compact `explore`: `invoked_as`, `root_path`, `entries`, `options`, `truncated`, and warnings only when present.
 - `find`: `query`, `limit`, `min_score`, `symbols`, `error`, `warnings`.
 - `interface`: `file_path`, `interface`, `error`, `warnings`.
 - `impact`: `symbol`, `impact`, `error`, `warnings`. Impact payloads include `strategy`, `total_count`, `raw_count`, and `filtered_count` so callers can see when non-source, duplicate, or definition-range matches were removed.
-- `search` / `scan`: `matches` plus the pattern or rule options.
-- `rewrite`: `matches`, `match_count`, `files_modified`, and `file_count`.
-- `imports` / `exports`: `file_path` and `items`.
+- compact `search` / `scan`: projected `matches` and page metadata.
+- compact `rewrite`: `match_count`, `files_modified`, and `file_count`.
+- compact `imports` / `exports`: projected `items` and page metadata.
 
 Example:
 

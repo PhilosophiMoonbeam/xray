@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import hashlib
 import json
 import os
 import sys
@@ -25,8 +28,11 @@ from xray.models import (
     dump_symbol_output,
     validate_symbol_input,
 )
+from xray.presentation import compact_explore, compact_structural_items
 
 SCHEMA_VERSION = "xray.cli.v1"
+COMPACT_SCHEMA_VERSION = "xray.cli.v2"
+DEFAULT_STRUCTURAL_LIMIT = 50
 MAX_SCORE = 100
 MAX_SYMBOL_JSON_CHARS = 1024 * 1024
 OUTPUT_FORMAT_HELP = "Output format. json is the default automation contract; text is a lossy scan mode."
@@ -44,8 +50,10 @@ Structural workflow:
   xray search ROOT -p 'old_api($ARG)' -l python
   xray imports ROOT src/package/module.py
 
-Subcommands emit compact JSON by default. Use subcommand --pretty for indented
-JSON or --format text for compact lossy scans. YAML output is unsupported.
+Subcommands emit compact JSON by default. Structural commands bound output and
+support --cursor continuation; use --detail full for upstream payloads.
+Use --pretty for indented JSON or --format text for compact lossy scans.
+YAML output is unsupported.
 Commands rewrite and scan --fix modify files in place.
 Exit codes: 0 success, 1 command failure, 2 parse or validation error.
 """
@@ -61,8 +69,9 @@ Examples:
   xray explore ROOT --focus src --include-symbols --max-symbols-per-file 5
   xray map ROOT --format text
 
-Default JSON includes schema_version, ok, root_path, tree_text, entries,
-options, warnings, and invoked_as. The map alias reports command "explore".
+Compact JSON includes structured relative-path entries without a duplicate tree
+or absolute paths. Use --detail full for the v1 payload. The map alias reports
+command "explore" and invoked_as "map".
 """
 
 FIND_EPILOG = """\
@@ -208,6 +217,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=OUTPUT_FORMAT_HELP,
     )
     explore.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    explore.add_argument(
+        "--detail",
+        choices=("compact", "full"),
+        default="compact",
+        help="JSON detail level; full preserves the v1 payload.",
+    )
     explore.set_defaults(handler=handle_explore)
 
     find = subparsers.add_parser(
@@ -287,8 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("root_path", help="Repository root to search.")
     search.add_argument("-p", "--pattern", required=True, help="ast-grep structural pattern.")
     search.add_argument("-l", "--lang", help="Pattern language when it cannot be inferred.")
-    search.add_argument("--format", choices=("json", "text"), default="json", help=OUTPUT_FORMAT_HELP)
-    search.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    add_structural_output_args(search)
     search.set_defaults(handler=handle_search)
 
     rewrite = subparsers.add_parser("rewrite", help="Apply an ast-grep structural rewrite in place.")
@@ -296,27 +310,45 @@ def build_parser() -> argparse.ArgumentParser:
     rewrite.add_argument("-p", "--pattern", required=True, help="ast-grep structural pattern.")
     rewrite.add_argument("-r", "--replacement", required=True, help="Replacement template.")
     rewrite.add_argument("-l", "--lang", help="Pattern language when it cannot be inferred.")
-    rewrite.add_argument("--format", choices=("json", "text"), default="json", help=OUTPUT_FORMAT_HELP)
-    rewrite.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    add_structural_output_args(rewrite, supports_cursor=False)
     rewrite.set_defaults(handler=handle_rewrite)
 
     scan = subparsers.add_parser("scan", help="Scan code with ast-grep YAML rules.")
     scan.add_argument("root_path", help="Repository root to scan.")
     scan.add_argument("--rule", required=True, help="Rule configuration file or directory inside the root.")
     scan.add_argument("--fix", action="store_true", help="Apply every rule fix without prompting.")
-    scan.add_argument("--format", choices=("json", "text"), default="json", help=OUTPUT_FORMAT_HELP)
-    scan.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    add_structural_output_args(scan)
     scan.set_defaults(handler=handle_scan)
 
     for command in ("imports", "exports"):
         outline = subparsers.add_parser(command, help=f"List file {command} using ast-grep outline.")
         outline.add_argument("root_path", help="Repository root containing the file.")
         outline.add_argument("file_path", help="File path, absolute or relative; must stay inside the root.")
-        outline.add_argument("--format", choices=("json", "text"), default="json", help=OUTPUT_FORMAT_HELP)
-        outline.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+        add_structural_output_args(outline)
         outline.set_defaults(handler=handle_outline_items, outline_item=command)
 
     return parser
+
+
+def add_structural_output_args(parser: argparse.ArgumentParser, *, supports_cursor: bool = True) -> None:
+    parser.add_argument(
+        "--detail",
+        choices=("compact", "full"),
+        default="compact",
+        help="Compact stable fields (default) or lossless upstream JSON.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_STRUCTURAL_LIMIT,
+        help=f"Maximum returned items (default: {DEFAULT_STRUCTURAL_LIMIT}); operations still inspect/fix all matches.",
+    )
+    if supports_cursor:
+        parser.add_argument("--cursor", help="Opaque continuation cursor from next_cursor.")
+    else:
+        parser.set_defaults(cursor=None)
+    parser.add_argument("--format", choices=("json", "text"), default="json", help=OUTPUT_FORMAT_HELP)
+    parser.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
 
 
 def handle_explore(args: argparse.Namespace) -> int:
@@ -340,6 +372,22 @@ def handle_explore(args: argparse.Namespace) -> int:
     if args.format == "json":
         data = dump_explore_data(data)
         invoked_as = args.command
+        if args.detail == "compact":
+            compact = compact_explore(data)
+            compact.update(
+                {
+                    "schema_version": COMPACT_SCHEMA_VERSION,
+                    "command": "explore",
+                    "invoked_as": invoked_as,
+                }
+            )
+            if data["truncated"]:
+                compact["warnings"] = [
+                    f"Explore output truncated at {args.max_entries} entries; "
+                    "narrow with --focus/--max-depth or raise --max-entries."
+                ]
+            print_json(compact, pretty=args.pretty)
+            return 0
         data.update(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -479,14 +527,99 @@ def _command_envelope(command: str, root_path: Path, **payload: Any) -> dict[str
     }
 
 
+def _cursor_fingerprint(command: str, root_path: Path, identity: Mapping[str, Any]) -> str:
+    value = json.dumps([command, str(root_path), identity], separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(value.encode()).hexdigest()[:16]
+
+
+def _encode_cursor(offset: int, fingerprint: str) -> str:
+    raw = json.dumps({"o": offset, "q": fingerprint}, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str | None, fingerprint: str) -> int:
+    if not cursor:
+        return 0
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        value = json.loads(raw)
+        offset = value["o"]
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError, binascii.Error) as exc:
+        raise ValueError("--cursor is invalid.") from exc
+    if not isinstance(offset, int) or offset < 0 or value.get("q") != fingerprint:
+        raise ValueError("--cursor does not match this command or query.")
+    return offset
+
+
+def _page_items(
+    items: Sequence[Mapping[str, Any]],
+    args: argparse.Namespace,
+    command: str,
+    root_path: Path,
+    identity: Mapping[str, Any],
+) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
+    if args.limit < 0:
+        raise ValueError("--limit must be 0 or greater.")
+    fingerprint = _cursor_fingerprint(command, root_path, identity)
+    offset = _decode_cursor(args.cursor, fingerprint)
+    total = len(items)
+    if offset > total:
+        raise ValueError("--cursor is past the available results.")
+    end = min(offset + args.limit, total)
+    page = list(items[offset:end])
+    metadata: dict[str, Any] = {
+        "returned": len(page),
+        "total": total,
+        "truncated": end < total,
+    }
+    if end < total:
+        metadata["next_cursor"] = _encode_cursor(end, fingerprint)
+    return page, metadata
+
+
+def _validate_page_args(args: argparse.Namespace, command: str, root_path: Path, identity: Mapping[str, Any]) -> None:
+    """Validate paging before any operation that may mutate the worktree."""
+    if args.limit < 0:
+        raise ValueError("--limit must be 0 or greater.")
+    _decode_cursor(args.cursor, _cursor_fingerprint(command, root_path, identity))
+
+
+def _structural_payload(
+    raw_items: Sequence[Mapping[str, Any]],
+    args: argparse.Namespace,
+    command: str,
+    root_path: Path,
+    identity: Mapping[str, Any],
+) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
+    projected: Sequence[Mapping[str, Any]] = (
+        raw_items if args.detail == "full" else compact_structural_items(raw_items, root_path)
+    )
+    return _page_items(projected, args, command, root_path, identity)
+
+
+def _compact_envelope(command: str, **payload: Any) -> dict[str, Any]:
+    return {"schema_version": COMPACT_SCHEMA_VERSION, "command": command, **payload}
+
+
 def handle_search(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
+    _validate_page_args(args, "search", indexer.root_path, {"pattern": args.pattern, "lang": args.lang})
     matches = indexer.search_pattern(args.pattern, args.lang)
+    page, metadata = _structural_payload(
+        matches, args, "search", indexer.root_path, {"pattern": args.pattern, "lang": args.lang}
+    )
     if args.format == "text":
-        print_structural_items(matches)
+        print_structural_items(page)
+        if metadata["truncated"]:
+            print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
+        return 0
+    if args.detail == "compact":
+        print_json(_compact_envelope("search", matches=page, **metadata), pretty=args.pretty)
         return 0
     print_json(
-        _command_envelope("search", indexer.root_path, pattern=args.pattern, language=args.lang, matches=matches),
+        _command_envelope(
+            "search", indexer.root_path, pattern=args.pattern, language=args.lang, matches=page, **metadata
+        ),
         pretty=args.pretty,
     )
     return 0
@@ -494,6 +627,8 @@ def handle_search(args: argparse.Namespace) -> int:
 
 def handle_rewrite(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
+    identity = {"pattern": args.pattern, "replacement": args.replacement, "lang": args.lang}
+    _validate_page_args(args, "rewrite", indexer.root_path, identity)
     summary = indexer.rewrite_pattern(args.pattern, args.replacement, args.lang)
     if args.format == "text":
         match_label = "match" if summary["match_count"] == 1 else "matches"
@@ -501,6 +636,12 @@ def handle_rewrite(args: argparse.Namespace) -> int:
         print(f"{summary['match_count']} {match_label} rewritten in {summary['file_count']} {file_label}")
         for path in summary["files_modified"]:
             print(path)
+        return 0
+    matches = summary.pop("matches", [])
+    page, metadata = _structural_payload(matches, args, "rewrite", indexer.root_path, identity)
+    metadata.pop("next_cursor", None)
+    if args.detail == "compact":
+        print_json(_compact_envelope("rewrite", **summary), pretty=args.pretty)
         return 0
     print_json(
         _command_envelope(
@@ -510,6 +651,8 @@ def handle_rewrite(args: argparse.Namespace) -> int:
             replacement=args.replacement,
             language=args.lang,
             **summary,
+            matches=page,
+            **metadata,
         ),
         pretty=args.pretty,
     )
@@ -518,12 +661,24 @@ def handle_rewrite(args: argparse.Namespace) -> int:
 
 def handle_scan(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
+    identity = {"rule": args.rule, "fix": args.fix}
+    if args.fix and args.cursor:
+        raise ValueError("--cursor cannot be used with scan --fix because fixes mutate the result set.")
+    _validate_page_args(args, "scan", indexer.root_path, identity)
     matches = indexer.scan_rules(args.rule, args.fix)
+    page, metadata = _structural_payload(matches, args, "scan", indexer.root_path, identity)
+    if args.fix:
+        metadata.pop("next_cursor", None)
     if args.format == "text":
-        print_structural_items(matches)
+        print_structural_items(page)
+        if metadata["truncated"] and "next_cursor" in metadata:
+            print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
+        return 0
+    if args.detail == "compact":
+        print_json(_compact_envelope("scan", matches=page, fixed=args.fix, **metadata), pretty=args.pretty)
         return 0
     print_json(
-        _command_envelope("scan", indexer.root_path, rule=args.rule, fixed=args.fix, matches=matches),
+        _command_envelope("scan", indexer.root_path, rule=args.rule, fixed=args.fix, matches=page, **metadata),
         pretty=args.pretty,
     )
     return 0
@@ -531,12 +686,20 @@ def handle_scan(args: argparse.Namespace) -> int:
 
 def handle_outline_items(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
+    identity = {"file_path": args.file_path}
+    _validate_page_args(args, args.outline_item, indexer.root_path, identity)
     items = indexer.file_outline_items(args.file_path, args.outline_item)
+    page, metadata = _structural_payload(items, args, args.outline_item, indexer.root_path, identity)
     if args.format == "text":
-        print_structural_items(items)
+        print_structural_items(page)
+        if metadata["truncated"]:
+            print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
+        return 0
+    if args.detail == "compact":
+        print_json(_compact_envelope(args.outline_item, items=page, **metadata), pretty=args.pretty)
         return 0
     print_json(
-        _command_envelope(args.outline_item, indexer.root_path, file_path=args.file_path, items=items),
+        _command_envelope(args.outline_item, indexer.root_path, file_path=args.file_path, items=page, **metadata),
         pretty=args.pretty,
     )
     return 0
@@ -561,9 +724,12 @@ def print_structural_item(item: Mapping[str, Any], *, default_path: str = "") ->
     range_data = item.get("range")
     start = range_data.get("start", {}) if isinstance(range_data, Mapping) else {}
     line = start.get("line") if isinstance(start, Mapping) else None
+    if line is None:
+        line = item.get("line")
     location = str(path)
     if line is not None:
-        location = f"{location}:{int(line) + 1}" if location else str(int(line) + 1)
+        display_line = int(line) if "line" in item and not range_data else int(line) + 1
+        location = f"{location}:{display_line}" if location else str(display_line)
 
     label = (
         item.get("text")

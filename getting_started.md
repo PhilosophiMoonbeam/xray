@@ -48,6 +48,11 @@ uvx --from . xray find . "UserService" --min-score 60
 uvx --from . xray-mcp
 ```
 
+Structural CLI commands use compact stable JSON and return at most 50 reported
+items by default. Use `--limit`, continue with the opaque `next_cursor` via
+`--cursor`, or request lossless ast-grep payloads with `--detail full`. Output
+limits never reduce the edits applied by `rewrite` or `scan --fix`.
+
 ### Option 3: Install as a Tool (Recommended for Regular Use)
 
 Install XRAY as a persistent tool:

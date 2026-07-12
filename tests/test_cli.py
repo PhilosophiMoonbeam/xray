@@ -1615,12 +1615,12 @@ def test_explore_json_includes_structured_entries(tmp_path, capsys):
 
     assert exit_code == 0
     result = json.loads(capsys.readouterr().out)
-    assert result["schema_version"] == "xray.cli.v1"
-    assert result["ok"] is True
+    assert result["schema_version"] == "xray.cli.v2"
+    assert "ok" not in result
     assert result["command"] == "explore"
     assert result["invoked_as"] == "explore"
     assert result["root_path"] == str(repo)
-    assert "tree_text" in result
+    assert "tree_text" not in result
     assert result["options"]["include_symbols"] is True
     assert result["options"]["max_entries"] == 5000
     assert result["truncated"] is False
@@ -1628,7 +1628,7 @@ def test_explore_json_includes_structured_entries(tmp_path, capsys):
     assert entries["."]["kind"] == "directory"
     assert entries["src"]["kind"] == "directory"
     assert entries["src/sample.py"]["language"] == "python"
-    assert entries["src/sample.py"]["abs_path"] == str(repo / "src" / "sample.py")
+    assert "abs_path" not in entries["src/sample.py"]
     assert any(symbol["signature"] == "def target_function(value):" for symbol in entries["src/sample.py"]["symbols"])
 
 
@@ -1643,7 +1643,17 @@ def test_explore_cli_bounds_and_reports_truncated_output(tmp_path, capsys):
     assert result["truncated"] is True
     assert result["options"]["max_entries"] == 2
     assert "truncated at 2 entries" in result["warnings"][0]
-    assert len(result["tree_text"].splitlines()) == 2
+    assert "tree_text" not in result
+
+
+def test_explore_full_preserves_v1_tree_and_absolute_paths(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+    assert cli.main(["explore", str(repo), "--detail", "full"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["schema_version"] == "xray.cli.v1"
+    assert result["ok"] is True
+    assert "tree_text" in result
+    assert all("abs_path" in entry for entry in result["entries"])
 
 
 def test_explore_text_reports_truncated_output(tmp_path, capsys):
