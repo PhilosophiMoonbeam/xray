@@ -45,6 +45,7 @@ def test_quality_tooling_is_configured_for_repo_layout():
     assert data["tool"]["ruff"]["target-version"] == "py310"
     assert "test_samples" in data["tool"]["ruff"]["extend-exclude"]
     assert data["tool"]["ruff"]["lint"]["select"] == ["E", "F", "I", "UP", "PL", "RUF"]
+    assert "PLR0917" in data["tool"]["ruff"]["lint"]["ignore"]
     assert data["tool"]["ruff"]["lint"]["per-file-ignores"]["tests/**/*"] == ["PLR2004", "E501"]
     assert data["tool"]["vulture"]["paths"] == ["src", "mcp-config-generator.py"]
     assert "test_samples" in data["tool"]["vulture"]["exclude"]

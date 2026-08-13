@@ -11,14 +11,22 @@ node_modules/
 
 # Python cache
 __pycache__/
+*.pyc
 .venv/
 uv.lock
+
+# Local XRAY and Codex runtime state
+.xray/
+.codex-log/
+*.tmp
+.DS_Store
 
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+.beads/interactions.jsonl
 
 # Reference Projects
 .reference_projects/

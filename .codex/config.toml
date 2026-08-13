@@ -1,2 +1,38 @@
+model = "gpt-5.6-sol"
+model_reasoning_effort = "medium"
+sandbox_mode = "danger-full-access"
+approval_policy = "never"
+web_search = "disabled"
+
 [features]
+multi_agent = true
+multi_agent_v2 = true
 hooks = true
+
+[agents]
+max_concurrent_threads_per_session = 3
+interrupt_message = true
+
+[agents.sol_design]
+description = "Proposes one material architecture as a frozen Design Packet for root."
+config_file = "agents/sol_design.toml"
+
+[agents.sol_write]
+description = "Implements one semantic-quality-sensitive ready Bead under frozen authority."
+config_file = "agents/sol_write.toml"
+
+[agents.breakthrough_read]
+description = "Diagnoses one unchanged failure after two evidence-free hypotheses."
+config_file = "agents/breakthrough_read.toml"
+
+[agents.luna_read]
+description = "Answers one bounded repository question with cited evidence."
+config_file = "agents/luna_read.toml"
+
+[agents.luna_write]
+description = "Implements one conventional contract-complete ready Bead."
+config_file = "agents/luna_write.toml"
+
+[agents.terra_verify]
+description = "Searches one fixed artifact for counterexamples to its contract."
+config_file = "agents/terra_verify.toml"

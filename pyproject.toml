@@ -64,6 +64,7 @@ ignore = [
     "PLR0911", # Too many return statements
     "PLR0912", # Too many branches
     "PLR0913", # Too many arguments
+    "PLR0917", # Too many positional arguments; preserve established API and test signatures
     "PLR0915", # Too many statements
     "RUF012",  # Mutable class attributes
 ]

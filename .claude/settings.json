@@ -4,11 +4,12 @@
       {
         "hooks": [
           {
-            "command": "bd prime --hook-json",
+            "command": "bd --readonly prime --hook-json",
+            "timeout": 35,
             "type": "command"
           }
         ],
-        "matcher": ""
+        "matcher": "startup|resume|clear|compact"
       }
     ]
   }

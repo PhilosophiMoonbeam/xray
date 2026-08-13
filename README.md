@@ -9,6 +9,16 @@ interfaces, estimate symbol impact, and perform structural code operations witho
 running a language server. Use the handwritten `xray` CLI in shell workflows, or
 run `xray-mcp` from an MCP-capable assistant.
 
+## Agent harness
+
+Repository automation starts at [`AGENTS.md`](AGENTS.md). The
+[`migration manifest`](TEMPLATE_MANIFEST.md) links the XRAY-owned
+[`adaptation`](docs/ADAPTATION.md), [`routing`](docs/agent-model-routing.md),
+[`operations`](docs/agent-operations.md),
+[`implementation`](docs/implementation-standard.md), and
+[`language`](docs/repository-language-standard.md) authorities. These harness
+documents do not change the product behavior described below.
+
 Progressive discovery starts with four operations:
 
 - **Map** (`xray explore`, `xray map`, `explore_repo`) - show repository structure with optional symbol skeletons.

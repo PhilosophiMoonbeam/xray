@@ -1,48 +1,16 @@
 {
+  "description": "Recover XRAY Beads workflow and current work when a Codex session starts or compacts.",
   "hooks": {
-    "PostCompact": [
-      {
-        "hooks": [
-          {
-            "command": "bd codex-hook PostCompact",
-            "statusMessage": "Scheduling Beads context refresh",
-            "type": "command"
-          }
-        ],
-        "matcher": "manual|auto"
-      }
-    ],
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "command": "bd codex-hook PreCompact",
-            "statusMessage": "Checking Beads context",
-            "type": "command"
-          }
-        ],
-        "matcher": "manual|auto"
-      }
-    ],
     "SessionStart": [
       {
+        "matcher": "startup|resume|clear|compact",
         "hooks": [
           {
-            "command": "bd codex-hook SessionStart",
-            "statusMessage": "Loading Beads context",
-            "type": "command"
-          }
-        ],
-        "matcher": "startup|resume|clear"
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "command": "bd codex-hook UserPromptSubmit",
-            "statusMessage": "Refreshing Beads context",
-            "type": "command"
+            "type": "command",
+            "command": "uv run python \"$(git rev-parse --show-toplevel)/.codex/session_start.py\"",
+            "statusMessage": "Loading XRAY Beads workflow and current work",
+            "additionalContextLimit": 2500,
+            "timeout": 35
           }
         ]
       }
