@@ -18,7 +18,7 @@ is hidden from ordinary intent results but remains callable by exact name.
    10; preserve the full scored symbol object.
 3. Inspect signature contracts with bounded `read_interface_structured`, exact source with
    `read_symbol`, or a location with `symbol_at`. Pass the full find result as
-   `exact_symbol` with `schema="v3"` to return only its owner/member interface.
+   `exact_symbol` to return only its owner/member interface in default v3.
    `read_interface` is legacy text.
 4. Estimate blast radius with `what_breaks` and the full find symbol. Results
    are name-based references, not a type-aware caller or dependency graph.

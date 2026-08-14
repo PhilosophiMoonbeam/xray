@@ -29,8 +29,8 @@ implementation under `src/xray/` remain product evidence; frozen Design Packet
 version 2 is the active harness authority.
 
 Preserved public interfaces include the `xray` and `xray-mcp` entry points,
-compact `xray.cli.v2` JSON plus full/v1 compatibility, the intentional CLI/MCP
-surface differences, opt-in compact `xray.cli.v3`, MCP's ranked search-first
+default compact `xray.cli.v3` JSON, explicit legacy v2 and full/v1 projections,
+the intentional CLI/MCP surface differences, MCP's ranked search-first
 `search_tools`/`call_tool` exposure,
 resource `xray://workflow`, prompt `xray_discovery_plan`, skill
 `skill://xray-progressive-discovery/SKILL.md`, and skill template

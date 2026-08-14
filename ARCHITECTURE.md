@@ -36,11 +36,11 @@ wrap the adapters without becoming runtime dependencies of them.
 
 ## XRAY 0.11.0 current contract
 
-XRAY 0.11.0 preserves Python 3.10+, default compact `xray.cli.v2`, explicit
-full/v1 output, JSON and `jq` pipelines, stdio MCP, repository containment,
-snapshot-bound cursors, and direct legacy mutation. Compact `xray.cli.v3` is
-opt-in through `--schema v3`; it standardizes success and paging fields without
-changing the v2 projection.
+XRAY 0.11.0 preserves Python 3.10+, default compact `xray.cli.v3`, explicit
+legacy v2 and full/v1 output, JSON and `jq` pipelines, stdio MCP, repository
+containment, snapshot-bound cursors, and direct legacy mutation. V3 standardizes
+success and paging fields; `--schema v2` exposes the previous projection only
+for diagnosis and is not a compatibility commitment.
 
 V3 interface output uses only `returned`, `total`, `total_exact`, `truncated`,
 and `next_cursor` for paging. `completeness` contains a Boolean and typed reasons
@@ -379,9 +379,9 @@ are removed.
 
 ### Compatibility and verification
 
-JSON remains the default. YAML remains ast-grep rule input only. Compact v2 is
-additive; full/v1 modes preserve lossless legacy payloads. Existing entry
-points, `map`, symbol handoffs, process exit classes, containment, installed
+JSON remains the default. YAML remains ast-grep rule input only. Compact v3 is
+the product default; explicit v2 and full/v1 modes remain diagnostic
+projections. Existing entry points, `map`, symbol handoffs, process exit classes, containment, installed
 skills, MCP search-first discovery, prompts, resources, package data, and
 Python 3.10+ remain supported.
 
@@ -433,10 +433,11 @@ JSON is the default; YAML is not an output mode and is not planned. Text output
 is explicitly lossy and intended for visual scanning.
 
 - Compact `explore`, `interface`, `impact`, replacement, `search`, `scan`, `rewrite`, `imports`, and `exports`
-  responses use sparse `schema_version: "xray.cli.v2"` envelopes by default.
-- Compact-capable CLI commands accept `--schema v3`; v3 consistently includes
-  success state and standardizes paging, interface completeness, and compact
-  impact diagnostics. Cursor identity includes v3 when its shape differs.
+  responses use `schema_version: "xray.cli.v3"` envelopes by default.
+- Compact-capable CLI commands accept `--schema v2` for the previous projection;
+  v3 consistently includes success state and standardizes paging, interface
+  completeness, and compact impact diagnostics. Cursor identity distinguishes
+  projections when their shapes differ.
 - `--detail full` preserves verbose v1-compatible data for commands that offer
   detail selection. `find` and legacy full interface/impact remain `xray.cli.v1`.
 - `map` is an alias for `explore`; JSON records `command: "explore"` and
@@ -449,7 +450,7 @@ is explicitly lossy and intended for visual scanning.
   `0`, `1`, and `2`. JSON errors contain `ok: false`, `error`, and `warnings`
   unless text was explicitly selected.
 
-Compact v2 is a projection, not a new engine result: it removes repeated or
+Compact output is a projection, not a new engine result: it removes repeated or
 empty data while retaining command identity and continuation/safety metadata.
 Changing a compact field, full/v1 field, symbol handoff, alias, exit code, or
 default format is a compatibility change and requires synchronized adapter,
@@ -465,8 +466,8 @@ safety—not identical names, arguments, envelopes, or discovery mechanics.
 |---|---|---|---|
 | Repository map | `explore` / `map` | `explore_repo` | MCP supports progress reporting and is invoked through search-first discovery. |
 | Symbol search | `find` | `find_symbol` | MCP returns tool-native symbol values rather than the CLI process envelope. |
-| Interface outline | `interface` | `read_interface`, `read_interface_structured` | MCP preserves legacy text and adds a typed hierarchical tool without CLI format/exit-code controls. |
-| Likely references | `impact` | `what_breaks` | MCP requires an absolute `path` or `abs_path`; the CLI accepts contained relative symbol paths and offers several symbol input forms. |
+| Interface outline | `interface` | `read_interface`, `read_interface_structured` | MCP preserves legacy text and adds a typed hierarchical tool; its structured projection defaults to v3. |
+| Likely references | `impact` | `what_breaks` | MCP defaults to compact v3 and requires an absolute `path` or `abs_path`; the CLI accepts contained relative symbol paths and offers several symbol input forms. |
 | Structural search | `search` | `search_pattern` | MCP exposes tool metadata/annotations and tool-native paging arguments. |
 | Structural rewrite | `rewrite` | `rewrite_pattern` | MCP marks the operation destructive; there is no CLI approval protocol in the server. |
 | Guarded replacement | `replace plan` / `replace verify` / `replace apply` | `plan_replacement`, `verify_replacement`, `apply_replacement` | MCP passes the full plan object directly; plan and verify are read-only, while apply is destructive. |

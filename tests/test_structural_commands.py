@@ -152,7 +152,7 @@ def test_structural_cli_commands_emit_standard_envelopes(
         assert cli.main(argv) == 0
 
     output = json.loads(capsys.readouterr().out)
-    assert output["schema_version"] == "xray.cli.v2"
+    assert output["schema_version"] == "xray.cli.v3"
     assert output["ok"] is True
     assert output["command"] == command
     assert payload_key in output
@@ -263,7 +263,7 @@ def test_search_compacts_raw_matches_and_pages_with_bound_cursor(tmp_path: Path,
         assert cli.main(["search", str(repo), "-p", "old($A)", "--limit", "2"]) == 0
     assert search.call_args.kwargs["max_results"] == 3
     first = json.loads(capsys.readouterr().out)
-    assert first["schema_version"] == "xray.cli.v2"
+    assert first["schema_version"] == "xray.cli.v3"
     assert first["matches"] == [
         {"path": "sample.py", "line": 1, "column": 5, "text": "old(0)", "captures": {"A": "0"}},
         {"path": "sample.py", "line": 2, "column": 5, "text": "old(1)", "captures": {"A": "1"}},
@@ -898,7 +898,7 @@ def test_replace_cli_plan_file_and_guarded_apply_end_to_end(tmp_path: Path, caps
         == 0
     )
     envelope = json.loads(capsys.readouterr().out)
-    assert envelope["schema_version"] == "xray.cli.v2"
+    assert envelope["schema_version"] == "xray.cli.v3"
     assert envelope["command"] == "replace.plan"
     plan = envelope["plan"]
     assert plan["candidate_count"] == 1

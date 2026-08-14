@@ -179,7 +179,7 @@ analysis. JSON symbols include `name`, repository-relative `path`, absolute
 `owner`, `language`, `match_reason`, and `confidence`. One expanded ast-grep
 outline supplies a snapshot-cached inventory; dirty source changes invalidate it.
 
-Compact v2 is the default, with scores, a 10-result page, and `min_score: 60`.
+Compact v3 is the default, with scores, a 10-result page, and `min_score: 60`.
 Filters run before paging and every filter is cursor-bound. Use `--min-score 0`
 only to inspect calibrated low-confidence candidates. `--detail full` preserves
 the v1 envelope. Find promises name identity matching, not semantic behavior search.
@@ -190,7 +190,7 @@ the v1 envelope. Find promises name identity matching, not semantic behavior sea
 xray interface ROOT FILE_PATH [--name NAME]... [--type TYPE]... \
   [--visibility VISIBILITY]... [--member-depth N] [--max-members N] \
   [--limit N] [--cursor TOKEN] [--detail compact|full] [--schema v2|v3]
-xray interface ROOT --symbol-json "$symbol" --schema v3
+xray interface ROOT --symbol-json "$symbol"
 ```
 
 `FILE_PATH` may be absolute or relative to `ROOT`, but it must resolve inside the
@@ -327,11 +327,12 @@ operation.
 
 ## JSON Output
 
-Compact output defaults to `schema_version: "xray.cli.v2"`; its established
-field presence is preserved. `--schema v3` opts into consistent `ok`, one paging
-vocabulary, typed interface completeness reasons, exact-symbol interface
-handoff, and named compact impact diagnostics. `--detail full` preserves v1
-where supported. JSON is one line unless `--pretty` is requested; text is lossy.
+Compact output defaults to `schema_version: "xray.cli.v3"`, with consistent
+`ok`, one paging vocabulary, typed interface completeness reasons, exact-symbol
+interface handoff, and named compact impact diagnostics. `--schema v2` selects
+the previous compact projection for diagnosis; it is not a compatibility
+commitment. `--detail full` preserves v1 where supported. JSON is one line
+unless `--pretty` is requested; text is lossy.
 
 Exit codes are `0` for success, `1` for command failure, and `2` for parse or
 validation errors.
@@ -352,7 +353,7 @@ Example:
 
 ```json
 {
-  "schema_version": "xray.cli.v2",
+  "schema_version": "xray.cli.v3",
   "ok": true,
   "command": "find",
   "root_path": "/repo",
@@ -416,7 +417,7 @@ The transformed MCP surface exposes compact metadata and tags for:
 - `find_symbol`: calibrated name/qualified-identity filters, scores, and paging.
 - `read_interface`: read a text file interface without implementation bodies.
 - `read_interface_structured`: bounded/filterable typed hierarchy with paging;
-  v3 `exact_symbol` returns only the selected owner/member path.
+  default v3 `exact_symbol` returns only the selected owner/member path.
 - `read_symbol` and `symbol_at`: bounded exact source and line-to-symbol lookup.
 - `search_pattern`: compact structural matches, bounded to 50 by default, with `returned`, `total`, `truncated`, and snapshot-bound `next_cursor` continuation. Set `detail: "full"` for raw ast-grep matches.
 - `rewrite_pattern`: in-place replacement with a compact count/path summary by default. Full detail is bounded but never advertises continuation after mutation.
@@ -426,7 +427,7 @@ The transformed MCP surface exposes compact metadata and tags for:
 - `apply_rule_fixes`: destructive application of a reviewed v2 rule plan.
 - `xray_capabilities`: help, contracts, limits, dependencies, and health.
 - `file_imports` and `file_exports`: compact flattened dependency and public-API outlines with limits and continuation cursors.
-- `what_breaks`: assess bounded classified symbol-name references with snapshot-bound continuation.
+- `what_breaks`: assess bounded classified symbol-name references with snapshot-bound continuation; compact v3 is the default projection.
 
 MCP failures are protocol errors (`isError: true`) with identical JSON text and
 structured `error: {code, message, details?}` content. `scan_rules` has read-only

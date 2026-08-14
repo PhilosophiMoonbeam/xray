@@ -52,7 +52,7 @@ ROOT_HELP_EPILOG = """\
 Agent flow:
   xray explore ROOT --max-depth 2
   symbol=$(xray find ROOT "target symbol" --limit 1 | jq -c '.symbols[0]')
-  xray interface ROOT --symbol-json "$symbol" --schema v3
+  xray interface ROOT --symbol-json "$symbol"
   xray impact ROOT --symbol-json "$symbol"
 
 Guarded change:
@@ -61,9 +61,9 @@ Guarded change:
   xray replace verify ROOT --plan-file plan.json --expected-digest REVIEWED_DIGEST
   xray replace apply ROOT --plan-file plan.json --expected-digest REVIEWED_DIGEST
 
-Compact JSON is default; where offered, use --detail full for legacy fields or
---format text for lossy scans. Use --schema v3 for consistent success/paging
-and exact-symbol interfaces. Pages report total_exact; next_cursor requires the
+Compact v3 JSON is default; where offered, use --detail full for legacy fields,
+--schema v2 for the previous compact projection, or --format text for lossy scans.
+Pages report total_exact; next_cursor requires the
 same query and snapshot. YAML output is unsupported. replace apply, rewrite, and
 scan --fix mutate files; --limit never bounds legacy edits. Exit codes: 0 success,
 1 command failure, 2 parse or validation error.
@@ -95,7 +95,7 @@ Show one file's typed hierarchy without implementation bodies.
 
 INTERFACE_EPILOG = """\
 Example: xray interface ROOT src/package/module.py
-Exact handoff: xray interface ROOT --symbol-json "$symbol" --schema v3
+Exact handoff: xray interface ROOT --symbol-json "$symbol"
 
 FILE_PATH must resolve inside ROOT; parent traversal and symlink escapes fail.
 Compact v3 accepts an exact find symbol and reports typed completeness reasons.
@@ -269,7 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--visibility", action="append", choices=("public", "private", "unknown"), help="Visibility filter; repeatable."
     )
     find.add_argument(
-        "--detail", choices=("compact", "full"), default="compact", help="Compact v2 (default) or v1 envelope."
+        "--detail", choices=("compact", "full"), default="compact", help="Compact v3 (default) or v1 envelope."
     )
     find.add_argument(
         "--format",
@@ -308,7 +308,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--detail",
         choices=("compact", "full"),
         default="compact",
-        help="Structured compact v2 contract (default) or legacy v1 string envelope.",
+        help="Structured compact v3 contract (default) or legacy v1 string envelope.",
     )
     interface.add_argument(
         "--format",
@@ -588,12 +588,12 @@ def add_symbol_input_args(parser: argparse.ArgumentParser) -> None:
 
 
 def add_schema_arg(parser: argparse.ArgumentParser, *, visible: bool = True) -> None:
-    """Add the opt-in compact response projection selector."""
+    """Add the compact response projection selector."""
     parser.add_argument(
         "--schema",
         choices=("v2", "v3"),
-        default="v2",
-        help="Compact schema." if visible else argparse.SUPPRESS,
+        default="v3",
+        help="Compact schema (default: v3)." if visible else argparse.SUPPRESS,
     )
 
 
@@ -784,7 +784,7 @@ def handle_interface(args: argparse.Namespace) -> int:
     exact_symbol = load_interface_symbol(args, indexer.root_path)
     if exact_symbol is not None:
         if args.detail == "full" or args.schema != "v3":
-            raise ValueError("Exact-symbol interface selection requires --schema v3 compact JSON.")
+            raise ValueError("Exact-symbol interface selection is unavailable with --schema v2.")
         file_path = str(exact_symbol["path"])
     elif args.file_path:
         file_path = args.file_path
@@ -1018,7 +1018,7 @@ def _validate_page_args(
         raise ValueError("--limit must be 0 or greater.")
     bound_identity = {
         **identity,
-        **({"schema": "v3"} if getattr(args, "schema", "v2") == "v3" else {}),
+        **({"schema": "v3"} if getattr(args, "schema", "v3") == "v3" else {}),
         "source_snapshot": source_snapshot,
     }
     fingerprint = cursor_fingerprint(command, root_path, bound_identity)
@@ -1055,12 +1055,12 @@ def _structural_payload(
 
 
 def compact_schema_version(args: argparse.Namespace) -> str:
-    """Return the selected compact schema without changing the v2 default."""
-    return V3_SCHEMA_VERSION if getattr(args, "schema", "v2") == "v3" else COMPACT_SCHEMA_VERSION
+    """Return the selected compact schema."""
+    return V3_SCHEMA_VERSION if getattr(args, "schema", "v3") == "v3" else COMPACT_SCHEMA_VERSION
 
 
 def _compact_envelope(command: str, *, args: argparse.Namespace | None = None, **payload: Any) -> dict[str, Any]:
-    schema_version = V3_SCHEMA_VERSION if getattr(args, "schema", "v2") == "v3" else COMPACT_SCHEMA_VERSION
+    schema_version = V3_SCHEMA_VERSION if getattr(args, "schema", "v3") == "v3" else COMPACT_SCHEMA_VERSION
     return {"schema_version": schema_version, "ok": True, "command": command, **payload}
 
 
@@ -1658,10 +1658,10 @@ def wants_full_output(argv: Sequence[str] | None) -> bool:
     )
 
 
-def wants_v3_output(argv: Sequence[str] | None) -> bool:
+def wants_v2_output(argv: Sequence[str] | None) -> bool:
     args = list(sys.argv[1:] if argv is None else argv)
     return any(
-        (value == "--schema" and index + 1 < len(args) and args[index + 1] == "v3") or value == "--schema=v3"
+        (value == "--schema" and index + 1 < len(args) and args[index + 1] == "v2") or value == "--schema=v2"
         for index, value in enumerate(args)
     )
 
@@ -1673,9 +1673,9 @@ def print_parse_error(message: str, argv: Sequence[str] | None) -> None:
             dump_error_envelope(
                 {
                     "schema_version": (
-                        V3_SCHEMA_VERSION
-                        if compact and wants_v3_output(argv)
-                        else COMPACT_SCHEMA_VERSION
+                        COMPACT_SCHEMA_VERSION
+                        if compact and wants_v2_output(argv)
+                        else V3_SCHEMA_VERSION
                         if compact
                         else SCHEMA_VERSION
                     ),

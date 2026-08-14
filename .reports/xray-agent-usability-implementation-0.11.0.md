@@ -17,10 +17,10 @@ wording. The implementation base is
 | A reviewed plan could overwrite existing worktree changes | Dirty affected paths block applicability unless their acknowledgement is digested | Git worktree regressions |
 | Review required nested edit-ID traversal | Every plan contains a flat `edit_manifest`; documented `jq` works for bare and CLI-enveloped plans | replacement manifest and documentation tests |
 | No non-mutating final guard check | CLI/MCP `verify_replacement` recomputes every apply guard without writes | no-write, drift, and call-surface regressions |
-| Interface output duplicated paging counts and over-returned context | Opt-in v3 uses one paging vocabulary and exact-symbol owner/member selection | CLI/MCP v2-compatibility and v3 regressions |
+| Interface output duplicated paging counts and over-returned context | Default v3 uses one paging vocabulary and exact-symbol owner/member selection | CLI/MCP default-v3 and explicit-v2 regressions |
 | Interface completeness required warning parsing | V3 exposes structured completeness reasons | member/page truncation regressions |
 | Compact impact exposed overlapping counters | V3 retains page total and groups raw/filter/execution evidence under `diagnostics` | CLI/MCP impact projection regressions |
-| Compact success fields were inconsistent | V3 consistently emits CLI `ok`; v2 remains the default compatibility projection | v2 snapshots, v3 success/error regressions |
+| Compact success fields were inconsistent | Default v3 consistently emits CLI `ok`; v2 remains an explicit diagnostic projection | default-v3 and explicit-v2 success/error regressions |
 | Capabilities omitted bounds, caches, and surface distinctions | Capabilities separate CLI/MCP names, defaults, maxima, caches, schemas, resources, prompts, and mutation classes | capability assertions and live doctor output |
 | README, architecture, skills, prompt, and help contradicted runtime | Owned guidance now teaches ranked search, focus, symbol-at, exact interface, verification, syntax/dirty guards, cache files, and legacy boundaries | help, packaging, byte-identity, resource, prompt, and stale-text checks |
 
@@ -28,7 +28,7 @@ wording. The implementation base is
 
 Every current result above traces to an audit recommendation except dirty-file
 blocking and syntax attestation, which implement the audit's guarded replacement
-direction. Default v2, full/v1, JSON/`jq`, direct legacy mutation, and name-based
+direction. Default v3, explicit v2 and full/v1, JSON/`jq`, direct legacy mutation, and name-based
 impact trace to the compatibility constraints recorded in the audit and project
 standards. No result adds YAML output, type-aware graphs, automatic commits,
 durable plan storage, or crash-proof rollback.

@@ -195,9 +195,9 @@ def test_interface_cli_compact_is_structured_and_full_preserves_legacy_string(tm
 
     assert cli.main(["interface", str(repo), "src/sample.py"]) == 0
     compact = json.loads(capsys.readouterr().out)
-    assert compact["schema_version"] == "xray.cli.v2"
+    assert compact["schema_version"] == "xray.cli.v3"
     assert compact["interface"]["path"] == "src/sample.py"
-    assert compact["interface"]["complete"] is True
+    assert compact["interface"]["completeness"]["complete"] is True
     assert compact["interface"]["symbols"][0]["signature"] == "def target_function(value):"
 
     assert cli.main(["interface", str(repo), "src/sample.py", "--detail", "full"]) == 0
@@ -242,7 +242,7 @@ def test_interface_cli_rejects_absolute_path_outside_root(tmp_path, capsys):
     assert exit_code == 1
     result = json.loads(capsys.readouterr().err)
     assert result["ok"] is False
-    assert result["schema_version"] == "xray.cli.v2"
+    assert result["schema_version"] == "xray.cli.v3"
     assert result["error"]["code"] == "path_outside_root"
     assert "outside repository root" in result["error"]["message"]
 
@@ -314,7 +314,7 @@ def test_find_cli_prints_json_symbols(tmp_path, capsys):
 
     assert exit_code == 0
     result = json.loads(capsys.readouterr().out)
-    assert result["schema_version"] == "xray.cli.v2"
+    assert result["schema_version"] == "xray.cli.v3"
     assert result["ok"] is True
     assert result["command"] == "find"
     assert result["query"] == "target"
@@ -736,7 +736,7 @@ def test_impact_cli_reads_symbol_from_stdin(tmp_path, capsys, monkeypatch):
 
     assert exit_code == 0
     result = json.loads(capsys.readouterr().out)
-    assert result["impact"]["total_count"] >= 1
+    assert result["impact"]["total"] >= 1
 
 
 def test_impact_cli_rejects_missing_symbol_file_as_json_error(tmp_path, capsys):
@@ -784,9 +784,9 @@ def test_impact_cli_accepts_relative_symbol_from_find_json(tmp_path, capsys):
 
     assert impact_exit == 0
     result = json.loads(capsys.readouterr().out)
-    assert result["schema_version"] == "xray.cli.v2"
+    assert result["schema_version"] == "xray.cli.v3"
     assert result["symbol"]["path"] == "src/sample.py"
-    assert result["impact"]["total_count"] >= 1
+    assert result["impact"]["total"] >= 1
     assert result["impact"]["total_exact"] is True
     assert all(reference["line"] >= 1 for reference in result["impact"]["references"])
     assert all(not Path(reference["path"]).is_absolute() for reference in result["impact"]["references"])
@@ -888,7 +888,7 @@ def test_mcp_what_breaks_accepts_cli_find_symbol_json(tmp_path, capsys):
     result = cast(dict[str, Any], mcp_server.what_breaks(found))
 
     assert "error" not in result
-    assert result["total_count"] >= 1
+    assert result["total"] >= 1
     assert all(reference["line"] >= 1 for reference in result["references"])
 
 
@@ -1210,7 +1210,7 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
     assert all(Path(symbol_result["abs_path"]).is_absolute() for symbol_result in found_symbols)
     assert "def target_function(value):" in text_content(calls["read_interface"].content[0])
     impact = structured_content(calls["what_breaks"])
-    assert impact["total_count"] >= 1
+    assert impact["total"] >= 1
     assert all(reference["line"] >= 1 for reference in impact["references"])
     assert structured_content(calls["legacy_rewrite"])["match_count"] == 0
 
@@ -1382,7 +1382,7 @@ def test_mcp_concurrent_call_tool_requests_succeed_same_and_multi_root(tmp_path)
     assert same_results[0]["root_path"] == str(repo_a)
     assert any(symbol["name"] == "target_function" for symbol in same_results[1]["symbols"])
     assert "def target_function(value):" in same_results[2]
-    assert same_results[3]["total_count"] >= 1
+    assert same_results[3]["total"] >= 1
     assert all("error" not in result for result in same_results[1:])
 
     multi_results = [payload(result) for result in multi_root]
@@ -1589,7 +1589,7 @@ def test_explore_cli_rejects_negative_max_depth(tmp_path, capsys):
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
-    assert error["schema_version"] == "xray.cli.v2"
+    assert error["schema_version"] == "xray.cli.v3"
     assert error["ok"] is False
     assert error["error"]["message"] == "--max-depth must be 0 or greater."
 
@@ -1599,7 +1599,7 @@ def test_explore_cli_parse_error_returns_json_by_default(capsys):
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
-    assert error["schema_version"] == "xray.cli.v2"
+    assert error["schema_version"] == "xray.cli.v3"
     assert error["ok"] is False
     assert error["command"] == "explore"
     assert "invalid int value" in error["error"]["message"]
@@ -1610,7 +1610,7 @@ def test_find_cli_missing_argument_returns_json_error_by_default(capsys):
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
-    assert error["schema_version"] == "xray.cli.v2"
+    assert error["schema_version"] == "xray.cli.v3"
     assert error["ok"] is False
     assert error["command"] == "find"
     assert "required" in error["error"]["message"]
@@ -1630,7 +1630,7 @@ def test_find_cli_invalid_format_returns_json_error_by_default(capsys):
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
-    assert error["schema_version"] == "xray.cli.v2"
+    assert error["schema_version"] == "xray.cli.v3"
     assert error["ok"] is False
     assert error["command"] == "find"
     assert "invalid choice" in error["error"]["message"]
@@ -1641,7 +1641,7 @@ def test_cli_missing_command_returns_json_error(capsys):
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
-    assert error["schema_version"] == "xray.cli.v2"
+    assert error["schema_version"] == "xray.cli.v3"
     assert error["ok"] is False
     assert error["command"] is None
     assert "required" in error["error"]["message"]
@@ -1691,7 +1691,7 @@ def test_cli_help_is_current_safe_and_token_bounded(capsys):
     assert "jq -c '.symbols[0]'" in root
     assert "xray replace plan ROOT" in root
     assert "xray replace apply ROOT" in root
-    assert "Compact JSON is default" in root
+    assert "Compact v3 JSON is default" in root
     assert "where offered, use --detail full" in root
     assert "total_exact" in root
     assert "YAML output is unsupported" in root
@@ -1859,8 +1859,8 @@ def test_explore_json_includes_structured_entries(tmp_path, capsys):
 
     assert exit_code == 0
     result = json.loads(capsys.readouterr().out)
-    assert result["schema_version"] == "xray.cli.v2"
-    assert "ok" not in result
+    assert result["schema_version"] == "xray.cli.v3"
+    assert result["ok"] is True
     assert result["command"] == "explore"
     assert result["invoked_as"] == "explore"
     assert result["root_path"] == str(repo)
@@ -2303,7 +2303,7 @@ def test_cli_find_compact_scopes_scores_pages_and_preserves_full_v1(tmp_path, ca
 
     assert cli.main(["find", str(repo), "target", "--path", "src", "--language", "python", "--limit", "1"]) == 0
     first = json.loads(capsys.readouterr().out)
-    assert first["schema_version"] == "xray.cli.v2"
+    assert first["schema_version"] == "xray.cli.v3"
     assert first["ok"] is True
     assert first["returned"] == 1
     assert first["total"] >= 2
@@ -2344,9 +2344,9 @@ def test_cli_bounded_interface_read_symbol_and_symbol_at(tmp_path, capsys):
 
     assert cli.main(["interface", str(repo), "src/sample.py", "--limit", "1", "--max-members", "1"]) == 0
     interface = json.loads(capsys.readouterr().out)
-    assert interface["schema_version"] == "xray.cli.v2"
+    assert interface["schema_version"] == "xray.cli.v3"
     assert interface["interface"]["returned"] == 1
-    assert interface["interface"]["complete"] is False
+    assert interface["interface"]["completeness"]["complete"] is False
 
     assert cli.main(["find", str(repo), "target_function", "--limit", "1"]) == 0
     symbol = json.loads(capsys.readouterr().out)["symbols"][0]
@@ -2390,12 +2390,12 @@ def test_cli_map_defaults_all_depth_limit_alias_capabilities_and_leaf_errors(tmp
 
     assert cli.main(["replace", "plan", str(repo)]) == 2
     error = json.loads(capsys.readouterr().err)
-    assert error["schema_version"] == "xray.cli.v2"
+    assert error["schema_version"] == "xray.cli.v3"
     assert error["command"] == "replace.plan"
     assert error["error"]["code"] == "invalid_request"
 
 
-def test_compact_v3_exact_interface_impact_and_capabilities_preserve_v2(tmp_path, capsys):
+def test_compact_v3_defaults_and_explicit_v2_legacy_projection(tmp_path, capsys):
     repo = tmp_path / "repo"
     repo.mkdir()
     source = repo / "service.py"
@@ -2420,21 +2420,18 @@ def test_compact_v3_exact_interface_impact_and_capabilities_preserve_v2(tmp_path
         "end_line": 5,
     }
 
-    assert cli.main(["interface", str(repo), "service.py", "--limit", "1"]) == 0
+    assert cli.main(["interface", str(repo), "service.py", "--schema", "v2", "--limit", "1"]) == 0
     compatible = json.loads(capsys.readouterr().out)
     assert compatible["schema_version"] == "xray.cli.v2"
     assert "returned_symbols" in compatible["interface"]
     assert "completeness" not in compatible["interface"]
 
-    assert cli.main(["interface", str(repo), "service.py", "--schema", "v3", "--limit", "1", "--max-members", "1"]) == 0
+    assert cli.main(["interface", str(repo), "service.py", "--limit", "1", "--max-members", "1"]) == 0
     incomplete = json.loads(capsys.readouterr().out)["interface"]
     assert incomplete["completeness"]["complete"] is False
     assert set(incomplete["completeness"]["reasons"]) == {"member_truncated", "page_truncated"}
 
-    assert (
-        cli.main(["interface", str(repo), "--symbol-json", json.dumps(exact), "--schema", "v3", "--max-members", "1"])
-        == 0
-    )
+    assert cli.main(["interface", str(repo), "--symbol-json", json.dumps(exact), "--max-members", "1"]) == 0
     selected = json.loads(capsys.readouterr().out)
     interface = selected["interface"]
     assert selected["schema_version"] == "xray.cli.v3" and selected["ok"] is True
@@ -2456,7 +2453,7 @@ def test_compact_v3_exact_interface_impact_and_capabilities_preserve_v2(tmp_path
         "execution_cap": 51,
     }
     with patch.object(XRayIndexer, "what_breaks", return_value=impact_result):
-        assert cli.main(["impact", str(repo), "--symbol-json", json.dumps(exact), "--schema", "v3"]) == 0
+        assert cli.main(["impact", str(repo), "--symbol-json", json.dumps(exact)]) == 0
     impact = json.loads(capsys.readouterr().out)
     assert impact["schema_version"] == "xray.cli.v3" and impact["ok"] is True
     assert "total_count" not in impact["impact"] and "raw_count" not in impact["impact"]
@@ -2465,24 +2462,29 @@ def test_compact_v3_exact_interface_impact_and_capabilities_preserve_v2(tmp_path
     assert impact["impact"]["diagnostics"]["raw_count"] == 3
     assert "total_exact" not in impact["impact"]["diagnostics"]
 
-    assert cli.main(["capabilities", str(repo), "--schema", "v3"]) == 0
+    assert cli.main(["capabilities", str(repo)]) == 0
     capabilities = json.loads(capsys.readouterr().out)
     contract = capabilities["capabilities"]
     assert capabilities["schema_version"] == "xray.cli.v3"
-    assert contract["schema_contracts"]["cli_default"] == "xray.cli.v2"
+    assert contract["schema_contracts"]["cli_default"] == "xray.cli.v3"
+    assert contract["schema_contracts"]["cli_legacy"] == ["xray.cli.v2"]
+    assert contract["schema_contracts"]["mcp_default"] == "v3"
+    assert contract["schema_contracts"]["mcp_legacy"] == ["v2"]
     assert contract["surfaces"]["cli"]["defaults"]["read_symbol"]["max_bytes"] == 65536
     assert contract["surfaces"]["mcp"]["cache"]["indexers"]["effective_limit"] >= 1
+    assert contract["surfaces"]["mcp"]["defaults"]["read_interface_structured"]["schema"] == "v3"
+    assert contract["surfaces"]["mcp"]["defaults"]["what_breaks"]["schema"] == "v3"
     assert "scan" in contract["surfaces"]["cli"]["operations"]["read_only"]
     assert contract["surfaces"]["cli"]["administrative"] == ["skill-install"]
     assert contract["surfaces"]["mcp"]["resource_templates"] == ["skill://xray-progressive-discovery/{path*}"]
     assert contract["cache"]["files"] == ["symbols.json", "inventory.json"]
     assert contract["bounds"]["replacement_total_bytes"] == 50 * 1024 * 1024
 
-    assert cli.main(["explore", str(repo), "--schema", "v3", "--limit", "1"]) == 0
+    assert cli.main(["explore", str(repo), "--limit", "1"]) == 0
     explore = json.loads(capsys.readouterr().out)
     assert explore["schema_version"] == "xray.cli.v3" and explore["ok"] is True
 
-    assert cli.main(["interface", str(repo), "--schema", "v3"]) == 2
+    assert cli.main(["interface", str(repo)]) == 2
     error = json.loads(capsys.readouterr().err)
     assert error["schema_version"] == "xray.cli.v3" and error["ok"] is False
 

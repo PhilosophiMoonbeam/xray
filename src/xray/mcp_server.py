@@ -80,7 +80,7 @@ Use XRAY as map -> find -> interface -> impact:
    Keep the returned symbol object, including path and line data.
 3. Inspect source contracts with `read_interface_structured` when typed hierarchy,
    documentation, and completeness matter. `read_interface` preserves the legacy text projection.
-   Pass the complete find symbol as `exact_symbol` with `schema="v3"` to return only its owner/member path.
+   Pass the complete find symbol as `exact_symbol` to return only its owner/member path.
    Python uses enriched standard-library AST data; other supported languages expose ast-grep completeness warnings.
 4. Check likely symbol-name code references with `what_breaks`.
    Pass the entire symbol object from `find_symbol`.
@@ -442,7 +442,7 @@ def xray_discovery_plan(goal: str = "understand a code change") -> str:
         "Use XRAY progressively:\n"
         "1. Call explore_repo; use compact entries for file selection and request detail='full' only for tree_text.\n"
         "2. Call find_symbol with the most relevant symbol name or owner-qualified identity.\n"
-        "3. Call read_interface_structured with exact_symbol and schema='v3' for its owner/member path, "
+        "3. Call read_interface_structured with exact_symbol for its owner/member path, "
         "or read_interface for legacy text.\n"
         "4. Call what_breaks with the full symbol object before changing public code; "
         "treat results as name-based references, not a type-aware dependency graph.\n\n"
@@ -826,7 +826,7 @@ def read_interface_structured(
     root_path: str,
     file_path: Annotated[str | None, "Contained source file; omit when exact_symbol supplies its path"] = None,
     exact_symbol: Annotated[
-        dict[str, Any] | None, "Exact find_symbol object; schema v3 selects only its owner/member path"
+        dict[str, Any] | None, "Exact find_symbol object; selects only its owner/member path"
     ] = None,
     symbol_names: list[str] | None = None,
     visibility: list[str] | None = None,
@@ -835,7 +835,7 @@ def read_interface_structured(
     max_members: int = 20,
     limit: int | str = 50,
     cursor: str | None = None,
-    schema: Annotated[str, "Response projection: v2 compatibility default or compact v3"] = "v2",
+    schema: Annotated[str, "Response projection: compact v3 default or explicit legacy v2"] = "v3",
 ) -> dict[str, Any] | ToolResult:
     """Return a typed interface; v3 exact_symbol selects only its owner/member path."""
     try:
@@ -937,7 +937,7 @@ def what_breaks(
     limit: int | str = DEFAULT_RESULT_LIMIT,
     cursor: str | None = None,
     detail: str = "compact",
-    schema: Annotated[str, "Response projection: v2 compatibility default or compact v3"] = "v2",
+    schema: Annotated[str, "Response projection: compact v3 default or explicit legacy v2"] = "v3",
 ) -> dict[str, Any] | ToolResult:
     """Find likely symbol-name code references for impact review."""
     try:

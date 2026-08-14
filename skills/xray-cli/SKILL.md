@@ -6,8 +6,9 @@ description: "Use XRAY to map, inspect, assess impact, search, validate rules, a
 # XRAY CLI
 
 Use installed `xray`; here use `uv run xray`. Pass `ROOT`. Compact
-`xray.cli.v2` JSON is the default; opt into `--schema v3` for consistent
-success/paging fields, typed completeness, and exact-symbol interfaces.
+`xray.cli.v3` JSON is the default, with consistent success/paging fields, typed
+completeness, and exact-symbol interfaces. Use `--schema v2` only to inspect the
+previous projection.
 
 ## Discover code
 
@@ -34,7 +35,7 @@ Preserve a complete find symbol for reads and impact:
 symbol=$(xray find ROOT target_function --limit 1 | jq -c '.symbols[0]')
 xray read-symbol ROOT --symbol-json "$symbol"
 xray impact ROOT --symbol-json "$symbol"
-xray interface ROOT --symbol-json "$symbol" --schema v3
+xray interface ROOT --symbol-json "$symbol"
 ```
 
 Impact returns classified name evidence, not a type-aware graph.

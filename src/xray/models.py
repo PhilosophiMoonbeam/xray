@@ -198,7 +198,7 @@ class ImpactEnvelope(PublicModel):
 
 
 class ErrorDetail(PublicModel):
-    """Stable machine-readable error value for compact v2 adapters."""
+    """Stable machine-readable error value for compact adapters."""
 
     code: str
     message: str

@@ -278,9 +278,7 @@ def test_mcp_v3_exact_interface_and_named_impact_diagnostics(tmp_path: Path) -> 
         "end_line": 5,
     }
 
-    interface = success_value(
-        mcp_server.read_interface_structured(str(repo), exact_symbol=exact, schema="v3", max_members=1)
-    )
+    interface = success_value(mcp_server.read_interface_structured(str(repo), exact_symbol=exact, max_members=1))
     assert interface["completeness"] == {"complete": True, "reasons": []}
     assert "returned_symbols" not in interface and interface["returned"] == 1
     assert interface["symbols"][0]["members"][0]["name"] == "second"
@@ -297,10 +295,10 @@ def test_mcp_v3_exact_interface_and_named_impact_diagnostics(tmp_path: Path) -> 
         "execution_cap": 51,
     }
     with patch.object(XRayIndexer, "what_breaks", return_value=result):
-        impact = success_value(mcp_server.what_breaks(exact, schema="v3"))
+        impact = success_value(mcp_server.what_breaks(exact))
     assert impact["total"] == 1 and "total_count" not in impact
     assert impact["total_exact"] is True
     assert impact["diagnostics"]["raw_count"] == 2
 
-    compatible_error = mcp_server.read_interface_structured(str(repo), exact_symbol=exact)
+    compatible_error = mcp_server.read_interface_structured(str(repo), exact_symbol=exact, schema="v2")
     assert error_value(compatible_error)["code"] == "invalid_request"
