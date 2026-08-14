@@ -25,6 +25,7 @@ def test_project_metadata_is_cli_first_with_mcp_compatibility():
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     project = data["project"]
 
+    assert project["version"] == "0.10.0"
     assert "CLI" in project["description"]
     assert "MCP compatibility" in project["description"]
     assert "cli" in project["keywords"]
@@ -97,9 +98,18 @@ def test_packaged_mcp_skill_is_current_and_token_bounded():
     assert "regular expression and returns at most 10 matches" in content
     assert "a broad `.` can" in content
     assert "read_interface_structured" in content
+    assert "read_symbol" in content
+    assert "symbol_at" in content
+    assert "xray_capabilities" in content
+    assert "apply_rule_fixes" in content
+    assert "`scan_rules`, `check_rules`," in content
     assert "plan_replacement" in content
+    assert "refine_replacement" in content
     assert "apply_replacement" in content
-    assert "Pass `lang` whenever the pattern language is known" in content
+    assert "xray.replace.v2" in content
+    assert "`isError=true`" in content
+    assert "YAML is ast-grep rule/test input, never XRAY output" in content
+    assert "Pass `lang` when known" in content
     assert len(content.split()) <= 500
     assert len(content.encode()) <= 3600
 
@@ -127,20 +137,29 @@ def test_top_level_cli_skill_is_agent_skills_compliant():
     assert "xray explore" in body
     assert "xray find" in body
     assert "xray interface" in body
+    assert "xray read-symbol" in body
+    assert "xray symbol-at" in body
     assert "xray impact" in body
     assert "xray search" in body
     assert "xray replace plan ROOT" in body
+    assert "xray replace refine ROOT" in body
     assert "xray replace apply ROOT" in body
+    assert "xray.replace.v2" in body
     assert "REVIEWED_DIGEST" in body
-    assert "xray rewrite ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' -l python" in body
+    assert "Legacy `rewrite` and `scan --fix` remain destructive" in body
     assert "Pass `-l/--lang` for pattern mutations when known" in body
     assert "xray scan" in body
+    assert "xray rules check" in body
+    assert "xray rules explain" in body
+    assert "xray rules test" in body
+    assert "xray capabilities" in body
     assert "xray imports" in body
     assert "xray exports" in body
     assert "never XRAY output" in body
     assert "total_exact: false" in body
-    assert "--limit` limits reporting, not edits" in body
-    assert "`find` remains `xray.cli.v1` and has no `--detail` option" in body
+    assert "reporting, not edits" in body
+    assert "`find` defaults to `min_score: 60`" in body
+    assert "`--detail full` preserves v1" in body
     assert len(content.split()) <= 500
     assert len(content.encode()) <= 3600
 

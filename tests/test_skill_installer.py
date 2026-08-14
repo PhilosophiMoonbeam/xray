@@ -116,6 +116,6 @@ def test_project_cli_reports_divergence_as_validation_error(tmp_path, capsys):
     assert cli.main(["skill", "install", "--project", str(project)]) == 2
 
     error = json.loads(capsys.readouterr().err)
-    assert error["command"] == "skill"
-    assert "--force" in error["error"]
+    assert error["command"] == "skill.install"
+    assert "--force" in error["error"]["message"]
     assert (target / "SKILL.md").read_text(encoding="utf-8") == "local changes"

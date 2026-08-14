@@ -1,6 +1,7 @@
 """Core indexing engine for XRAY - ast-grep based implementation."""
 
 import ast
+import difflib
 import hashlib
 import json
 import os
@@ -19,9 +20,11 @@ from typing import Any, TypedDict, cast
 from pathspec import GitIgnoreSpec
 from thefuzz import fuzz
 
+from xray import __version__
 from xray.core.ast_grep import (
     AstGrepCommandError,
     AstGrepNotFoundError,
+    get_ast_grep_timeout,
     parse_json_array,
     run_ast_grep,
     run_ast_grep_bounded,
@@ -96,11 +99,13 @@ MAX_INVENTORY_FILES = 20_000
 MAX_INVENTORY_SOURCE_BYTES = 256 * 1024 * 1024
 MAX_INVENTORY_SYMBOLS = 100_000
 MAX_SOURCE_ARGUMENT_CHARS = 128 * 1024
+MAX_IMPACT_RAW_RESULTS = 10_000
 INVENTORY_CACHE_FILENAME = "inventory.json"
-REPLACEMENT_PLAN_VERSION = "xray.replace.v1"
+REPLACEMENT_PLAN_VERSION = "xray.replace.v2"
 DEFAULT_REPLACEMENT_MAX_MATCHES = 1000
 DEFAULT_REPLACEMENT_MAX_FILES = 100
 DEFAULT_REPLACEMENT_PREVIEW_LIMIT = 50
+DEFAULT_REPLACEMENT_DIFF_LIMIT = 100_000
 MAX_REPLACEMENT_FILE_BYTES = 10 * 1024 * 1024
 MAX_REPLACEMENT_TOTAL_BYTES = 50 * 1024 * 1024
 
@@ -229,6 +234,8 @@ class ImpactResult(TypedDict):
     note: str
     total_exact: bool
     degradation_reason: str | None
+    execution_limited: bool
+    execution_cap: int | None
 
 
 @dataclass(frozen=True)
@@ -256,6 +263,7 @@ class XRayIndexer:
         self.last_warnings: list[str] = []
         self.last_result_total_exact = True
         self.last_result_cap: int | None = None
+        self.last_find_total = 0
         self.last_mutation_summary: dict[str, Any] | None = None
         self._inventory_fingerprint: str | None = None
         self._inventory: list[dict[str, Any]] | None = None
@@ -708,6 +716,7 @@ class XRayIndexer:
                     "line": int(start_data.get("line", 0)) + 1 if isinstance(start_data, Mapping) else 1,
                     "column": int(start_data.get("column", 0)) + 1 if isinstance(start_data, Mapping) else 1,
                     "captures": self._capture_values(match),
+                    "_match": match,
                 }
                 edits.append(edit)
 
@@ -732,6 +741,20 @@ class XRayIndexer:
 
             relative_path = path.relative_to(self.root_path).as_posix()
             for edit in edits:
+                source_match = edit.pop("_match")
+                edit["edit_id"] = self._sha256(
+                    self._canonical_json(
+                        {
+                            "path": relative_path,
+                            "preimage_sha256": self._sha256(original),
+                            "start": edit["start"],
+                            "end": edit["end"],
+                            "before_sha256": self._sha256(edit["before"].encode("utf-8")),
+                            "after_sha256": self._sha256(edit["after"].encode("utf-8")),
+                        }
+                    )
+                )
+                source_match["_xray_edit_id"] = edit["edit_id"]
                 preview.append({"path": relative_path, **edit})
             files.append(
                 PreparedReplacementFile(
@@ -771,22 +794,28 @@ class XRayIndexer:
 
     @staticmethod
     def _plan_digest_payload(plan: Mapping[str, Any]) -> dict[str, Any]:
-        """Select every semantic field covered by a replacement plan digest."""
-        keys = (
-            "plan_version",
-            "root_path",
-            "root_fingerprint",
-            "query",
-            "bounds",
-            "allow_noop",
-            "candidate_count",
-            "changed_candidate_count",
-            "no_op_count",
-            "affected_file_count",
-            "changed_file_count",
-            "files",
-        )
-        return {key: plan[key] for key in keys}
+        """Return the complete review artifact except for its self-referential digest."""
+        return {str(key): value for key, value in plan.items() if key != "plan_digest"}
+
+    @staticmethod
+    def _replacement_diff(files: Sequence[PreparedReplacementFile]) -> str:
+        """Return a deterministic unified diff for every changed file."""
+        chunks: list[str] = []
+        for item in files:
+            if item.original == item.postimage:
+                continue
+            before = item.original.decode("utf-8").splitlines(keepends=True)
+            after = item.postimage.decode("utf-8").splitlines(keepends=True)
+            chunks.extend(
+                difflib.unified_diff(
+                    before,
+                    after,
+                    fromfile=f"a/{item.relative_path}",
+                    tofile=f"b/{item.relative_path}",
+                    lineterm="\n",
+                )
+            )
+        return "".join(chunks)
 
     def _build_replacement_plan(
         self,
@@ -800,7 +829,10 @@ class XRayIndexer:
         max_matches: int | None = DEFAULT_REPLACEMENT_MAX_MATCHES,
         max_files: int | None = DEFAULT_REPLACEMENT_MAX_FILES,
         allow_noop: bool = False,
+        allow_truncated_review: bool = False,
         preview_limit: int = DEFAULT_REPLACEMENT_PREVIEW_LIMIT,
+        diff_limit: int = DEFAULT_REPLACEMENT_DIFF_LIMIT,
+        selected_edit_ids: Sequence[str] | None = None,
     ) -> PreparedReplacement:
         """Build one exact non-mutating replacement plan and its in-memory postimages."""
         if max_matches is not None and max_matches < 1:
@@ -809,6 +841,8 @@ class XRayIndexer:
             raise ValueError("max_files must be 1 or greater.")
         if preview_limit < 0:
             raise ValueError("preview_limit must be 0 or greater.")
+        if diff_limit < 0:
+            raise ValueError("diff_limit must be 0 or greater.")
         execution_cap = max_matches + 1 if max_matches is not None else None
         matches, query = self._replacement_candidates(
             pattern=pattern,
@@ -822,6 +856,18 @@ class XRayIndexer:
         if max_matches is not None and len(matches) > max_matches:
             raise ValueError(f"Replacement has more than the allowed {max_matches} candidates.")
         files, preview = self._prepare_replacement_files(matches)
+        available_edit_ids = {str(edit["edit_id"]) for edit in preview}
+        normalized_selection = sorted(set(selected_edit_ids or ()))
+        if selected_edit_ids is not None:
+            unknown = sorted(set(normalized_selection) - available_edit_ids)
+            if unknown:
+                raise ValueError(f"Unknown replacement edit_id: {unknown[0]}.")
+            selected = set(normalized_selection)
+            matches = [match for match in matches if str(match.get("_xray_edit_id", "")) in selected]
+            if matches:
+                files, preview = self._prepare_replacement_files(matches)
+            else:
+                files, preview = (), []
         if max_files is not None and len(files) > max_files:
             raise ValueError(f"Replacement affects more than the allowed {max_files} files.")
 
@@ -835,9 +881,22 @@ class XRayIndexer:
                 "edit_count": len(item.edits),
                 "changed_edit_count": sum(bool(edit["changed"]) for edit in item.edits),
                 "changed": item.original != item.postimage,
+                "edits": [
+                    {
+                        "edit_id": edit["edit_id"],
+                        "start": edit["start"],
+                        "end": edit["end"],
+                        "before_sha256": self._sha256(edit["before"].encode("utf-8")),
+                        "after_sha256": self._sha256(edit["after"].encode("utf-8")),
+                        "changed": edit["changed"],
+                    }
+                    for edit in item.edits
+                ],
             }
             for item in files
         ]
+        if selected_edit_ids is not None:
+            query["selected_edit_ids"] = normalized_selection
         commit, dirty = self._git_state()
         fingerprint_payload = {
             "root_path": str(self.root_path),
@@ -854,13 +913,33 @@ class XRayIndexer:
             warnings.append("Repository worktree is dirty; the plan digest still binds every affected preimage.")
         if matches and changed_candidate_count == 0:
             warnings.append("Every candidate is a no-op; apply requires explicit no-op allowance.")
+        full_diff = self._replacement_diff(files)
+        preview_truncated = len(preview) > preview_limit
+        diff_truncated = len(full_diff) > diff_limit
+        review_truncated = preview_truncated or diff_truncated
+        review_complete = not review_truncated or allow_truncated_review
+        applicable = bool(matches) and review_complete and (changed_candidate_count > 0 or allow_noop)
+        applicability_reason: str | None = None
+        if not matches:
+            applicability_reason = "no_candidates"
+        elif review_truncated and not allow_truncated_review:
+            applicability_reason = "truncated_review_not_acknowledged"
+            warnings.append("Preview or diff is truncated; acknowledge truncated review before apply.")
+        elif changed_candidate_count == 0 and not allow_noop:
+            applicability_reason = "noop_not_allowed"
         plan: dict[str, Any] = {
             "plan_version": REPLACEMENT_PLAN_VERSION,
             "root_path": str(self.root_path),
             "root_fingerprint": root_fingerprint,
             "query": query,
-            "bounds": {"max_matches": max_matches, "max_files": max_files},
+            "bounds": {
+                "max_matches": max_matches,
+                "max_files": max_files,
+                "preview_limit": preview_limit,
+                "diff_limit": diff_limit,
+            },
             "allow_noop": allow_noop,
+            "allow_truncated_review": allow_truncated_review,
             "candidate_count": len(matches),
             "changed_candidate_count": changed_candidate_count,
             "no_op_count": len(matches) - changed_candidate_count,
@@ -870,7 +949,14 @@ class XRayIndexer:
             "preview": preview[:preview_limit],
             "preview_returned": min(len(preview), preview_limit),
             "preview_total": len(preview),
-            "preview_truncated": len(preview) > preview_limit,
+            "preview_truncated": preview_truncated,
+            "diff": full_diff[:diff_limit],
+            "diff_returned_chars": min(len(full_diff), diff_limit),
+            "diff_total_chars": len(full_diff),
+            "diff_truncated": diff_truncated,
+            "review_complete": review_complete,
+            "applicable": applicable,
+            "applicability_reason": applicability_reason,
             "warnings": warnings,
         }
         plan["plan_digest"] = self._sha256(self._canonical_json(self._plan_digest_payload(plan)))
@@ -888,7 +974,9 @@ class XRayIndexer:
         max_matches: int = DEFAULT_REPLACEMENT_MAX_MATCHES,
         max_files: int = DEFAULT_REPLACEMENT_MAX_FILES,
         allow_noop: bool = False,
+        allow_truncated_review: bool = False,
         preview_limit: int = DEFAULT_REPLACEMENT_PREVIEW_LIMIT,
+        diff_limit: int = DEFAULT_REPLACEMENT_DIFF_LIMIT,
     ) -> dict[str, Any]:
         """Return an exact, bounded, non-mutating replacement plan."""
         return self._build_replacement_plan(
@@ -901,7 +989,26 @@ class XRayIndexer:
             max_matches=max_matches,
             max_files=max_files,
             allow_noop=allow_noop,
+            allow_truncated_review=allow_truncated_review,
             preview_limit=preview_limit,
+            diff_limit=diff_limit,
+        ).plan
+
+    def refine_replacement(self, plan: Mapping[str, Any], *, edit_ids: Sequence[str]) -> dict[str, Any]:
+        """Recompute a reviewed plan and select stable edit identifiers without writing."""
+        self._validate_replacement_plan_digest(plan)
+        query, bounds, kwargs = self._replacement_plan_inputs(plan)
+        return self._build_replacement_plan(
+            **kwargs,
+            paths=query.get("paths"),
+            globs=query.get("globs"),
+            max_matches=bounds.get("max_matches"),
+            max_files=bounds.get("max_files"),
+            allow_noop=bool(plan.get("allow_noop", False)),
+            allow_truncated_review=bool(plan.get("allow_truncated_review", False)),
+            preview_limit=int(bounds.get("preview_limit", DEFAULT_REPLACEMENT_PREVIEW_LIMIT)),
+            diff_limit=int(bounds.get("diff_limit", DEFAULT_REPLACEMENT_DIFF_LIMIT)),
+            selected_edit_ids=edit_ids,
         ).plan
 
     @staticmethod
@@ -989,24 +1096,26 @@ class XRayIndexer:
             ],
         }
 
-    def apply_replacement(self, plan: Mapping[str, Any], *, expected_digest: str) -> dict[str, Any]:
-        """Recompute and apply a serialized plan only when every guard still matches."""
-        if plan.get("plan_version") != REPLACEMENT_PLAN_VERSION:
-            raise ValueError(f"Unsupported replacement plan version: {plan.get('plan_version')!r}.")
+    def _validate_replacement_plan_digest(self, plan: Mapping[str, Any]) -> str:
+        """Validate the version and complete-artifact digest of a replacement plan."""
+        version = plan.get("plan_version")
+        if version == "xray.replace.v1":
+            raise ValueError("Replacement plan xray.replace.v1 cannot attest review fields; create a new v2 plan.")
+        if version != REPLACEMENT_PLAN_VERSION:
+            raise ValueError(f"Unsupported replacement plan version: {version!r}.")
         stored_digest = plan.get("plan_digest")
         if not isinstance(stored_digest, str):
             raise ValueError("Replacement plan is missing plan_digest.")
-        try:
-            calculated_digest = self._sha256(self._canonical_json(self._plan_digest_payload(plan)))
-        except KeyError as exc:
-            raise ValueError(f"Replacement plan is missing semantic field {exc.args[0]!r}.") from exc
+        calculated_digest = self._sha256(self._canonical_json(self._plan_digest_payload(plan)))
         if calculated_digest != stored_digest:
-            raise ValueError("Replacement plan digest does not match its semantic fields.")
-        if expected_digest != stored_digest:
-            raise ValueError("expected_digest does not confirm this replacement plan.")
-        if Path(str(plan.get("root_path", ""))).resolve() != self.root_path:
-            raise ValueError("Replacement plan root does not match the requested repository root.")
+            raise ValueError("Replacement plan digest does not match its complete review artifact.")
+        return stored_digest
 
+    @staticmethod
+    def _replacement_plan_inputs(
+        plan: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any], dict[str, Any]]:
+        """Extract validated plan inputs used for canonical recomputation."""
         query = plan.get("query")
         bounds = plan.get("bounds")
         if not isinstance(query, Mapping) or not isinstance(query.get("change"), Mapping):
@@ -1015,7 +1124,6 @@ class XRayIndexer:
             raise ValueError("Replacement plan bounds are invalid.")
         change = query["change"]
         kind = change.get("kind")
-        kwargs: dict[str, Any]
         if kind == "pattern":
             kwargs = {
                 "pattern": change.get("pattern"),
@@ -1026,6 +1134,16 @@ class XRayIndexer:
             kwargs = {"rule_path": change.get("rule_path")}
         else:
             raise ValueError("Replacement plan change kind is invalid.")
+        return query, bounds, kwargs
+
+    def apply_replacement(self, plan: Mapping[str, Any], *, expected_digest: str) -> dict[str, Any]:
+        """Recompute and apply a serialized plan only when every guard still matches."""
+        stored_digest = self._validate_replacement_plan_digest(plan)
+        if expected_digest != stored_digest:
+            raise ValueError("expected_digest does not confirm this replacement plan.")
+        if Path(str(plan.get("root_path", ""))).resolve() != self.root_path:
+            raise ValueError("Replacement plan root does not match the requested repository root.")
+        query, bounds, kwargs = self._replacement_plan_inputs(plan)
         prepared = self._build_replacement_plan(
             **kwargs,
             paths=query.get("paths"),
@@ -1033,14 +1151,17 @@ class XRayIndexer:
             max_matches=bounds.get("max_matches"),
             max_files=bounds.get("max_files"),
             allow_noop=bool(plan.get("allow_noop", False)),
-            preview_limit=int(plan.get("preview_returned", DEFAULT_REPLACEMENT_PREVIEW_LIMIT)),
+            allow_truncated_review=bool(plan.get("allow_truncated_review", False)),
+            preview_limit=int(bounds.get("preview_limit", DEFAULT_REPLACEMENT_PREVIEW_LIMIT)),
+            diff_limit=int(bounds.get("diff_limit", DEFAULT_REPLACEMENT_DIFF_LIMIT)),
+            selected_edit_ids=query.get("selected_edit_ids"),
         )
-        if prepared.plan["plan_digest"] != stored_digest or prepared.plan["root_fingerprint"] != plan.get(
-            "root_fingerprint"
-        ):
+        if prepared.plan != dict(plan):
             raise ReplacementApplyError("Replacement plan no longer matches the repository source snapshot.")
-        if prepared.plan["changed_candidate_count"] == 0 and not prepared.plan["allow_noop"]:
-            raise ValueError("Replacement plan contains no byte-changing edits; allow_noop was not recorded.")
+        if not prepared.plan["applicable"]:
+            if prepared.plan["applicability_reason"] == "noop_not_allowed":
+                raise ValueError("Replacement plan contains no byte-changing edits; allow_noop was not recorded.")
+            raise ValueError(f"Replacement plan is not applicable: {prepared.plan['applicability_reason']}.")
         return self._apply_prepared_replacement(prepared)
 
     def rewrite_pattern(self, pattern: str, replacement: str, lang: str | None = None) -> dict[str, Any]:
@@ -1098,6 +1219,153 @@ class XRayIndexer:
         self.last_mutation_summary = self._apply_prepared_replacement(prepared)
         return list(prepared.matches)
 
+    def check_rules(
+        self,
+        rule_path: str,
+        *,
+        paths: Sequence[str] | None = None,
+        globs: Sequence[str] | None = None,
+        max_results: int = 100,
+    ) -> dict[str, Any]:
+        """Validate and scan one contained ast-grep rule source without mutation."""
+        matches, relative_rule = self._scan_rule_matches(rule_path, paths=paths, globs=globs, max_results=max_results)
+        return {
+            "rule_path": relative_rule,
+            "valid": True,
+            "matches": matches,
+            "returned": len(matches),
+            "total_exact": self.last_result_total_exact,
+            "truncated": not self.last_result_total_exact,
+        }
+
+    def explain_rules(self, rule_path: str, *, source_limit: int = 32_000) -> dict[str, Any]:
+        """Return bounded source plus upstream validation and inspection evidence."""
+        if source_limit < 1:
+            raise ValueError("source_limit must be 1 or greater.")
+        rule_args, relative_rule = self._rule_arguments(rule_path)
+        resolved = self._resolve_repo_path(relative_rule)
+        source_path = resolved
+        if resolved.is_dir():
+            source_path = next(
+                path for path in (resolved / "sgconfig.yml", resolved / "sgconfig.yaml") if path.is_file()
+            )
+        source = source_path.read_text(encoding="utf-8")
+        result = run_ast_grep(
+            ["scan", *rule_args, "--inspect=summary", "--json=compact", "--max-results", "1", str(self.root_path)],
+            cwd=self.root_path,
+        )
+        return {
+            "rule_path": relative_rule,
+            "valid": True,
+            "source": source[:source_limit],
+            "source_chars": min(len(source), source_limit),
+            "source_total_chars": len(source),
+            "source_truncated": len(source) > source_limit,
+            "inspection": result.stderr.strip(),
+        }
+
+    def test_rules(
+        self,
+        *,
+        test_dir: str = ".",
+        config_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Run contained ast-grep rule tests without snapshots or interactive behavior."""
+        resolved_test_dir = self._resolve_repo_path(test_dir)
+        if not resolved_test_dir.is_dir():
+            raise ValueError("test_dir must be a directory.")
+        args = [
+            "test",
+            "--test-dir",
+            str(resolved_test_dir),
+            "--skip-snapshot-tests",
+            "--color",
+            "never",
+        ]
+        relative_config: str | None = None
+        if config_path is not None:
+            resolved_config = self._resolve_repo_path(config_path, require_file=True)
+            relative_config = resolved_config.relative_to(self.root_path).as_posix()
+            args.extend(["--config", str(resolved_config)])
+        result = run_ast_grep(args, cwd=self.root_path)
+        return {
+            "ok": True,
+            "test_dir": (
+                "." if resolved_test_dir == self.root_path else resolved_test_dir.relative_to(self.root_path).as_posix()
+            ),
+            "config_path": relative_config,
+            "output": result.stdout.strip(),
+            "diagnostics": result.stderr.strip(),
+        }
+
+    def capabilities(self, *, include_repository: bool = True) -> dict[str, Any]:
+        """Report stable product contracts and effective local dependency health."""
+
+        def version(command: str) -> str | None:
+            executable = shutil.which(command)
+            if executable is None:
+                return None
+            try:
+                completed = subprocess.run(
+                    [executable, "--version"], capture_output=True, check=False, text=True, timeout=GIT_TIMEOUT_SECONDS
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            output = (completed.stdout or completed.stderr).strip().splitlines()
+            return output[0] if completed.returncode == 0 and output else None
+
+        ast_grep_version = version("ast-grep")
+        payload: dict[str, Any] = {
+            "product": {"name": "xray-cli", "version": __version__},
+            "schemas": ["xray.cli.v1", "xray.cli.v2"],
+            "replacement_plan_versions": [REPLACEMENT_PLAN_VERSION],
+            "languages": sorted(set(LANGUAGE_MAP.values())),
+            "extensions": dict(sorted(LANGUAGE_MAP.items())),
+            "operations": {
+                "read_only": [
+                    "explore",
+                    "find",
+                    "interface",
+                    "read-symbol",
+                    "symbol-at",
+                    "impact",
+                    "search",
+                    "rules-check",
+                    "rules-explain",
+                    "rules-test",
+                    "replace-plan",
+                    "replace-refine",
+                ],
+                "destructive": ["rewrite", "scan-fix", "replace-apply", "apply-rule-fixes"],
+            },
+            "bounds": {
+                "inventory_files": MAX_INVENTORY_FILES,
+                "inventory_symbols": MAX_INVENTORY_SYMBOLS,
+                "impact_raw_results": MAX_IMPACT_RAW_RESULTS,
+                "replacement_matches": DEFAULT_REPLACEMENT_MAX_MATCHES,
+                "replacement_files": DEFAULT_REPLACEMENT_MAX_FILES,
+                "ast_grep_timeout_seconds": get_ast_grep_timeout(),
+            },
+            "cache": {"directory": str(self.cache_dir) if self.cache_dir is not None else None, "snapshot_bound": True},
+            "workflow_resources": [
+                "xray://workflow",
+                "xray_discovery_plan",
+                "skill://xray-progressive-discovery/SKILL.md",
+            ],
+            "dependencies": {
+                "ast_grep": {"required": True, "available": ast_grep_version is not None, "version": ast_grep_version},
+                "git": {"required": False, "available": shutil.which("git") is not None, "version": version("git")},
+                "ripgrep": {"required": False, "available": shutil.which("rg") is not None, "version": version("rg")},
+            },
+            "healthy": ast_grep_version is not None,
+        }
+        if include_repository:
+            payload["repository"] = {
+                "root_path": str(self.root_path),
+                "snapshot": self.repository_snapshot_fingerprint(),
+            }
+        return payload
+
     def file_outline_items(self, file_path: str, item: str) -> list[dict[str, Any]]:
         """Return imports or exports reported by ast-grep outline for one repository file."""
         if item not in {"imports", "exports"}:
@@ -1154,6 +1422,12 @@ class XRayIndexer:
 
         The text tree remains available through explore_repo and structured payloads include entries for automation.
         """
+        normalized_focus: list[str] = []
+        for value in focus_dirs or ():
+            candidate = self._resolve_repo_path(value)
+            relative = "." if candidate == self.root_path else candidate.relative_to(self.root_path).as_posix()
+            if relative not in normalized_focus:
+                normalized_focus.append(relative)
         gitignore_patterns = self._parse_gitignore(use_default_exclusions=use_default_exclusions)
         tree_lines: list[str] = []
         entries: list[ExploreEntry] = []
@@ -1165,7 +1439,7 @@ class XRayIndexer:
             current_depth=0,
             max_depth=max_depth,
             include_symbols=include_symbols,
-            focus_dirs=focus_dirs,
+            focus_dirs=normalized_focus,
             max_symbols_per_file=max_symbols_per_file,
             symbol_types=symbol_types,
             is_last=True,
@@ -1184,7 +1458,7 @@ class XRayIndexer:
             "options": {
                 "max_depth": max_depth,
                 "include_symbols": include_symbols,
-                "focus_dirs": focus_dirs or [],
+                "focus_dirs": normalized_focus,
                 "max_symbols_per_file": max_symbols_per_file,
                 "symbol_types": symbol_types or [],
                 "max_entries": max_entries,
@@ -1250,14 +1524,27 @@ class XRayIndexer:
             return False
 
     def _should_include_dir(self, path: Path, focus_dirs: list[str] | None, current_depth: int) -> bool:
-        """Check if a directory should be included based on focus_dirs."""
-        if not focus_dirs or current_depth > 0:
+        """Retain focused descendants and their complete repository ancestor chain."""
+        if not focus_dirs:
             return True
         if path == self.root_path:
             return True
+        relative = path.relative_to(self.root_path).as_posix()
+        return any(
+            focus in {".", relative} or focus.startswith(f"{relative}/") or relative.startswith(f"{focus}/")
+            for focus in focus_dirs
+        )
 
-        # At depth 0 (top-level), only include if in focus_dirs
-        return path.name in focus_dirs
+    def _should_include_focused_path(self, path: Path, focus_dirs: list[str] | None) -> bool:
+        """Include root context files plus selected files and descendant subtrees."""
+        if not focus_dirs or path == self.root_path:
+            return True
+        relative = path.relative_to(self.root_path).as_posix()
+        if path.is_dir():
+            return self._should_include_dir(path, focus_dirs, len(relative.split("/")))
+        if "/" not in relative:
+            return True
+        return any(focus in {".", relative} or relative.startswith(f"{focus}/") for focus in focus_dirs)
 
     def _collect_tree_entries(
         self,
@@ -1273,6 +1560,9 @@ class XRayIndexer:
     ):
         """Collect a flat, structured repository map."""
         if self._should_exclude(path, gitignore_patterns):
+            return
+
+        if not self._should_include_focused_path(path, focus_dirs):
             return
 
         if max_depth is not None and current_depth > max_depth:
@@ -1309,9 +1599,6 @@ class XRayIndexer:
         try:
             children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
             children = [c for c in children if not self._should_exclude(c, gitignore_patterns)]
-
-            if current_depth == 0 and focus_dirs:
-                children = [c for c in children if c.is_file() or c.name in focus_dirs]
 
             for child in children:
                 self._collect_tree_entries(
@@ -1397,6 +1684,9 @@ class XRayIndexer:
         if self._should_exclude(path, gitignore_patterns):
             return False
 
+        if not self._should_include_focused_path(path, focus_dirs):
+            return False
+
         # Check depth limit
         if max_depth is not None and current_depth > max_depth:
             return False
@@ -1459,10 +1749,6 @@ class XRayIndexer:
                 children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
                 # Filter out excluded items
                 children = [c for c in children if not self._should_exclude(c, gitignore_patterns)]
-
-                # Apply focus_dirs filter at top level
-                if current_depth == 0 and focus_dirs:
-                    children = [c for c in children if c.is_file() or c.name in focus_dirs]
 
                 for i, child in enumerate(children):
                     is_last_child = i == len(children) - 1
@@ -1617,8 +1903,22 @@ class XRayIndexer:
             warnings.append("No interface symbols were reported for this supported file.")
         return symbols, warnings
 
-    def read_interface_structured(self, file_path: str) -> dict[str, Any]:
-        """Return a typed, hierarchical interface contract or raise InterfaceReadError."""
+    def read_interface_structured(
+        self,
+        file_path: str,
+        *,
+        symbol_names: Sequence[str] | None = None,
+        visibility: Sequence[str] | None = None,
+        symbol_types: Sequence[str] | None = None,
+        member_depth: int | None = 1,
+        max_symbols: int | None = 50,
+        max_members: int | None = 20,
+    ) -> dict[str, Any]:
+        """Return a bounded, filterable hierarchical interface contract."""
+        bounds = (("member_depth", member_depth), ("max_symbols", max_symbols), ("max_members", max_members))
+        for label, value in bounds:
+            if value is not None and value < 0:
+                raise InterfaceReadError("invalid_bound", f"{label} must be 0 or greater.")
         try:
             target_path = self._resolve_file_inside_root(file_path)
         except (OSError, RuntimeError, ValueError) as exc:
@@ -1638,11 +1938,55 @@ class XRayIndexer:
             symbols, warnings = self._python_interface(target_path)
         else:
             symbols, warnings = self._outline_interface(target_path)
+        names = {value for value in symbol_names or ()}
+        visibilities = {value.lower() for value in visibility or ()}
+        types = {value.lower() for value in symbol_types or ()}
+        if visibilities - {"public", "private", "unknown"}:
+            raise InterfaceReadError("invalid_filter", "visibility filters must be public, private, or unknown.")
+        symbols = [
+            symbol
+            for symbol in symbols
+            if (not names or str(symbol.get("name")) in names)
+            and (not visibilities or str(symbol.get("visibility", "unknown")).lower() in visibilities)
+            and (not types or str(symbol.get("type", "symbol")).lower() in types)
+        ]
+        complete = not warnings
+        total_symbols = len(symbols)
+        if max_symbols is not None and len(symbols) > max_symbols:
+            symbols = symbols[:max_symbols]
+            complete = False
+            warnings.append(f"Interface symbols truncated at {max_symbols} of {total_symbols} top-level symbols.")
+
+        def bound_members(items: list[dict[str, Any]], depth: int) -> None:
+            nonlocal complete
+            for symbol in items:
+                members = symbol.get("members")
+                if not isinstance(members, list):
+                    symbol["members"] = []
+                    continue
+                if member_depth is not None and depth >= member_depth:
+                    if members:
+                        complete = False
+                        warnings.append(f"Members for '{symbol.get('name', '')}' truncated at depth {member_depth}.")
+                    symbol["members"] = []
+                    continue
+                if max_members is not None and len(members) > max_members:
+                    complete = False
+                    warnings.append(
+                        f"Members for '{symbol.get('name', '')}' truncated at {max_members} of {len(members)}."
+                    )
+                    members = members[:max_members]
+                    symbol["members"] = members
+                bound_members(members, depth + 1)
+
+        bound_members(symbols, 0)
         return {
             "path": target_path.relative_to(self.root_path).as_posix(),
             "language": language,
             "symbols": symbols,
-            "complete": not warnings,
+            "complete": complete,
+            "total_symbols": total_symbols,
+            "returned_symbols": len(symbols),
             "warnings": warnings,
         }
 
@@ -1670,9 +2014,85 @@ class XRayIndexer:
     def read_interface(self, file_path: str) -> str:
         """Preserve the legacy string interface projection and string errors."""
         try:
-            return self.render_interface(self.read_interface_structured(file_path))
+            return self.render_interface(
+                self.read_interface_structured(
+                    file_path,
+                    member_depth=None,
+                    max_symbols=None,
+                    max_members=None,
+                )
+            )
         except InterfaceReadError as exc:
             return f"Error reading interface: {exc}"
+
+    def read_symbol(
+        self,
+        symbol: Mapping[str, Any],
+        *,
+        context_lines: int = 0,
+        max_lines: int = 200,
+        max_bytes: int = 64 * 1024,
+    ) -> dict[str, Any]:
+        """Read one contained symbol source slice with explicit line and byte bounds."""
+        if context_lines < 0 or max_lines < 1 or max_bytes < 1:
+            raise ValueError("context_lines must be non-negative and max_lines/max_bytes must be positive.")
+        path_value = symbol.get("path") or symbol.get("abs_path")
+        if not isinstance(path_value, str):
+            raise ValueError("Symbol path is required.")
+        target = self._resolve_repo_path(path_value, require_file=True)
+        start = int(symbol.get("start_line", 0))
+        end = int(symbol.get("end_line", start))
+        if start < 1 or end < start:
+            raise ValueError("Symbol start_line/end_line are invalid.")
+        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+        slice_start = max(1, start - context_lines)
+        slice_end = min(len(lines), end + context_lines)
+        requested_lines = lines[slice_start - 1 : slice_end]
+        line_truncated = len(requested_lines) > max_lines
+        requested_lines = requested_lines[:max_lines]
+        source = "".join(requested_lines)
+        encoded = source.encode("utf-8")
+        byte_truncated = len(encoded) > max_bytes
+        if byte_truncated:
+            source = encoded[:max_bytes].decode("utf-8", errors="ignore")
+        returned_lines = source.count("\n") + (1 if source and not source.endswith("\n") else 0)
+        return {
+            "path": target.relative_to(self.root_path).as_posix(),
+            "symbol": {
+                key: symbol.get(key) for key in ("name", "type", "qualified_name") if symbol.get(key) is not None
+            },
+            "start_line": slice_start,
+            "end_line": slice_start + max(0, returned_lines - 1),
+            "source": source,
+            "returned_lines": returned_lines,
+            "returned_bytes": len(source.encode("utf-8")),
+            "truncated": line_truncated or byte_truncated,
+            "line_truncated": line_truncated,
+            "byte_truncated": byte_truncated,
+        }
+
+    def symbol_at(self, file_path: str, line: int) -> dict[str, Any] | None:
+        """Return the narrowest inventory symbol containing a one-based source line."""
+        if line < 1:
+            raise ValueError("line must be 1 or greater.")
+        target = self._resolve_repo_path(file_path, require_file=True)
+        relative = target.relative_to(self.root_path).as_posix()
+        matches = [
+            symbol
+            for symbol in self._get_symbol_inventory()
+            if symbol.get("path") == relative
+            and int(symbol.get("start_line", 0)) <= line <= int(symbol.get("end_line", 0))
+        ]
+        if not matches:
+            return None
+        selected = min(
+            matches,
+            key=lambda symbol: (
+                int(symbol.get("end_line", 0)) - int(symbol.get("start_line", 0)),
+                -int(symbol.get("start_line", 0)),
+            ),
+        )
+        return cast(dict[str, Any], dict(selected))
 
     def _resolve_file_inside_root(self, file_path: str) -> Path:
         """Resolve a file path and require it to remain inside the repository root."""
@@ -2028,11 +2448,33 @@ class XRayIndexer:
         return min(int(fuzz.ratio(query_lower, candidate)), 59), "fuzzy", "low"
 
     def find_symbol(
-        self, query: str, limit: int = 10, min_score: int = 0, include_scores: bool = False
+        self,
+        query: str,
+        limit: int | None = 10,
+        min_score: int = 60,
+        include_scores: bool = True,
+        *,
+        paths: Sequence[str] | None = None,
+        languages: Sequence[str] | None = None,
+        symbol_types: Sequence[str] | None = None,
+        visibility: Sequence[str] | None = None,
     ) -> list[SymbolMatch]:
-        """Find symbols from one snapshot-cached expanded outline inventory."""
+        """Find symbols by calibrated name identity after contained scope filtering."""
         if not query.strip():
             raise ValueError("Symbol query must not be empty.")
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be 0 or greater.")
+        if not 0 <= min_score <= 100:  # noqa: PLR2004 - public score scale is defined as 0..100
+            raise ValueError("min_score must be between 0 and 100.")
+        _resolved, relative_paths = self._operation_scopes(paths)
+        normalized_languages = {value.lower() for value in languages or ()}
+        unknown_languages = normalized_languages - set(LANGUAGE_MAP.values())
+        if unknown_languages:
+            raise ValueError(f"Unsupported language filter: {sorted(unknown_languages)[0]}.")
+        normalized_types = {value.lower() for value in symbol_types or ()}
+        normalized_visibility = {value.lower() for value in visibility or ()}
+        if normalized_visibility - {"public", "private", "unknown"}:
+            raise ValueError("visibility filters must be public, private, or unknown.")
         self.last_warnings = []
         self.last_search_succeeded = False
         scored: list[tuple[int, int, dict[str, Any]]] = []
@@ -2046,6 +2488,17 @@ class XRayIndexer:
             "fuzzy": 1,
         }
         for symbol in self._get_symbol_inventory():
+            symbol_path = str(symbol.get("path") or "")
+            if relative_paths and not any(
+                scope in {".", symbol_path} or symbol_path.startswith(f"{scope}/") for scope in relative_paths
+            ):
+                continue
+            if normalized_languages and str(symbol.get("language", "")).lower() not in normalized_languages:
+                continue
+            if normalized_types and str(symbol.get("type", "")).lower() not in normalized_types:
+                continue
+            if normalized_visibility and str(symbol.get("visibility", "unknown")).lower() not in normalized_visibility:
+                continue
             score, reason, confidence = self._score_inventory_symbol(query, symbol)
             if score < min_score:
                 continue
@@ -2063,7 +2516,9 @@ class XRayIndexer:
                 int(value[2].get("start_line", 0)),
             )
         )
-        return [cast(SymbolMatch, value[2]) for value in scored[:limit]]
+        self.last_find_total = len(scored)
+        selected = scored if limit is None else scored[:limit]
+        return [cast(SymbolMatch, value[2]) for value in selected]
 
     def _get_metavariable(self, metavars: dict[str, Any], name: str) -> dict[str, Any] | None:
         """Return a metavariable from old or current ast-grep JSON shapes."""
@@ -2123,20 +2578,42 @@ class XRayIndexer:
         strategy = "structural"
         degradation_reason: str | None = None
 
-        references, total_exact, structural_error = self._ast_grep_search(symbol_name, context_lines, max_results)
-        if not references:
+        raw_cap = max_results
+        execution_limited = False
+        structural_error: str | None = None
+        while True:
+            references, total_exact, structural_error = self._ast_grep_search(symbol_name, context_lines, raw_cap)
+            filtered_references = self._filter_impact_references(
+                references,
+                symbol_name,
+                definition_path,
+                int(definition_start),
+                int(definition_end),
+            )
+            enough = max_results is None or len(filtered_references) >= max_results
+            if enough or total_exact or raw_cap is None:
+                break
+            if raw_cap >= MAX_IMPACT_RAW_RESULTS:
+                execution_limited = True
+                break
+            raw_cap = min(MAX_IMPACT_RAW_RESULTS, max(raw_cap + 1, raw_cap * 2))
+
+        if not filtered_references:
             strategy = "text"
             references, total_exact = self._text_search(symbol_name, context_lines, max_results)
-            degradation_reason = structural_error or "Structural search returned no candidates; used text fallback."
+            filtered_references = self._filter_impact_references(
+                references,
+                symbol_name,
+                definition_path,
+                int(definition_start),
+                int(definition_end),
+            )
+            degradation_reason = (
+                structural_error or "Structural search returned no usable candidates; used text fallback."
+            )
 
         raw_count = len(references)
-        references = self._filter_impact_references(
-            references,
-            symbol_name,
-            definition_path,
-            int(definition_start),
-            int(definition_end),
-        )
+        references = filtered_references
         definition_count = sum(reference.get("type") == "definition" for reference in references)
         lower_bound = "at least " if not total_exact else ""
 
@@ -2152,6 +2629,8 @@ class XRayIndexer:
             ),
             "total_exact": total_exact,
             "degradation_reason": degradation_reason,
+            "execution_limited": execution_limited,
+            "execution_cap": raw_cap,
         }
 
     def _ast_grep_search(

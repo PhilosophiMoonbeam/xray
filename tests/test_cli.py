@@ -23,6 +23,11 @@ def structured_content(result: Any) -> dict[str, Any]:
     return cast(dict[str, Any], content)
 
 
+def direct_tool_error(result: Any) -> dict[str, Any]:
+    assert result.is_error is True
+    return cast(dict[str, Any], result.structured_content)["error"]
+
+
 def text_content(value: Any) -> str:
     text = getattr(value, "text", None)
     assert isinstance(text, str)
@@ -235,7 +240,7 @@ def test_interface_cli_rejects_absolute_path_outside_root(tmp_path, capsys):
     exit_code = cli.main(["interface", str(repo), str(outside), "--format", "json"])
 
     assert exit_code == 1
-    result = json.loads(capsys.readouterr().out)
+    result = json.loads(capsys.readouterr().err)
     assert result["ok"] is False
     assert result["schema_version"] == "xray.cli.v2"
     assert result["error"]["code"] == "path_outside_root"
@@ -250,8 +255,8 @@ def test_interface_cli_rejects_parent_traversal_outside_root(tmp_path, capsys):
     exit_code = cli.main(["interface", str(repo), "../outside.py", "--format", "text"])
 
     assert exit_code == 1
-    output = capsys.readouterr().out
-    assert "Error reading interface:" in output
+    output = capsys.readouterr().err
+    assert "xray:" in output
     assert "outside repository root" in output
     assert "def leaked" not in output
 
@@ -266,24 +271,24 @@ def test_interface_cli_rejects_symlink_file_outside_root(tmp_path, capsys):
     exit_code = cli.main(["interface", str(repo), "src/linked.py", "--format", "json"])
 
     assert exit_code == 1
-    result = json.loads(capsys.readouterr().out)
+    result = json.loads(capsys.readouterr().err)
     assert result["ok"] is False
     assert result["error"]["code"] == "path_outside_root"
     assert "outside repository root" in result["error"]["message"]
     assert "def leaked" not in result["error"]["message"]
 
 
-def test_mcp_read_interface_preserves_string_error_for_outside_root(tmp_path):
+def test_mcp_read_interface_returns_protocol_error_for_outside_root(tmp_path):
     repo = write_sample_repo(tmp_path)
     outside = tmp_path / "outside.py"
     outside.write_text("def leaked():\n    pass\n", encoding="utf-8")
 
     result = mcp_server.read_interface(str(repo), str(outside))
 
-    assert isinstance(result, str)
-    assert result.startswith("Error reading interface:")
-    assert "outside repository root" in result
-    assert "def leaked" not in result
+    error = direct_tool_error(result)
+    assert error["code"] == "path_outside_root"
+    assert "outside repository root" in error["message"]
+    assert "def leaked" not in error["message"]
 
 
 def test_explore_json_does_not_traverse_symlinked_directory_outside_root(tmp_path, capsys):
@@ -309,7 +314,7 @@ def test_find_cli_prints_json_symbols(tmp_path, capsys):
 
     assert exit_code == 0
     result = json.loads(capsys.readouterr().out)
-    assert result["schema_version"] == "xray.cli.v1"
+    assert result["schema_version"] == "xray.cli.v2"
     assert result["ok"] is True
     assert result["command"] == "find"
     assert result["query"] == "target"
@@ -625,10 +630,10 @@ def test_find_cli_reports_missing_ast_grep_as_json_error(tmp_path, capsys):
         exit_code = cli.main(["find", str(repo), "target"])
 
     assert exit_code == 1
-    result = json.loads(capsys.readouterr().out)
+    result = json.loads(capsys.readouterr().err)
     assert result["ok"] is False
-    assert result["error"] == "Symbol search failed."
-    assert "ast-grep executable was not found" in result["warnings"][0]
+    assert result["error"]["code"] == "ast_grep_error"
+    assert "ast-grep executable was not found" in result["error"]["message"]
 
 
 def test_find_cli_reports_ast_grep_nonzero_as_json_error(tmp_path, capsys):
@@ -640,9 +645,9 @@ def test_find_cli_reports_ast_grep_nonzero_as_json_error(tmp_path, capsys):
         exit_code = cli.main(["find", str(repo), "target"])
 
     assert exit_code == 1
-    result = json.loads(capsys.readouterr().out)
+    result = json.loads(capsys.readouterr().err)
     assert result["ok"] is False
-    assert "parser failed" in result["warnings"][0]
+    assert "parser failed" in result["error"]["message"]
 
 
 def test_find_cli_uses_one_expanded_outline_inventory(tmp_path, capsys):
@@ -683,7 +688,7 @@ def test_find_cli_rejects_invalid_min_score(tmp_path, capsys):
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
     assert error["ok"] is False
-    assert error["error"] == "--min-score must be between 0 and 100."
+    assert error["error"]["message"] == "--min-score must be between 0 and 100."
 
 
 def test_find_cli_rejects_negative_limit(tmp_path, capsys):
@@ -693,7 +698,7 @@ def test_find_cli_rejects_negative_limit(tmp_path, capsys):
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
-    assert error["error"] == "--limit must be 0 or greater."
+    assert error["error"]["message"] == "--limit must be 0 or greater."
 
 
 def test_impact_cli_accepts_manual_symbol_json(tmp_path, capsys):
@@ -742,7 +747,7 @@ def test_impact_cli_rejects_missing_symbol_file_as_json_error(tmp_path, capsys):
     assert exit_code == 2
     result = json.loads(capsys.readouterr().err)
     assert result["ok"] is False
-    assert "Could not read symbol file" in result["error"]
+    assert "Could not read symbol file" in result["error"]["message"]
 
 
 def test_impact_cli_rejects_empty_stdin_symbol_json(tmp_path, capsys, monkeypatch):
@@ -754,7 +759,7 @@ def test_impact_cli_rejects_empty_stdin_symbol_json(tmp_path, capsys, monkeypatc
     assert exit_code == 2
     result = json.loads(capsys.readouterr().err)
     assert result["ok"] is False
-    assert result["error"] == "Symbol JSON from stdin is empty."
+    assert result["error"]["message"] == "Symbol JSON from stdin is empty."
 
 
 def test_impact_cli_rejects_oversized_stdin_symbol_json(tmp_path, capsys, monkeypatch):
@@ -766,7 +771,7 @@ def test_impact_cli_rejects_oversized_stdin_symbol_json(tmp_path, capsys, monkey
     assert exit_code == 2
     result = json.loads(capsys.readouterr().err)
     assert result["ok"] is False
-    assert "exceeds" in result["error"]
+    assert "exceeds" in result["error"]["message"]
 
 
 def test_impact_cli_accepts_relative_symbol_from_find_json(tmp_path, capsys):
@@ -880,7 +885,7 @@ def test_mcp_what_breaks_accepts_cli_find_symbol_json(tmp_path, capsys):
     assert find_exit == 0
     found = json.loads(capsys.readouterr().out)["symbols"][0]
 
-    result = mcp_server.what_breaks(found)
+    result = cast(dict[str, Any], mcp_server.what_breaks(found))
 
     assert "error" not in result
     assert result["total_count"] >= 1
@@ -898,7 +903,11 @@ def test_mcp_what_breaks_rejects_bare_relative_symbol_path():
 
     result = mcp_server.what_breaks(symbol)
 
-    assert result == {"error": "what_breaks requires an absolute symbol path or abs_path when called via MCP."}
+    error = direct_tool_error(result)
+    assert error == {
+        "code": "invalid_symbol_path",
+        "message": "what_breaks requires an absolute symbol path or abs_path when called via MCP.",
+    }
 
 
 def test_mcp_what_breaks_rejects_absolute_symbol_without_inferable_root(tmp_path, monkeypatch):
@@ -921,8 +930,7 @@ def test_mcp_what_breaks_rejects_absolute_symbol_without_inferable_root(tmp_path
         }
     )
 
-    assert "error" in result
-    assert "requires a CLI find symbol" in result["error"]
+    assert "requires a CLI find symbol" in direct_tool_error(result)["message"]
 
 
 def test_mcp_what_breaks_infers_root_from_cli_symbol_without_git(tmp_path, monkeypatch):
@@ -943,15 +951,18 @@ def test_mcp_what_breaks_infers_root_from_cli_symbol_without_git(tmp_path, monke
 
     monkeypatch.setattr(mcp_server, "run_indexer_operation", fake_run_indexer_operation)
 
-    result = mcp_server.what_breaks(
-        {
-            "name": "target_function",
-            "type": "function",
-            "path": "src/sample.py",
-            "abs_path": str(symbol_path),
-            "start_line": 1,
-            "end_line": 2,
-        }
+    result = cast(
+        dict[str, Any],
+        mcp_server.what_breaks(
+            {
+                "name": "target_function",
+                "type": "function",
+                "path": "src/sample.py",
+                "abs_path": str(symbol_path),
+                "start_line": 1,
+                "end_line": 2,
+            }
+        ),
     )
 
     assert "error" not in result
@@ -981,7 +992,7 @@ def test_mcp_tool_surface_is_search_first_with_compact_metadata(tmp_path):
     assert "tool names, descriptions, and parameters" in tools[0].inputSchema["properties"]["pattern"]["description"]
     matches = structured_content(search_result)["result"]
     assert [match["name"] for match in matches] == ["what_breaks"]
-    assert matches[0]["description"].startswith("Find likely symbol-name code references")
+    assert matches[0]["description"].startswith("Estimate blast radius")
     assert "not a type-aware caller" in matches[0]["description"]
     assert matches[0]["inputSchema"]["properties"]["exact_symbol"]["description"].startswith("Full symbol object")
     explore = structured_content(call_result)
@@ -1099,7 +1110,7 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
     assert searches["api"][0]["name"] == "read_interface"
     assert searches["summary"][0]["name"] == "read_interface"
     assert searches["body"][0]["name"] == "read_interface"
-    assert searches["uses"][0]["name"] == "what_breaks"
+    assert any(match["name"] == "what_breaks" for match in searches["uses"])
     assert searches["used by"][0]["name"] == "what_breaks"
     assert searches["breaking change"][0]["name"] == "what_breaks"
     assert searches["change impact"][0]["name"] == "what_breaks"
@@ -1122,12 +1133,12 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
         "find_symbol",
         "read_interface",
         "read_interface_structured",
+        "read_symbol",
+        "symbol_at",
         "what_breaks",
         "search_pattern",
         "rewrite_pattern",
         "plan_replacement",
-        "apply_replacement",
-        "scan_rules",
     ]
     assert searches["["] == []
 
@@ -1137,12 +1148,15 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
         "find_symbol",
         "read_interface",
         "read_interface_structured",
+        "read_symbol",
+        "symbol_at",
         "what_breaks",
         "search_pattern",
         "rewrite_pattern",
         "plan_replacement",
         "apply_replacement",
         "scan_rules",
+        "explain_rules",
         "file_imports",
         "file_exports",
     }
@@ -1162,8 +1176,7 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
     assert "Pass lang whenever the target language is known" in all_tools["rewrite_pattern"]["description"]
     lang_description = all_tools["rewrite_pattern"]["inputSchema"]["properties"]["lang"]["description"]
     assert "constrain destructive rewrite scope" in lang_description
-    assert "apply every configured fix" in all_tools["scan_rules"]["description"]
-    assert "read-only by default" in all_tools["scan_rules"]["description"]
+    assert "read-only" in all_tools["scan_rules"]["description"]
     assert "identical root" in all_tools["search_pattern"]["inputSchema"]["properties"]["cursor"]["description"]
 
     for matches in searches.values():
@@ -1173,7 +1186,7 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
             assert "ctx" not in properties
             assert match["description"]
             assert match["meta"]["fastmcp"]["tags"]
-            if match["name"] in {"rewrite_pattern", "scan_rules", "apply_replacement"}:
+            if match["name"] in {"rewrite_pattern", "apply_replacement", "apply_rule_fixes"}:
                 assert match["annotations"] == {
                     "readOnlyHint": False,
                     "destructiveHint": True,
@@ -1192,10 +1205,10 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
     explore = structured_content(calls["explore_repo"])
     assert "tree_text" not in explore
     assert any(entry["path"] == "src" for entry in explore["entries"])
-    found_symbols = structured_content(calls["find_symbol"])["result"]
+    found_symbols = structured_content(calls["find_symbol"])["symbols"]
     assert any(symbol_result["name"] == "target_function" for symbol_result in found_symbols)
     assert all(Path(symbol_result["abs_path"]).is_absolute() for symbol_result in found_symbols)
-    assert "def target_function(value):" in structured_content(calls["read_interface"])["result"]
+    assert "def target_function(value):" in text_content(calls["read_interface"].content[0])
     impact = structured_content(calls["what_breaks"])
     assert impact["total_count"] >= 1
     assert all(reference["line"] >= 1 for reference in impact["references"])
@@ -1258,13 +1271,28 @@ def test_async_mcp_find_symbol_offloads_blocking_indexer(tmp_path, monkeypatch):
         async def error(self, message):
             pass
 
+    calls = 0
+
     def fake_run_indexer_operation(path, operation):
+        nonlocal calls
+        calls += 1
         started.set()
         if not release.wait(timeout=2):
             raise AssertionError("blocking operation was not released")
-        return [
-            {"name": "target_function", "path": str(repo / "src" / "sample.py"), "type": "function", "start_line": 1}
-        ]
+        if calls == 1:
+            return "snapshot"
+        return (
+            [
+                {
+                    "name": "target_function",
+                    "path": str(repo / "src" / "sample.py"),
+                    "type": "function",
+                    "start_line": 1,
+                }
+            ],
+            True,
+            [],
+        )
 
     monkeypatch.setattr(mcp_server, "run_indexer_operation", fake_run_indexer_operation)
 
@@ -1275,12 +1303,13 @@ def test_async_mcp_find_symbol_offloads_blocking_indexer(tmp_path, monkeypatch):
         release.set()
         return result, await asyncio.wait_for(task, timeout=1)
 
-    loop_probe, symbols = asyncio.run(exercise())
+    loop_probe, symbols_value = asyncio.run(exercise())
+    symbols = cast(dict[str, Any], symbols_value)
 
     assert loop_probe == "event loop alive"
-    assert symbols[0]["name"] == "target_function"
-    assert symbols[0]["type"] == "function"
-    assert symbols[0]["start_line"] == 1
+    assert symbols["symbols"][0]["name"] == "target_function"
+    assert symbols["symbols"][0]["type"] == "function"
+    assert symbols["symbols"][0]["start_line"] == 1
 
 
 def test_mcp_concurrent_call_tool_requests_succeed_same_and_multi_root(tmp_path):
@@ -1342,20 +1371,22 @@ def test_mcp_concurrent_call_tool_requests_succeed_same_and_multi_root(tmp_path)
 
     same_root, multi_root = asyncio.run(call_concurrently())
 
-    def payload(result):
-        content = structured_content(result)
+    def payload(result) -> Any:
+        content = result.structured_content
+        if content is None:
+            return text_content(result.content[0])
         return content.get("result", content)
 
     same_results = [payload(result) for result in same_root]
     assert same_results[0]["root_path"] == str(repo_a)
-    assert any(symbol["name"] == "target_function" for symbol in same_results[1])
+    assert any(symbol["name"] == "target_function" for symbol in same_results[1]["symbols"])
     assert "def target_function(value):" in same_results[2]
     assert same_results[3]["total_count"] >= 1
     assert all("error" not in result for result in same_results[1:])
 
     multi_results = [payload(result) for result in multi_root]
-    assert any(symbol["name"] == "target_function" for symbol in multi_results[0])
-    assert any(symbol["name"] == "target_function" for symbol in multi_results[1])
+    assert any(symbol["name"] == "target_function" for symbol in multi_results[0]["symbols"])
+    assert any(symbol["name"] == "target_function" for symbol in multi_results[1]["symbols"])
     assert multi_results[2]["root_path"] == str(repo_a)
     assert multi_results[3]["root_path"] == str(repo_b)
 
@@ -1460,9 +1491,9 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     assert "search_tools" in skill_text
     assert "regular expression and returns at most 10 matches" in skill_text
     assert "a broad `.` can" in skill_text
-    assert "`entries` for file selection" in skill_text
+    assert "relative-path `entries`" in skill_text
     assert "signature" in skill_text
-    assert "name-based reference search" in skill_text
+    assert "name-based references" in skill_text
     assert "dependency graph" in skill_text
     prompt_text = text_content(prompt.messages[0].content)
     assert prompt_text.startswith("Goal: review impact")
@@ -1474,7 +1505,8 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     assert "independently copied digest" in prompt_text
     assert "focused search_tools regular expression" in prompt_text
     assert "pass lang whenever the target language is known" in prompt_text
-    assert "Legacy rewrite and scan fixes still apply every match" in prompt_text
+    assert "Legacy rewrite still applies every match" in prompt_text
+    assert "Rule fixes require a reviewed plan" in prompt_text
     assert "name-based references" in prompt_text
     assert "Fetch xray://workflow" in prompt_text
 
@@ -1496,7 +1528,7 @@ def test_impact_cli_rejects_absolute_symbol_path_outside_root(tmp_path, capsys):
     assert exit_code == 2
     result = json.loads(capsys.readouterr().err)
     assert result["ok"] is False
-    assert "outside repository root" in result["error"]
+    assert "outside repository root" in result["error"]["message"]
 
 
 def test_impact_cli_rejects_manual_symbol_without_start_line(tmp_path, capsys):
@@ -1507,7 +1539,7 @@ def test_impact_cli_rejects_manual_symbol_without_start_line(tmp_path, capsys):
     assert exit_code == 2
     result = json.loads(capsys.readouterr().err)
     assert result["ok"] is False
-    assert "Manual symbols require --start-line" in result["error"]
+    assert "Manual symbols require --start-line" in result["error"]["message"]
 
 
 def test_impact_cli_rejects_missing_symbol_source(tmp_path, capsys):
@@ -1517,7 +1549,9 @@ def test_impact_cli_rejects_missing_symbol_source(tmp_path, capsys):
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
-    assert error["error"] == "Provide exactly one symbol source: --symbol-json, --symbol-file, or --name with --path."
+    assert error["error"]["message"] == (
+        "Provide exactly one symbol source: --symbol-json, --symbol-file, or --name with --path."
+    )
 
 
 def test_impact_cli_validates_symbol_json_with_pydantic(tmp_path, capsys):
@@ -1528,13 +1562,13 @@ def test_impact_cli_validates_symbol_json_with_pydantic(tmp_path, capsys):
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
     assert error["ok"] is False
-    assert "Symbol input field 'name'" in error["error"]
+    assert "Symbol input field 'name'" in error["error"]["message"]
 
 
 def test_mcp_what_breaks_validates_symbol_input():
     result = mcp_server.what_breaks({"path": "/tmp/sample.py"})
 
-    assert result["error"].startswith("Error finding references: Symbol input field 'name'")
+    assert direct_tool_error(result)["message"].startswith("Symbol input field 'name'")
 
 
 def test_map_alias_matches_explore(tmp_path, capsys):
@@ -1553,9 +1587,9 @@ def test_explore_cli_rejects_negative_max_depth(tmp_path, capsys):
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
-    assert error["schema_version"] == "xray.cli.v1"
+    assert error["schema_version"] == "xray.cli.v2"
     assert error["ok"] is False
-    assert error["error"] == "--max-depth must be 0 or greater."
+    assert error["error"]["message"] == "--max-depth must be 0 or greater."
 
 
 def test_explore_cli_parse_error_returns_json_by_default(capsys):
@@ -1563,10 +1597,10 @@ def test_explore_cli_parse_error_returns_json_by_default(capsys):
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
-    assert error["schema_version"] == "xray.cli.v1"
+    assert error["schema_version"] == "xray.cli.v2"
     assert error["ok"] is False
     assert error["command"] == "explore"
-    assert "invalid int value" in error["error"]
+    assert "invalid int value" in error["error"]["message"]
 
 
 def test_find_cli_missing_argument_returns_json_error_by_default(capsys):
@@ -1574,10 +1608,10 @@ def test_find_cli_missing_argument_returns_json_error_by_default(capsys):
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
-    assert error["schema_version"] == "xray.cli.v1"
+    assert error["schema_version"] == "xray.cli.v2"
     assert error["ok"] is False
     assert error["command"] == "find"
-    assert "required" in error["error"]
+    assert "required" in error["error"]["message"]
 
 
 def test_find_cli_missing_argument_returns_text_error_when_requested(capsys):
@@ -1594,10 +1628,10 @@ def test_find_cli_invalid_format_returns_json_error_by_default(capsys):
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
-    assert error["schema_version"] == "xray.cli.v1"
+    assert error["schema_version"] == "xray.cli.v2"
     assert error["ok"] is False
     assert error["command"] == "find"
-    assert "invalid choice" in error["error"]
+    assert "invalid choice" in error["error"]["message"]
 
 
 def test_cli_missing_command_returns_json_error(capsys):
@@ -1605,17 +1639,17 @@ def test_cli_missing_command_returns_json_error(capsys):
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
-    assert error["schema_version"] == "xray.cli.v1"
+    assert error["schema_version"] == "xray.cli.v2"
     assert error["ok"] is False
     assert error["command"] is None
-    assert "required" in error["error"]
+    assert "required" in error["error"]["message"]
 
 
 def test_cli_version_returns_without_system_exit(capsys):
     exit_code = cli.main(["--version"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out.strip() == "xray 0.9.1"
+    assert capsys.readouterr().out.strip() == "xray 0.10.0"
 
 
 def test_cli_help_is_current_safe_and_token_bounded(capsys):
@@ -1698,8 +1732,8 @@ def test_cli_help_is_current_safe_and_token_bounded(capsys):
     assert "Page size (default: 50)" in normalized["exports"]
 
     assert all("read-only repository scans" not in value for value in normalized.values())
-    assert len(helps["root"].encode()) <= 2200
-    assert sum(len(value.encode()) for value in helps.values()) <= 16_000
+    assert len(helps["root"].encode()) <= 3200
+    assert sum(len(value.encode()) for value in helps.values()) <= 20_000
 
 
 @pytest.mark.parametrize(
@@ -1975,7 +2009,10 @@ def test_bounded_impact_classifies_definitions_imports_and_calls(tmp_path):
 
     with patch(
         "xray.core.indexer.run_ast_grep_bounded",
-        return_value=BoundedAstGrepResult(matches=matches, total_exact=False),
+        side_effect=[
+            BoundedAstGrepResult(matches=matches, total_exact=False),
+            BoundedAstGrepResult(matches=matches, total_exact=True),
+        ],
     ) as run:
         result = indexer.what_breaks(
             {"name": "work", "path": str(target), "start_line": 1, "end_line": 2}, max_results=4
@@ -1983,9 +2020,287 @@ def test_bounded_impact_classifies_definitions_imports_and_calls(tmp_path):
 
     assert [reference.get("type") for reference in result["references"]] == ["definition", "import", "call"]
     assert [reference.get("confidence") for reference in result["references"]] == ["high", "high", "high"]
-    assert result["total_exact"] is False
+    assert result["total_exact"] is True
     assert "not dependents" in result["note"]
-    assert run.call_args.args[1] == 4
+    assert [call.args[1] for call in run.call_args_list] == [4, 8]
+
+
+def test_find_symbol_defaults_are_calibrated_scoped_and_scored(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "other").mkdir()
+    (repo / "src" / "public.py").write_text("def exact_target():\n    pass\n", encoding="utf-8")
+    (repo / "other" / "private.py").write_text("def _exact_target():\n    pass\n", encoding="utf-8")
+    indexer = XRayIndexer(str(repo))
+
+    results = indexer.find_symbol("exact_target", paths=["src"], languages=["python"], symbol_types=["function"])
+
+    assert [result["path"] for result in results] == ["src/public.py"]
+    assert results[0].get("score") == 100
+    assert results[0].get("confidence") == "high"
+    assert indexer.find_symbol("utterly unrelated behavior phrase") == []
+    assert indexer.last_find_total == 0
+
+
+def test_interface_symbol_reads_and_symbol_at_are_bounded_and_contained(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = repo / "service.py"
+    source.write_text(
+        "class Service:\n"
+        "    def first(self):\n"
+        "        return 1\n"
+        "    def second(self):\n"
+        "        return 2\n"
+        "\n"
+        "def helper():\n"
+        "    return Service().first()\n",
+        encoding="utf-8",
+    )
+    indexer = XRayIndexer(str(repo))
+
+    interface = indexer.read_interface_structured("service.py", max_symbols=1, max_members=1)
+    assert interface["complete"] is False
+    assert interface["returned_symbols"] == 1
+    assert len(interface["symbols"][0]["members"]) == 1
+    assert interface["warnings"]
+
+    found = indexer.find_symbol("helper", min_score=100)[0]
+    at_line = indexer.symbol_at("service.py", int(found["start_line"]))
+    assert at_line is not None and at_line["name"] == "helper"
+    read = indexer.read_symbol(found, max_lines=1, max_bytes=12)
+    assert read["path"] == "service.py"
+    assert read["returned_lines"] <= 1
+    assert read["returned_bytes"] <= 12
+    assert read["truncated"] is True
+    with pytest.raises(ValueError, match="outside repository"):
+        indexer.read_symbol({"path": "../outside.py", "start_line": 1, "end_line": 1})
+
+
+def test_nested_map_focus_keeps_root_context_and_ancestor_chain(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src" / "pkg").mkdir(parents=True)
+    (repo / "docs").mkdir()
+    (repo / "README.md").write_text("context\n", encoding="utf-8")
+    (repo / "src" / "pkg" / "selected.py").write_text("def selected():\n    pass\n", encoding="utf-8")
+    (repo / "src" / "other.py").write_text("def other():\n    pass\n", encoding="utf-8")
+    (repo / "docs" / "guide.md").write_text("not selected\n", encoding="utf-8")
+
+    data = XRayIndexer(str(repo)).explore_repo_data(focus_dirs=["src/pkg"])
+    paths = {entry["path"] for entry in data["entries"]}
+
+    assert {".", "README.md", "src", "src/pkg", "src/pkg/selected.py"} <= paths
+    assert "src/other.py" not in paths
+    assert "docs" not in paths
+    assert data["options"]["focus_dirs"] == ["src/pkg"]
+
+
+def test_impact_reports_when_raw_safety_bound_blocks_filtered_page(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "target.py"
+    target.write_text("def work():\n    pass\n", encoding="utf-8")
+    other = repo / "other.py"
+    other.write_text("work()\n", encoding="utf-8")
+    definition = {"file": str(target), "text": "work", "lines": "def work():", "range": {"start": {"line": 0}}}
+    valid = {"file": str(other), "text": "work", "lines": "work()", "range": {"start": {"line": 0}}}
+    indexer = XRayIndexer(str(repo))
+
+    with (
+        patch("xray.core.indexer.MAX_IMPACT_RAW_RESULTS", 4),
+        patch(
+            "xray.core.indexer.run_ast_grep_bounded",
+            side_effect=[
+                BoundedAstGrepResult(matches=[definition, valid], total_exact=False),
+                BoundedAstGrepResult(matches=[definition, valid, definition, definition], total_exact=False),
+            ],
+        ),
+    ):
+        result = indexer.what_breaks(
+            {"name": "work", "path": str(target), "start_line": 1, "end_line": 2}, max_results=2
+        )
+
+    assert result["total_count"] == 1
+    assert result["total_exact"] is False
+    assert result["execution_limited"] is True
+    assert result["execution_cap"] == 4
+
+
+def test_rule_explain_and_capabilities_are_read_only_and_bounded(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "sample.py").write_text("old(1)\n", encoding="utf-8")
+    (repo / "rule.yml").write_text(
+        "id: no-old\nlanguage: Python\nrule:\n  pattern: old($A)\nseverity: warning\n",
+        encoding="utf-8",
+    )
+    indexer = XRayIndexer(str(repo))
+
+    checked = indexer.check_rules("rule.yml", max_results=10)
+    explained = indexer.explain_rules("rule.yml", source_limit=16)
+    capabilities = indexer.capabilities()
+    with patch(
+        "xray.core.indexer.run_ast_grep",
+        return_value=AstGrepResult("2 tests passed\n", "", 0),
+    ) as run:
+        tested = indexer.test_rules(test_dir=".")
+
+    assert checked["valid"] is True and checked["returned"] == 1
+    assert explained["valid"] is True
+    assert explained["source_truncated"] is True
+    assert len(explained["source"]) == 16
+    assert capabilities["replacement_plan_versions"] == ["xray.replace.v2"]
+    assert capabilities["product"]["version"]
+    assert capabilities["dependencies"]["ast_grep"]["available"] is True
+    assert capabilities["healthy"] is True
+    assert tested["ok"] is True
+    assert "--skip-snapshot-tests" in run.call_args.args[0]
+    assert "--color" in run.call_args.args[0]
+    assert run.call_args.kwargs["cwd"] == repo
+
+
+def test_cli_find_compact_scopes_scores_pages_and_preserves_full_v1(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+    (repo / "src" / "second.py").write_text("def target_helper():\n    pass\n", encoding="utf-8")
+
+    assert cli.main(["find", str(repo), "target", "--path", "src", "--language", "python", "--limit", "1"]) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["schema_version"] == "xray.cli.v2"
+    assert first["ok"] is True
+    assert first["returned"] == 1
+    assert first["total"] >= 2
+    assert first["total_exact"] is True
+    assert first["truncated"] is True
+    assert first["next_cursor"]
+    assert first["symbols"][0]["score"] >= 60
+
+    assert (
+        cli.main(
+            [
+                "find",
+                str(repo),
+                "target",
+                "--path",
+                "src",
+                "--language",
+                "python",
+                "--limit",
+                "1",
+                "--cursor",
+                first["next_cursor"],
+            ]
+        )
+        == 0
+    )
+    second = json.loads(capsys.readouterr().out)
+    assert second["symbols"][0]["qualified_name"] != first["symbols"][0]["qualified_name"]
+
+    assert cli.main(["find", str(repo), "target", "--detail", "full", "--limit", "1"]) == 0
+    full = json.loads(capsys.readouterr().out)
+    assert full["schema_version"] == "xray.cli.v1"
+
+
+def test_cli_bounded_interface_read_symbol_and_symbol_at(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+    sample = repo / "src" / "sample.py"
+
+    assert cli.main(["interface", str(repo), "src/sample.py", "--limit", "1", "--max-members", "1"]) == 0
+    interface = json.loads(capsys.readouterr().out)
+    assert interface["schema_version"] == "xray.cli.v2"
+    assert interface["interface"]["returned"] == 1
+    assert interface["interface"]["complete"] is False
+
+    assert cli.main(["find", str(repo), "target_function", "--limit", "1"]) == 0
+    symbol = json.loads(capsys.readouterr().out)["symbols"][0]
+    assert (
+        cli.main(
+            ["read-symbol", str(repo), "--symbol-json", json.dumps(symbol), "--max-lines", "1", "--max-bytes", "24"]
+        )
+        == 0
+    )
+    read = json.loads(capsys.readouterr().out)
+    assert read["command"] == "read-symbol"
+    assert read["result"]["returned_lines"] <= 1
+    assert read["result"]["returned_bytes"] <= 24
+
+    assert cli.main(["symbol-at", str(repo), "src/sample.py", str(symbol["start_line"])]) == 0
+    at = json.loads(capsys.readouterr().out)
+    assert at["found"] is True
+    assert at["symbol"]["name"] == "target_function"
+    assert sample.exists()
+
+
+def test_cli_map_defaults_all_depth_limit_alias_capabilities_and_leaf_errors(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+
+    assert cli.main(["explore", str(repo), "--limit", "2"]) == 0
+    shallow = json.loads(capsys.readouterr().out)
+    assert shallow["options"]["max_depth"] == 2
+    assert shallow["options"]["max_entries"] == 2
+    assert cli.main(["explore", str(repo), "--all-depths", "--limit", "2"]) == 0
+    unlimited = json.loads(capsys.readouterr().out)
+    assert unlimited["options"]["max_depth"] is None
+
+    assert cli.main(["capabilities"]) == 0
+    capabilities = json.loads(capsys.readouterr().out)
+    assert capabilities["command"] == "capabilities"
+    assert "repository" not in capabilities["capabilities"]
+    assert cli.main(["doctor", str(repo)]) == 0
+    doctor = json.loads(capsys.readouterr().out)
+    assert doctor["invoked_as"] == "doctor"
+    assert doctor["capabilities"]["repository"]["root_path"] == str(repo)
+
+    assert cli.main(["replace", "plan", str(repo)]) == 2
+    error = json.loads(capsys.readouterr().err)
+    assert error["schema_version"] == "xray.cli.v2"
+    assert error["command"] == "replace.plan"
+    assert error["error"]["code"] == "invalid_request"
+
+
+def test_cli_rules_and_replacement_refinement_are_non_mutating(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+    rule = repo / "rule.yml"
+    rule.write_text(
+        "id: no-old\nlanguage: Python\nrule:\n  pattern: target_function($A)\nseverity: warning\n",
+        encoding="utf-8",
+    )
+    original = (repo / "src" / "sample.py").read_bytes()
+
+    assert cli.main(["rules", "check", str(repo), "--rule", "rule.yml", "--limit", "5"]) == 0
+    checked = json.loads(capsys.readouterr().out)
+    assert checked["command"] == "rules.check"
+    assert checked["result"]["valid"] is True
+    assert cli.main(["rules", "explain", str(repo), "--rule", "rule.yml", "--source-limit", "8"]) == 0
+    explained = json.loads(capsys.readouterr().out)
+    assert explained["command"] == "rules.explain"
+    assert explained["result"]["source_truncated"] is True
+    assert (repo / "src" / "sample.py").read_bytes() == original
+
+    assert (
+        cli.main(
+            [
+                "replace",
+                "plan",
+                str(repo),
+                "--pattern",
+                "target_function($A)",
+                "--replacement",
+                "renamed($A)",
+                "--lang",
+                "python",
+            ]
+        )
+        == 0
+    )
+    plan_envelope = json.loads(capsys.readouterr().out)
+    plan_path = repo / "plan.json"
+    plan_path.write_text(json.dumps(plan_envelope), encoding="utf-8")
+    edit_id = plan_envelope["plan"]["files"][0]["edits"][0]["edit_id"]
+    assert cli.main(["replace", "refine", str(repo), "--plan-file", str(plan_path), "--edit-id", edit_id]) == 0
+    refined = json.loads(capsys.readouterr().out)
+    assert refined["command"] == "replace.refine"
+    assert refined["plan"]["query"]["selected_edit_ids"] == [edit_id]
+    assert (repo / "src" / "sample.py").read_bytes() == original
 
 
 @pytest.mark.parametrize("with_git_directory", [False, True])
@@ -2062,13 +2377,16 @@ def test_explore_text_reports_truncated_output(tmp_path, capsys):
 def test_mcp_explore_result_reports_truncated_output(tmp_path):
     repo = write_sample_repo(tmp_path)
 
-    result = mcp_server.build_explore_result(
-        XRayIndexer(str(repo)),
-        max_depth=None,
-        include_symbols=False,
-        focus_dirs=None,
-        max_symbols_per_file=5,
-        max_entries=2,
+    result = cast(
+        dict[str, Any],
+        mcp_server.build_explore_result(
+            XRayIndexer(str(repo)),
+            max_depth=None,
+            include_symbols=False,
+            focus_dirs=None,
+            max_symbols_per_file=5,
+            max_entries=2,
+        ),
     )
 
     assert len(result["entries"]) == 2
@@ -2083,7 +2401,7 @@ def test_explore_cli_rejects_nonpositive_max_entries(tmp_path, capsys):
     exit_code = cli.main(["explore", str(repo), "--max-entries", "0"])
 
     assert exit_code == 2
-    assert json.loads(capsys.readouterr().err)["error"] == "--max-entries must be 1 or greater."
+    assert json.loads(capsys.readouterr().err)["error"]["message"] == "--max-entries must be 1 or greater."
 
 
 def test_map_json_uses_explore_command_with_invoked_alias(tmp_path, capsys):

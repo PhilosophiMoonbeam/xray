@@ -152,7 +152,7 @@ def test_structural_cli_commands_emit_standard_envelopes(
 
     output = json.loads(capsys.readouterr().out)
     assert output["schema_version"] == "xray.cli.v2"
-    assert "ok" not in output
+    assert output["ok"] is True
     assert output["command"] == command
     assert payload_key in output
 
@@ -321,7 +321,7 @@ def test_cursor_is_query_bound_and_scan_fix_rejects_cursor_before_mutation(tmp_p
     with patch.object(XRayIndexer, "search_pattern") as search:
         assert cli.main(["search", str(repo), "-p", "other($A)", "--cursor", cursor]) == 2
     search.assert_not_called()
-    assert "does not match" in json.loads(capsys.readouterr().err)["error"]
+    assert "does not match" in json.loads(capsys.readouterr().err)["error"]["message"]
 
     with patch.object(XRayIndexer, "scan_rules") as scan:
         assert cli.main(["scan", str(repo), "--rule", "rule.yml", "--fix", "--cursor", cursor]) == 2
@@ -402,13 +402,17 @@ def test_replacement_plan_is_non_mutating_and_guarded_apply_changes_exact_bytes(
     plan = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
 
     assert sample.read_bytes() == original
-    assert plan["plan_version"] == "xray.replace.v1"
+    assert plan["plan_version"] == "xray.replace.v2"
     assert plan["candidate_count"] == 1
     assert plan["changed_candidate_count"] == 1
     assert plan["no_op_count"] == 0
     assert plan["changed_file_count"] == 1
     assert plan["preview"][0]["before"] == "old(1)"
     assert plan["preview"][0]["after"] == "new(1)"
+    assert plan["review_complete"] is True
+    assert plan["applicable"] is True
+    assert plan["files"][0]["edits"][0]["edit_id"] == plan["preview"][0]["edit_id"]
+    assert "--- a/sample.py" in plan["diff"]
 
     result = indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
 
@@ -440,6 +444,91 @@ def test_replacement_apply_rejects_digest_mismatch_and_source_drift(tmp_path: Pa
     with pytest.raises(ReplacementApplyError, match="no longer matches"):
         indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
     assert sample.read_bytes() == drifted
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("warnings", ["tampered"]),
+        ("preview", []),
+        ("diff", "tampered"),
+        ("review_complete", False),
+        ("applicable", False),
+        ("applicability_reason", "tampered"),
+    ],
+)
+def test_replacement_v2_digest_binds_every_review_field(tmp_path: Path, field: str, value: object) -> None:
+    repo = make_repo(tmp_path)
+    indexer = XRayIndexer(str(repo))
+    plan = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
+    tampered = json.loads(json.dumps(plan))
+    tampered[field] = value
+
+    with pytest.raises(ValueError, match="complete review artifact"):
+        indexer.apply_replacement(tampered, expected_digest=plan["plan_digest"])
+
+
+def test_replacement_rejects_v1_and_requires_truncated_review_acknowledgement(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    indexer = XRayIndexer(str(repo))
+    plan = indexer.plan_replacement(
+        pattern="old($A)", replacement="new($A)", lang="python", preview_limit=0, diff_limit=1
+    )
+
+    assert plan["preview_truncated"] is True
+    assert plan["diff_truncated"] is True
+    assert plan["review_complete"] is False
+    assert plan["applicable"] is False
+    with pytest.raises(ValueError, match="truncated_review_not_acknowledged"):
+        indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
+
+    acknowledged = indexer.plan_replacement(
+        pattern="old($A)",
+        replacement="new($A)",
+        lang="python",
+        preview_limit=0,
+        diff_limit=1,
+        allow_truncated_review=True,
+    )
+    assert acknowledged["review_complete"] is True
+    assert acknowledged["applicable"] is True
+
+    legacy = dict(acknowledged, plan_version="xray.replace.v1")
+    with pytest.raises(ValueError, match="cannot attest review fields"):
+        indexer.apply_replacement(legacy, expected_digest=acknowledged["plan_digest"])
+
+
+def test_replacement_diff_and_edit_ids_are_deterministic_and_refinable(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    (repo / "second.py").write_text("def second():\n    return old(2)\n", encoding="utf-8")
+    indexer = XRayIndexer(str(repo))
+
+    first = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
+    second = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
+    assert first["diff"] == second["diff"]
+    assert [edit["edit_id"] for file in first["files"] for edit in file["edits"]] == [
+        edit["edit_id"] for file in second["files"] for edit in file["edits"]
+    ]
+
+    selected_id = first["files"][0]["edits"][0]["edit_id"]
+    refined = indexer.refine_replacement(first, edit_ids=[selected_id])
+    assert refined["candidate_count"] == 1
+    assert refined["query"]["selected_edit_ids"] == [selected_id]
+    assert [file["path"] for file in refined["files"]] == [first["files"][0]["path"]]
+    result = indexer.apply_replacement(refined, expected_digest=refined["plan_digest"])
+    assert result["changed_count"] == 1
+
+
+def test_replacement_zero_candidate_plan_is_not_applicable(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    indexer = XRayIndexer(str(repo))
+    plan = indexer.plan_replacement(pattern="missing($A)", replacement="new($A)", lang="python")
+
+    assert plan["candidate_count"] == 0
+    assert plan["applicable"] is False
+    assert plan["applicability_reason"] == "no_candidates"
+    with pytest.raises(ValueError, match="no_candidates"):
+        indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
 
 
 def test_replacement_noop_is_truthful_and_requires_explicit_allowance(tmp_path: Path) -> None:
@@ -664,7 +753,7 @@ def test_replace_cli_apply_rejects_independent_digest_without_mutation(tmp_path:
         == 2
     )
     error = json.loads(capsys.readouterr().err)
-    assert "expected_digest" in error["error"]
+    assert "expected_digest" in error["error"]["message"]
     assert sample.read_bytes() == original
 
 
@@ -696,7 +785,7 @@ def test_search_cursor_rejects_changed_source_snapshot(tmp_path: Path, capsys) -
         )
         == 2
     )
-    assert "does not match" in json.loads(capsys.readouterr().err)["error"]
+    assert "does not match" in json.loads(capsys.readouterr().err)["error"]["message"]
 
 
 def test_cursor_snapshot_ignores_generated_and_gitignored_content(tmp_path: Path) -> None:

@@ -1,33 +1,57 @@
 # XRAY Progressive Discovery
 
-Use this skill when an MCP client needs to inspect a repository with XRAY while keeping context small.
+Use this skill to inspect and safely change a repository through XRAY MCP while
+keeping context small.
 
-## Workflow
+## Discover
 
 `search_tools` accepts a regular expression and returns at most 10 matches. Use
-a focused literal or alternation such as `interface|signature`; a broad `.` can
-hide later tools. Call one result through `call_tool` with its exact name and
-arguments.
+a focused intent such as `lookup`, `blast radius`, `interface|signature`,
+`safe code replacement`, `help`, or `workflow`; a broad `.` can hide later
+tools. Execute one result through `call_tool` with its exact name and arguments.
 
-1. Map with `search_tools` using terms like `map`, then call `call_tool` with `name="explore_repo"`; use `entries` for file selection.
-2. Find symbols with `search_tools` using terms like `symbol`, `function`, `class`, or `find`, then call `call_tool` with `name="find_symbol"`.
-3. Read source contracts with `search_tools` using terms like `interface`, `signature`, `contract`, or `documentation`. Prefer `read_interface_structured` for typed hierarchy, documentation, visibility, and completeness; use `read_interface` for legacy text.
-4. Assess likely symbol-name code references with `search_tools` using terms like `impact`, `usage`, or `reference`, then call `call_tool` with `name="what_breaks"` and pass the full symbol object returned from `find_symbol`.
+1. Map with `explore_repo`. Compact relative-path `entries` default to depth 2.
+   Use contained nested `focus_dirs`; set `all_depths=true` only explicitly.
+2. Locate definitions with `find_symbol`. It matches names and owner-qualified
+   identities, not behavior. The default score threshold is 60 and the page is
+   10; preserve the full scored symbol object.
+3. Inspect contracts with bounded `read_interface_structured`, exact source with
+   `read_symbol`, or a location with `symbol_at`. `read_interface` is legacy text.
+4. Estimate blast radius with `what_breaks` and the full find symbol. Results
+   are name-based references, not a type-aware caller or dependency graph.
 
-## Guidance
+`xray_capabilities` reports help, workflow resources, schemas, operations,
+bounds, dependency versions, health, and optional repository checks.
 
-- Start with absolute repository paths.
-- Compact `explore_repo` entries are the default. Request `detail="full"` only when `tree_text` is needed for visual scanning.
-- Keep `include_symbols` false for an initial map; enable it only when zooming into a focused directory.
-- Python interfaces use enriched standard-library AST data. Other supported languages use ast-grep outlines and report completeness warnings.
-- When a symbol map is noisy, pass `symbol_types` to `explore_repo` (for example `["class", "interface"]`) to keep only those top-level outline types.
-- Preserve full symbol objects so impact analysis has path and line data.
-- Treat `what_breaks` as a name-based reference search, not a type-aware caller, dependent, or dependency graph.
-- Use `search_pattern` for arbitrary AST-aware queries. Compact matches retain useful captured metavariables without raw range trees.
-- Structural reads return at most 50 items by default. Check `returned`, `total`, `total_exact`, and `truncated`; `total_exact=false` means a lower bound. Pass `next_cursor` back only for the identical root/query/scopes and unchanged source snapshot.
-- Use `file_imports` and `file_exports` for compact, flattened immediate dependencies and public APIs.
-- Use `detail="full"` only when raw ast-grep matches or outline wrappers are necessary.
-- Use `scan_rules` to verify YAML-defined invariants. Set `fix=true` only when file mutation is intended; fixes apply to every match and do not support continuation afterward.
-- For structural mutation, call read-only `plan_replacement`, review all preview edits, counts, paths, warnings, hashes, and `plan_digest`, then call destructive `apply_replacement` with the complete plan and an independently copied reviewed digest. Apply rejects drift before writing and rolls back already replaced files after a later failure. Pass `lang` whenever the pattern language is known.
-- Keep `rewrite_pattern` only for explicit legacy all-match replacement. It is destructive and does not require plan confirmation. Pass `lang` whenever known so pattern-like configuration or documentation text is not also rewritten.
-- Fetch `xray://workflow` for a longer reference when a client needs detailed examples.
+## Page and validate
+
+- Read results expose `returned`, `total`, `total_exact`, `truncated`, and
+  `next_cursor`. A false `total_exact` means a lower bound. Reuse a cursor only
+  with identical arguments and unchanged source. Impact paging stays under
+  `.impact` only in the CLI; MCP returns its result fields directly.
+- Narrow find with `paths`, `languages`, `symbol_types`, or `visibility`.
+  Request `min_score=0` only to inspect low-confidence candidates.
+- Use `search_pattern`, `file_imports`, and `file_exports` for bounded structural
+  matches and outlines. Request `detail="full"` only for raw ast-grep metadata.
+- Protocol failures set `isError=true` and return structured
+  `error: {code, message, details?}` values; do not treat them as empty results.
+- Paths, rules, files, and symbols must remain inside the supplied root.
+
+## Rules and mutation
+
+YAML is ast-grep rule/test input, never XRAY output. `scan_rules`, `check_rules`,
+`explain_rules`, and `test_rules` are read-only. Tests never update snapshots or
+start interactive review. For fixes, create a rule plan with `plan_replacement`,
+review it, then call destructive `apply_rule_fixes` with the full plan and an
+independently copied digest.
+
+For pattern changes, call `plan_replacement`, review every manifest `edit_id`,
+preview, deterministic diff, warning, hash, bound, applicability value, and
+`plan_digest`, optionally select edits with `refine_replacement`, then call
+`apply_replacement`. Plans are `xray.replace.v2`; their digest binds the complete
+review artifact. Truncated review requires recorded acknowledgement. Zero-match
+plans cannot apply, v1 plans are rejected, and apply rejects tampering or drift
+before staged writes and rolls back partial replacement. Pass `lang` when known.
+
+Keep `rewrite_pattern` only for explicit legacy all-match mutation. Its limit
+does not bound edits. Fetch `xray://workflow` for longer examples.

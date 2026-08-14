@@ -34,11 +34,178 @@ skills, reports, tests, or harness. Presentation and public models may describe
 core values but do not perform repository analysis. Distribution and guidance
 wrap the adapters without becoming runtime dependencies of them.
 
-## Current xray-cs4 product contract
+## Frozen xray-s3b design
 
-This section records the integrated public and engine behavior introduced by
-`xray-cs4`. The current-behavior sections below refine its component and
-compatibility placement.
+This section is the implemented XRAY 0.10.0 candidate contract and is
+authoritative for current product behavior. Final qualification remains tracked
+by `xray-s3b.6`. The contract changes agent defaults only through the versioned
+migration below.
+
+### Compatibility
+
+XRAY 0.10.0 retains Python 3.10+, JSON-first output, `jq` symbol handoffs,
+`xray.cli.v2` compact envelopes, explicit full/v1 output, the `map` alias, exit
+classes, stdio MCP, search-first MCP exposure, packaged resources and skills,
+repository containment, snapshot-bound cursors, staged rollback, legacy
+`rewrite`, and CLI `scan --fix`.
+
+The migration changes these compact agent surfaces:
+
+- `find` defaults to compact v2 with calibrated filtering and retains its v1
+  envelope through `--detail full`;
+- `explore` defaults to depth two and requires `--all-depths` for an unbounded
+  depth request;
+- MCP `scan_rules` becomes read-only; guarded rule application moves to
+  `apply_rule_fixes`; and
+- replacement application rejects `xray.replace.v1` plans with an instruction
+  to re-plan because v1 cannot attest its review fields.
+
+YAML remains ast-grep rule and test input. XRAY does not add YAML output, a
+language server, type-aware dependency analysis, automatic commits, or durable
+product plan storage.
+
+### Replacement review contract
+
+`xray.replace.v2` binds the complete review artifact. `plan_digest` is SHA-256
+over canonical JSON for every plan field except `plan_digest` itself. The
+covered values include query and scope identity, bounds, file hashes, edit
+manifest, selection, preview, deterministic unified diff, truncation metadata,
+warnings, applicability, review completeness, and explicit acknowledgements.
+
+Each candidate has an `edit_id` derived from its contained relative path,
+preimage hash, byte range, before hash, and after hash. The plan contains a
+compact manifest for every edit. Preview and unified diff content remain
+bounded. If either is truncated, `review_complete` and `applicable` are false
+unless `allow_truncated_review` was explicitly requested and recorded before
+the digest was calculated.
+
+Zero-candidate plans are not applicable. All-no-op plans require recorded
+`allow_noop`. A plan reports the exact reason when it is not applicable.
+
+`replace refine` accepts a complete v2 plan and repeated edit IDs. It recomputes
+the original candidate set, validates every ID, and emits a new v2 plan whose
+query records the selection. It does not write files. Apply recomputes the plan
+with the bound query, bounds, selection, and review limits, compares the entire
+canonical artifact and digest, validates source state, then uses the established
+staged writer. CLI and MCP application remain stateless and require the full
+plan plus an independently supplied digest.
+
+### Symbol discovery and bounded source reads
+
+Compact CLI `find` and MCP `find_symbol` default to `min_score: 60` and a
+ten-result page. They always include scores and accept repeated contained path,
+language, symbol-type, and visibility filters. Results expose `returned`,
+`total`, `total_exact`, `truncated`, and `next_cursor`. The cursor binds every
+filter and the supported-source snapshot. Descriptions promise name and
+qualified-identity matching, not semantic or behavior search. Explicit
+`--min-score 0` and CLI `--detail full` preserve low-confidence and v1 access.
+
+Compact interface reads accept symbol-name, visibility, type, member-depth,
+member-count, page-limit, and cursor controls. Defaults bound top-level symbols
+and members. Truncation sets `complete: false` and adds an exact warning. Full/v1
+keeps the established unbounded legacy string projection.
+
+CLI `read-symbol` and MCP `read_symbol` accept a full contained symbol plus
+context, line, and byte bounds. They return the exact source slice with path,
+one-based range, returned line and byte counts, and truncation metadata. CLI
+`symbol-at` and MCP `symbol_at` accept a contained path and one-based line and
+return the narrowest enclosing inventory symbol. They return an explicit empty
+result when no supported symbol contains the line.
+
+### Impact continuation
+
+Impact execution collects enough post-filter references to satisfy the
+requested filtered offset and page plus one, or until upstream completion. It
+may grow the raw ast-grep cap only to a named safety bound. Early definitions,
+duplicates, unsupported paths, and inexact matches cannot suppress a cursor for
+later valid references.
+
+When the raw safety bound prevents exactness, the response reports
+`execution_limited: true`, retains `total_exact: false`, and emits a warning. It
+does not claim that omitted results are available through a cursor it cannot
+honor.
+
+### Repository mapping
+
+Compact CLI and MCP maps default to `max_depth: 2`. CLI `--all-depths` and MCP
+`all_depths: true` explicitly select unlimited depth. CLI `--limit` aliases
+`--max-entries` without changing the compact field name.
+
+Each focus value is a contained repository-relative file or directory path.
+Nested focus retains the root entry, root-level context files, and the ancestor
+directory chain, then traverses only selected descendant subtrees. Parent
+traversal, absolute outside-root paths, and symlink escapes fail before
+traversal. Full/v1 output uses the same selection semantics.
+
+### Errors and MCP annotations
+
+Compact CLI failures use `xray.cli.v2`, `ok: false`, the exact leaf command,
+`error: {code, message, details?}`, and warnings. Explicit full/v1 output keeps
+the legacy string error contract where compatibility requires it.
+
+MCP tools return FastMCP error results with `isError: true`, JSON text content,
+and the same structured error object. Adapter boundaries translate typed domain
+failures to stable codes and unexpected failures to `internal_error`; neither
+surface emits tracebacks.
+
+MCP `scan_rules` accepts no mutation argument and has read-only annotations.
+`apply_rule_fixes` has destructive annotations and accepts only a reviewed v2
+rule plan plus its expected digest. CLI `scan --fix` remains an explicitly
+legacy all-match mutation.
+
+### Capabilities and rule tooling
+
+CLI `capabilities [ROOT]`, its `doctor` alias, and MCP `xray_capabilities`
+report product version, supported schemas and plan versions, operations with
+mutation classes, language-extension support, effective bounds and timeouts,
+cache behavior, required ast-grep availability and version, optional Git and
+ripgrep availability, and workflow resource identifiers. Repository-dependent
+checks are omitted when no root is supplied. Missing required dependencies make
+doctor unhealthy without making capabilities undiscoverable.
+
+MCP searchable descriptions include the natural intents `lookup`, `blast
+radius`, `callers`, `rename`, `safe code replacement`, `help`, and `workflow`.
+Regex discovery remains bounded and initially exposes only `search_tools` and
+`call_tool`.
+
+CLI `rules check`, `rules explain`, and `rules test`, plus corresponding MCP
+tools, are read-only:
+
+- check runs contained ast-grep scan diagnostics without fixes;
+- explain returns bounded contained rule source, validation evidence, and
+  upstream `--inspect=summary` output without parsing or reimplementing YAML;
+  and
+- test runs contained project tests with `ast-grep test`,
+  `--skip-snapshot-tests`, disabled color, and bounded output.
+
+Rule tooling never starts interactive sessions, updates snapshots, or applies
+fixes.
+
+### Verification matrix
+
+Focused evidence covers:
+
+- field-by-field plan tampering, v1 rejection, truncated-review
+  acknowledgement, deterministic diffs, stable edit selection, zero/no-op
+  plans, drift, staged writes, and rollback;
+- scoped, calibrated, paged, empty, and nonsense symbol queries;
+- protocol `isError`, typed CLI errors, leaf commands, natural-intent search,
+  tool annotations, resources, prompts, and skills;
+- bounded interfaces, symbol source reads, line lookup, containment, and
+  truncation;
+- filtered-prefix impact continuation and raw-cap exhaustion;
+- nested focus, shallow defaults, explicit all-depth maps, and the limit alias;
+- healthy and degraded capabilities plus contained rule check, explain, and
+  test behavior; and
+- compact/full compatibility, package data, installed guidance, every
+  canonical gate, and live CLI/MCP smoke against one unchanged artifact.
+
+## Historical xray-cs4 product contract
+
+This section preserves the XRAY 0.9.1 baseline introduced by `xray-cs4` as
+transformation evidence. It is superseded by the XRAY 0.10.0 contract above
+and does not define current behavior. Later component, compatibility, and
+verification descriptions in this historical section describe that baseline.
 
 ### Safe replacement
 

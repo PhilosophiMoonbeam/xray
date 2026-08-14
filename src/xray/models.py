@@ -178,6 +178,8 @@ class ImpactResult(PublicModel):
     note: str
     total_exact: bool = True
     degradation_reason: str | None = None
+    execution_limited: bool = False
+    execution_cap: int | None = None
 
 
 class ImpactEnvelope(PublicModel):
@@ -193,13 +195,21 @@ class ImpactEnvelope(PublicModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class ErrorDetail(PublicModel):
+    """Stable machine-readable error value for compact v2 adapters."""
+
+    code: str
+    message: str
+    details: dict[str, Any] | None = None
+
+
 class ErrorEnvelope(PublicModel):
     """CLI JSON envelope for parse and validation errors."""
 
     schema_version: str
     ok: bool = False
     command: str | None = None
-    error: str
+    error: str | ErrorDetail
     warnings: list[str] = Field(default_factory=list)
 
 

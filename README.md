@@ -22,7 +22,7 @@ documents do not change the product behavior described below.
 Progressive discovery starts with four operations:
 
 - **Map** (`xray explore`, `xray map`, `explore_repo`) - show repository structure with optional symbol skeletons.
-- **Find** (`xray find`, `find_symbol`) - locate functions, classes, methods, interfaces, types, enums, and common JS/TS/Go definitions by fuzzy name.
+- **Find** (`xray find`, `find_symbol`) - locate definitions by calibrated name or owner-qualified identity.
 - **Interface** (`xray interface`, `read_interface`) - read signatures, types, and public members without implementation bodies.
 - **Impact** (`xray impact`, `what_breaks`) - find likely references to a symbol name.
 
@@ -127,19 +127,22 @@ operation; JSON output records `command: "explore"` and `invoked_as: "map"` when
 the alias is used.
 
 ```bash
-xray explore ROOT [--max-depth N] [--include-symbols | --symbols] \
-  [--focus DIR]... [--max-symbols-per-file N] [--type TYPE[,TYPE...]] [--max-entries N] \
+xray explore ROOT [--max-depth N | --all-depths] [--include-symbols | --symbols] \
+  [--focus PATH]... [--max-symbols-per-file N] [--type TYPE[,TYPE...]] [--max-entries N | --limit N] \
   [--no-default-exclusions] \
   [--detail compact|full] [--format json|text] [--pretty]
 ```
 
 Important options:
 
-- `--max-depth N` limits directory traversal and must be zero or greater.
+- Maps default to depth two. `--max-depth N` changes that bound;
+  `--all-depths` explicitly removes it.
 - `--include-symbols` and `--symbols` include compact file skeletons.
-- `--focus DIR` can be repeated to keep output centered on selected top-level directories; root-level files remain visible for repository context.
+- `--focus PATH` accepts contained nested files or directories. Focus retains
+  root-level context files and the complete ancestor chain, then traverses only
+  selected descendant subtrees.
 - `--max-symbols-per-file N` limits skeleton detail per file and must be zero or greater.
-- `--max-entries N` bounds files and directories in the map (default: 5000) and must be at least one.
+- `--max-entries N` and its `--limit N` alias bound map entries (default: 5000).
 - Compact JSON is the default and returns structured `entries` without duplicated `tree_text`, absolute paths, names derivable from paths, or empty envelope fields.
 - `--detail full` preserves the v1 JSON tree and entry payload.
 - `--format text` returns the compact lossy tree view.
@@ -164,7 +167,9 @@ across Python, JavaScript/TypeScript, and Go.
 ### `xray find`
 
 ```bash
-xray find ROOT QUERY [--limit N] [--min-score 0-100] [--format json|text] [--pretty]
+xray find ROOT QUERY [--limit N] [--cursor TOKEN] [--min-score 0-100] \
+  [--path PATH]... [--language LANG]... [--type TYPE]... \
+  [--visibility public|private|unknown]... [--detail compact|full]
 ```
 
 JSON is the default because symbol objects are usually piped into impact
@@ -173,13 +178,17 @@ analysis. JSON symbols include `name`, repository-relative `path`, absolute
 `owner`, `language`, `match_reason`, and `confidence`. One expanded ast-grep
 outline supplies a snapshot-cached inventory; dirty source changes invalidate it.
 
-`--limit` must be zero or greater. `--min-score` must be between 0 and 100; use
-60 or higher when an agent should suppress weak fuzzy matches.
+Compact v2 is the default, with scores, a 10-result page, and `min_score: 60`.
+Filters run before paging and every filter is cursor-bound. Use `--min-score 0`
+only to inspect calibrated low-confidence candidates. `--detail full` preserves
+the v1 envelope. Find promises name identity matching, not semantic behavior search.
 
 ### `xray interface`
 
 ```bash
-xray interface ROOT FILE_PATH [--detail compact|full] [--format json|text] [--pretty]
+xray interface ROOT FILE_PATH [--name NAME]... [--type TYPE]... \
+  [--visibility VISIBILITY]... [--member-depth N] [--max-members N] \
+  [--limit N] [--cursor TOKEN] [--detail compact|full]
 ```
 
 `FILE_PATH` may be absolute or relative to `ROOT`, but it must resolve inside the
@@ -189,6 +198,10 @@ symbols, direct members, signatures, one-based ranges, visibility, role,
 documentation, `complete`, and warnings. `--detail full` preserves the legacy v1
 string envelope. Typed compact errors distinguish missing, unsupported,
 containment, parse, upstream, and size failures.
+
+Use `xray read-symbol ROOT` with the same symbol JSON/file/manual inputs as
+impact to return a bounded exact source slice. `xray symbol-at ROOT FILE LINE`
+returns the narrowest enclosing symbol or an explicit `found: false` result.
 
 ### `xray impact`
 
@@ -224,6 +237,9 @@ Other same-name definitions are classified rather than described as dependents.
 xray search ROOT -p 'old_api($ARG)' [-l python]
 xray rewrite ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' -l python
 xray scan ROOT --rule sgconfig.yml [--fix]
+xray rules check ROOT --rule rule.yml
+xray rules explain ROOT --rule rule.yml
+xray rules test ROOT --test-dir rule-tests [--config sgconfig.yml]
 xray imports ROOT src/package/module.py
 xray exports ROOT src/package/module.py
 ```
@@ -251,6 +267,12 @@ counts. `scan` runs a rule configuration inside `ROOT`; `--fix` applies configur
 fixes without prompting. Import/export paths are confined to `ROOT` and use
 ast-grep outline for file dependency and public-API inspection.
 
+The `rules check`, `rules explain`, and `rules test` family is read-only.
+Explain returns bounded rule source, validation evidence, and ast-grep inspection
+without parsing YAML into an XRAY format. Test disables snapshot updates, color,
+and interactive review. Legacy CLI `scan --fix` remains the explicit all-match
+rule mutation path.
+
 Compact `rewrite` output omits pre-rewrite matches and reports only counts and
 modified paths. Use `--detail full` when the match payload is required.
 
@@ -270,14 +292,19 @@ xray replace plan ROOT \
   --pattern 'old_api($ARG)' --replacement 'new_api($ARG)' --lang python \
   --path src --glob '*.py' > plan.json
 
-# Review .plan.preview, counts, paths, warnings, pre/post hashes, and .plan.plan_digest.
-xray replace apply ROOT --plan-file plan.json --expected-digest REVIEWED_DIGEST
+# Review every edit_id, preview, diff, warning, bound, applicability value, hash, and digest.
+xray replace refine ROOT --plan-file plan.json --edit-id EDIT_ID > refined.json
+xray replace apply ROOT --plan-file refined.json --expected-digest REVIEWED_DIGEST
 ```
 
 Planning is non-mutating and defaults to at most 1000 candidates, 100 affected
-files, and 50 preview edits. A plan records the exact query/scopes, candidate and
-no-op counts, source/postimage hashes, root fingerprint, warnings, and semantic
-digest. Applying requires the complete plan plus an independently copied reviewed
+files, 50 preview edits, and a bounded deterministic unified diff. An
+`xray.replace.v2` plan records every stable edit ID, exact query/selection,
+source/postimage hashes, warnings, applicability, and complete-artifact digest.
+Preview or diff truncation makes a plan inapplicable unless explicit
+`--allow-truncated-review` acknowledgement is recorded. Zero-candidate plans
+are inapplicable and all-no-op plans require `--allow-noop`. Applying rejects
+v1 plans and requires the complete plan plus an independently copied reviewed
 digest. XRAY recomputes the candidate set and rejects root, query, count, digest,
 or source drift before writing. It prepares same-directory staged files, preserves
 file modes, verifies postimages, and restores already replaced files if a later
@@ -287,15 +314,12 @@ operation.
 
 ## JSON Output
 
-Compact explore, interface, impact, replacement, and structural output use the sparse `schema_version:
-"xray.cli.v2"` contract. `--detail full` preserves the verbose v1 envelope for
-compatibility where supported. Find and legacy full interface/impact remain v1. JSON is one line by
-default for token efficiency. Pass `--pretty` for indented JSON,
-or `--format text` for lossy human-readable scans. Compact v2 responses retain
-`schema_version` and `command`, but omit `ok: true`, empty warnings, repeated root
-paths, and echoed query fields. JSON errors use `ok: false`, `error`, and
-`warnings`. Parse and validation errors are JSON unless the caller explicitly
-requested `--format text`.
+Compact output uses `schema_version: "xray.cli.v2"`. `--detail full` preserves
+v1 where supported, including find and the legacy interface/impact projections.
+JSON is one line unless `--pretty` is requested; text is deliberately lossy.
+Compact successes include `ok: true`. Compact failures include the exact leaf
+command and `error: {code, message, details?}` with `ok: false`; full/v1 keeps
+legacy string errors where compatibility requires them.
 
 Exit codes are `0` for success, `1` for command failure, and `2` for parse or
 validation errors.
@@ -303,10 +327,11 @@ validation errors.
 Command-specific fields:
 
 - compact `explore`: `invoked_as`, `root_path`, `entries`, `options`, `truncated`, and warnings only when present.
-- `find`: `query`, `limit`, `min_score`, `symbols`, `error`, `warnings`.
+- compact `find`: filtered scored `symbols` plus exact paging metadata; full preserves v1.
 - compact `interface`: typed hierarchical `interface` with completeness/warnings; full v1 preserves the string projection.
 - compact `impact`: `symbol` plus classified relative-path references, strategy/degradation, counts, and exact paging metadata.
-- `replace.plan`: the complete applicable `xray.replace.v1` plan; `replace.apply`: truthful changed/no-op/file and rollback evidence.
+- `replace.plan` / `replace.refine`: complete `xray.replace.v2` review artifacts;
+  `replace.apply`: truthful changed/no-op/file and rollback evidence.
 - compact `search` / `scan`: projected `matches` and page metadata.
 - compact `rewrite`: `match_count`, `files_modified`, and `file_count`.
 - compact `imports` / `exports`: projected `items` and page metadata.
@@ -315,13 +340,13 @@ Example:
 
 ```json
 {
-  "schema_version": "xray.cli.v1",
+  "schema_version": "xray.cli.v2",
   "ok": true,
   "command": "find",
   "root_path": "/repo",
   "query": "target",
   "limit": 3,
-  "min_score": 0,
+  "min_score": 60,
   "symbols": [
     {
       "name": "target_function",
@@ -333,10 +358,19 @@ Example:
       "score": 100
     }
   ],
-  "error": null,
+  "returned": 1,
+  "total": 1,
+  "total_exact": true,
+  "truncated": false,
   "warnings": []
 }
 ```
+
+Impact keeps its page metadata under `.impact`; other compact paged commands
+place it at the command result level. `xray capabilities [ROOT]` and its
+`doctor` alias report version, schemas, plan versions, mutation classes,
+language support, bounds, timeouts, cache behavior, dependencies, health, and
+workflow resources. Repository checks appear only when `ROOT` is supplied.
 
 ## MCP Usage
 
@@ -347,9 +381,8 @@ with a `{name, arguments}` payload.
 
 `search_tools` accepts a regular expression and returns at most 10 matches. Use
 a focused literal or alternation such as `interface|signature`; a broad `.` can
-hide later operations. Descriptions contain common phrases such as `find symbol`,
-`structural search`, `replacement plan`, `apply replacement`, and `scan rules`
-so focused discovery does not require knowing Python function names.
+hide later operations. Natural intents include `lookup`, `blast radius`,
+`callers`, `rename`, `safe code replacement`, `help`, and `workflow`.
 
 ```json
 {
@@ -365,17 +398,26 @@ so focused discovery does not require knowing Python function names.
 
 The transformed MCP surface exposes compact metadata and tags for:
 
-- `explore_repo`: bounded compact map with relative-path `entries`, `options`, `truncated`, warnings when present, and optional symbol skeletons. Pass `detail: "full"` only when `tree_text` and absolute paths are needed. `symbol_types` filters top-level outline types, and `max_entries` overrides the 5000-entry default.
-- `find_symbol`: find code symbols by fuzzy name or behavior phrase.
+- `explore_repo`: depth-two compact map with nested focus; `all_depths: true`
+  explicitly removes the depth bound.
+- `find_symbol`: calibrated name/qualified-identity filters, scores, and paging.
 - `read_interface`: read a text file interface without implementation bodies.
-- `read_interface_structured`: read typed hierarchy, documentation, ranges, visibility, completeness, and warnings.
+- `read_interface_structured`: bounded/filterable typed hierarchy with paging.
+- `read_symbol` and `symbol_at`: bounded exact source and line-to-symbol lookup.
 - `search_pattern`: compact structural matches, bounded to 50 by default, with `returned`, `total`, `truncated`, and snapshot-bound `next_cursor` continuation. Set `detail: "full"` for raw ast-grep matches.
 - `rewrite_pattern`: in-place replacement with a compact count/path summary by default. Full detail is bounded but never advertises continuation after mutation.
-- `plan_replacement`: read-only exact replacement preview with bounds, hashes, warnings, and digest.
+- `plan_replacement` and `refine_replacement`: non-mutating v2 review and edit selection.
 - `apply_replacement`: destructive guarded application requiring the complete plan and independently supplied digest.
-- `scan_rules`: compact ast-grep YAML diagnostics with the same paging contract when read-only. With `fix: true`, all fixes are applied and no continuation cursor is returned.
+- `scan_rules`, `check_rules`, `explain_rules`, and `test_rules`: read-only rule operations.
+- `apply_rule_fixes`: destructive application of a reviewed v2 rule plan.
+- `xray_capabilities`: help, contracts, limits, dependencies, and health.
 - `file_imports` and `file_exports`: compact flattened dependency and public-API outlines with limits and continuation cursors.
 - `what_breaks`: assess bounded classified symbol-name references with snapshot-bound continuation.
+
+MCP failures are protocol errors (`isError: true`) with identical JSON text and
+structured `error: {code, message, details?}` content. `scan_rules` has read-only
+annotations and no mutation argument; `apply_rule_fixes` alone carries the
+guarded destructive rule-fix contract.
 
 Detailed guidance is available on demand:
 

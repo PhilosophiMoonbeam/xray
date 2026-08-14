@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 DEFAULT_AST_GREP_TIMEOUT_SECONDS = 30
@@ -71,7 +72,7 @@ def get_ast_grep_output_limit() -> int:
         return DEFAULT_AST_GREP_OUTPUT_LIMIT_CHARS
 
 
-def run_ast_grep(args: Sequence[str], input_text: str | None = None) -> AstGrepResult:
+def run_ast_grep(args: Sequence[str], input_text: str | None = None, *, cwd: Path | None = None) -> AstGrepResult:
     """Run ast-grep and treat exit code 1 as a normal no-match outcome."""
     command = ["ast-grep", *args]
     try:
@@ -83,6 +84,7 @@ def run_ast_grep(args: Sequence[str], input_text: str | None = None) -> AstGrepR
                     stderr=stderr_file,
                     check=False,
                     input=input_text,
+                    cwd=cwd,
                     text=True,
                     timeout=get_ast_grep_timeout(),
                 )
