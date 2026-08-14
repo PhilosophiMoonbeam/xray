@@ -798,11 +798,13 @@ def test_impact_filters_duplicate_non_source_and_inexact_structural_matches(tmp_
     repo = write_sample_repo(tmp_path)
     (repo / "README.md").write_text("target_function in docs should not be an impact code hit.\n", encoding="utf-8")
     indexer = XRayIndexer(str(repo))
+    valid_lines = "target_function = ignored\n    return target_function(41)"
     valid_match = {
         "text": "target_function",
         "file": str(repo / "src" / "sample.py"),
         "range": {"start": {"line": 4}},
-        "lines": "def caller():\n    return target_function(41)",
+        "lines": valid_lines,
+        "charCount": {"leading": valid_lines.rfind("target_function")},
     }
     matches = [
         valid_match,
@@ -846,7 +848,8 @@ def test_impact_filters_duplicate_non_source_and_inexact_structural_matches(tmp_
         {
             "file": str(repo / "src" / "sample.py"),
             "line": 5,
-            "text": "def caller():\n    return target_function(41)",
+            "text": valid_lines,
+            "matched_text": "return target_function(41)",
             "type": "call",
             "confidence": "high",
         }
@@ -1651,7 +1654,7 @@ def test_cli_version_returns_without_system_exit(capsys):
     exit_code = cli.main(["--version"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out.strip() == "xray 0.11.0"
+    assert capsys.readouterr().out.strip() == "xray 0.11.1"
 
 
 def test_cli_help_is_current_safe_and_token_bounded(capsys):
@@ -2288,6 +2291,8 @@ def test_rule_explain_and_capabilities_are_read_only_and_bounded(tmp_path):
     assert explained["source_truncated"] is True
     assert len(explained["source"]) == 16
     assert capabilities["replacement_plan_versions"] == ["xray.replace.v2"]
+    assert capabilities["mutation_classes"]["guarded"]["mcp"] == ["apply_replacement", "apply_rule_fixes"]
+    assert capabilities["mutation_classes"]["direct_legacy"]["mcp"] == ["rewrite_pattern"]
     assert capabilities["product"]["version"]
     assert capabilities["dependencies"]["ast_grep"]["available"] is True
     assert capabilities["healthy"] is True
@@ -2442,7 +2447,15 @@ def test_compact_v3_defaults_and_explicit_v2_legacy_projection(tmp_path, capsys)
     assert [item["name"] for item in interface["symbols"][0]["members"]] == ["second"]
 
     impact_result = {
-        "references": [{"file": str(source), "line": 5, "text": "        return 2", "type": "read"}],
+        "references": [
+            {
+                "file": str(source),
+                "line": 5,
+                "text": "capabilities = other\n        return capabilities()",
+                "matched_text": "return capabilities()",
+                "type": "call",
+            }
+        ],
         "total_count": 1,
         "raw_count": 3,
         "filtered_count": 2,
@@ -2459,6 +2472,7 @@ def test_compact_v3_defaults_and_explicit_v2_legacy_projection(tmp_path, capsys)
     assert "total_count" not in impact["impact"] and "raw_count" not in impact["impact"]
     assert impact["impact"]["total"] == 1
     assert impact["impact"]["total_exact"] is True
+    assert impact["impact"]["references"][0]["text"] == "return capabilities()"
     assert impact["impact"]["diagnostics"]["raw_count"] == 3
     assert "total_exact" not in impact["impact"]["diagnostics"]
 

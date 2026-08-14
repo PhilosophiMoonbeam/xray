@@ -1,5 +1,6 @@
+import io
 import subprocess
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -8,6 +9,7 @@ from xray.core.ast_grep import (
     AstGrepNotFoundError,
     parse_json_array,
     run_ast_grep,
+    run_ast_grep_bounded,
 )
 
 
@@ -98,6 +100,29 @@ def test_run_ast_grep_rejects_oversized_output(monkeypatch):
     with patch("xray.core.ast_grep.subprocess.run", return_value=completed):
         with pytest.raises(AstGrepCommandError, match="stdout exceeded 1024 characters"):
             run_ast_grep(["run", "--pattern", "anything", "--json", "."])
+
+
+def test_run_ast_grep_bounded_forces_single_thread_for_stable_prefix():
+    process = MagicMock()
+    process.stdout = io.StringIO('{"file":"sample.py"}\n')
+    process.stderr = io.StringIO("")
+
+    with patch("xray.core.ast_grep.subprocess.Popen", return_value=process) as popen:
+        result = run_ast_grep_bounded(["run", "--pattern", "target", "."], 1)
+
+    assert result.matches == [{"file": "sample.py"}]
+    assert result.total_exact is False
+    assert popen.call_args.args[0] == [
+        "ast-grep",
+        "run",
+        "--pattern",
+        "target",
+        ".",
+        "--threads",
+        "1",
+        "--json=stream",
+    ]
+    process.terminate.assert_called_once_with()
 
 
 def test_parse_json_array_rejects_non_array_output():

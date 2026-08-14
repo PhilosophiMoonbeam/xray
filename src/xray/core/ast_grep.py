@@ -109,7 +109,10 @@ def run_ast_grep_bounded(args: Sequence[str], max_results: int) -> BoundedAstGre
     """Stream JSON matches and terminate ast-grep once the execution cap is reached."""
     if max_results < 1:
         raise ValueError("max_results must be 1 or greater.")
-    command = ["ast-grep", *args, "--json=stream"]
+    # Early termination makes parallel result arrival cap-sensitive. A single
+    # worker keeps each larger execution cap as a stable prefix for paging and
+    # guarded replacement plans.
+    command = ["ast-grep", *args, "--threads", "1", "--json=stream"]
     try:
         process = subprocess.Popen(
             command,

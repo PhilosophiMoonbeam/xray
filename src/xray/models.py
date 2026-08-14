@@ -165,6 +165,7 @@ class ImpactReference(PublicModel):
     path: str | None = None
     line: int
     text: str = ""
+    matched_text: str | None = None
     type: str | None = None
     confidence: str | None = None
 

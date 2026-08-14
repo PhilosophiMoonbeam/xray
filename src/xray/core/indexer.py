@@ -227,6 +227,7 @@ class ImpactReferenceBase(TypedDict):
 
 
 class ImpactReference(ImpactReferenceBase, total=False):
+    matched_text: str
     type: str
     confidence: str
 
@@ -1738,10 +1739,13 @@ class XRayIndexer:
                 },
             },
             "mutation_classes": {
-                "guarded": {"cli": ["replace-apply"], "mcp": ["apply_replacement"]},
+                "guarded": {
+                    "cli": ["replace-apply"],
+                    "mcp": ["apply_replacement", "apply_rule_fixes"],
+                },
                 "direct_legacy": {
                     "cli": ["rewrite", "scan-fix"],
-                    "mcp": ["rewrite_pattern", "apply_rule_fixes"],
+                    "mcp": ["rewrite_pattern"],
                 },
                 "administrative": {"cli": ["skill-install"], "mcp": []},
             },
@@ -3092,19 +3096,36 @@ class XRayIndexer:
 
         for match in matches:
             code_snippet = (match.get("lines") or match.get("text") or "").strip()
+            matched_text = self._matched_ast_grep_line(match, symbol_name)
             line_num = self._normalize_ast_grep_line(match.get("range", {}).get("start", {}).get("line"))
-            reference_type, confidence = self._classify_impact_reference(symbol_name, code_snippet, structural=True)
+            reference_type, confidence = self._classify_impact_reference(symbol_name, matched_text, structural=True)
             references.append(
                 {
                     "file": match.get("file", ""),
                     "line": line_num,
                     "text": code_snippet,
+                    "matched_text": matched_text,
                     "type": reference_type,
                     "confidence": confidence,
                 }
             )
 
         return references, total_exact, None
+
+    @staticmethod
+    def _matched_ast_grep_line(match: Mapping[str, Any], symbol_name: str) -> str:
+        """Return the exact matched source line from an ast-grep context block."""
+        context = str(match.get("lines") or match.get("text") or "")
+        char_count = match.get("charCount")
+        leading = char_count.get("leading") if isinstance(char_count, Mapping) else None
+        if isinstance(leading, int) and 0 <= leading <= len(context):
+            line_start = context.rfind("\n", 0, leading) + 1
+            line_end = context.find("\n", leading)
+            if line_end < 0:
+                line_end = len(context)
+            return context[line_start:line_end].strip()
+        word = re.compile(r"\b" + re.escape(symbol_name) + r"\b")
+        return next((line.strip() for line in context.splitlines() if word.search(line)), context.strip())
 
     @staticmethod
     def _classify_impact_reference(symbol_name: str, text: str, *, structural: bool) -> tuple[str, str]:
@@ -3146,7 +3167,8 @@ class XRayIndexer:
                 continue
 
             text = str(ref.get("text", ""))
-            if not word_pattern.search(text):
+            matched_text = str(ref.get("matched_text") or text)
+            if not word_pattern.search(matched_text):
                 continue
 
             ref_line = int(ref.get("line", 0))
@@ -3168,6 +3190,8 @@ class XRayIndexer:
                 "type": ref_type,
                 "confidence": confidence,
             }
+            if "matched_text" in ref:
+                filtered_ref["matched_text"] = matched_text
             filtered.append(filtered_ref)
 
         return filtered

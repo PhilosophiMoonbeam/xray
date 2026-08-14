@@ -122,7 +122,9 @@ def compact_impact_references(
     compact: list[dict[str, Any]] = []
     for item in items:
         text = str(item.get("text") or "")
-        matched_line = next((line.strip() for line in text.splitlines() if word.search(line)), text.strip())
+        matched_line = str(item.get("matched_text") or "")
+        if not matched_line:
+            matched_line = next((line.strip() for line in text.splitlines() if word.search(line)), text.strip())
         compact.append(
             {
                 "path": _relative_path(item.get("file"), root_path),

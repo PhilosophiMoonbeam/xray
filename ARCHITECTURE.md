@@ -34,9 +34,9 @@ skills, reports, tests, or harness. Presentation and public models may describe
 core values but do not perform repository analysis. Distribution and guidance
 wrap the adapters without becoming runtime dependencies of them.
 
-## XRAY 0.11.0 current contract
+## XRAY 0.11.1 current contract
 
-XRAY 0.11.0 preserves Python 3.10+, default compact `xray.cli.v3`, explicit
+XRAY 0.11.1 preserves Python 3.10+, default compact `xray.cli.v3`, explicit
 legacy v2 and full/v1 output, JSON and `jq` pipelines, stdio MCP, repository
 containment, snapshot-bound cursors, and direct legacy mutation. V3 standardizes
 success and paging fields; `--schema v2` exposes the previous projection only
@@ -80,7 +80,7 @@ YAML remains only ast-grep rule/test input and is never XRAY product output.
 ## Historical frozen xray-s3b design
 
 This section preserves the implemented XRAY 0.10.0 contract as transformation
-evidence. XRAY 0.11.0 above supersedes it for current behavior.
+evidence. XRAY 0.11.1 above supersedes it for current behavior.
 
 ### Compatibility
 
