@@ -223,7 +223,7 @@ def test_mcp_structured_interface_is_read_only_and_returns_hierarchy(tmp_path):
                     "arguments": {"root_path": str(repo), "file_path": "src/sample.py"},
                 },
             )
-            return structured_content(search)["result"], structured_content(call)
+            return structured_content(search)["matches"], structured_content(call)
 
     discovered, result = asyncio.run(exercise())
     tool = next(item for item in discovered if item["name"] == "read_interface_structured")
@@ -978,23 +978,29 @@ def test_mcp_tool_surface_is_search_first_with_compact_metadata(tmp_path):
         async with Client(mcp_server.mcp) as client:
             tools = await client.list_tools()
             search_result = await client.call_tool("search_tools", {"pattern": "impact"})
+            full_search_result = await client.call_tool("search_tools", {"pattern": "impact", "detail": "full"})
             call_result = await client.call_tool(
                 "call_tool",
                 {"name": "explore_repo", "arguments": {"root_path": str(repo), "max_depth": 1}},
             )
-            return tools, search_result, call_result
+            return tools, search_result, full_search_result, call_result
 
-    tools, search_result, call_result = asyncio.run(inspect_surface())
+    tools, search_result, full_search_result, call_result = asyncio.run(inspect_surface())
 
     assert [tool.name for tool in tools] == ["search_tools", "call_tool"]
     assert all("PROGRESSIVE DISCOVERY WORKFLOW" not in (tool.description or "") for tool in tools)
-    assert "regex pattern" in (tools[0].description or "")
-    assert "tool names, descriptions, and parameters" in tools[0].inputSchema["properties"]["pattern"]["description"]
-    matches = structured_content(search_result)["result"]
+    assert "ranked intent" in (tools[0].description or "")
+    assert "Natural-language intent" in tools[0].inputSchema["properties"]["pattern"]["description"]
+    summary = structured_content(search_result)
+    assert summary["total_exact"] is True
+    assert summary["detail"] == "summary"
+    matches = summary["matches"]
     assert [match["name"] for match in matches] == ["what_breaks"]
     assert matches[0]["description"].startswith("Estimate blast radius")
     assert "not a type-aware caller" in matches[0]["description"]
-    assert matches[0]["inputSchema"]["properties"]["exact_symbol"]["description"].startswith("Full symbol object")
+    assert matches[0]["mutation_class"] == "read_only"
+    full_match = structured_content(full_search_result)["matches"][0]
+    assert full_match["inputSchema"]["properties"]["exact_symbol"]["description"].startswith("Full symbol object")
     explore = structured_content(call_result)
     assert "tree_text" not in explore
     assert explore["root_path"] == str(repo)
@@ -1017,50 +1023,57 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
         from fastmcp import Client
 
         async with Client(mcp_server.mcp) as client:
+            terms = [
+                "map",
+                "find symbol",
+                "interface",
+                "find usages",
+                "who calls",
+                "used by",
+                "change impact",
+                "structural search",
+                "rename symbol",
+                "change function safely",
+                "replace expression",
+                "replace",
+                "fix",
+                "apply replacement",
+                "validate rule",
+                "scan rules",
+                "file imports",
+                "file exports",
+                "help",
+                "rewrite pattern",
+            ]
             searches = {
-                term: structured_content(await client.call_tool("search_tools", {"pattern": term}))["result"]
-                for term in [
-                    "map",
-                    "tree",
-                    "find",
-                    "function",
-                    "class",
-                    "interface",
-                    "signature",
-                    "contract",
-                    "docstring",
-                    "impact",
-                    "usage",
-                    "caller",
-                    "dependency",
-                    "overview",
-                    "layout",
-                    "file tree",
-                    "definitions",
-                    "method",
-                    "type",
-                    "enum",
-                    "api",
-                    "summary",
-                    "body",
-                    "uses",
-                    "used by",
-                    "breaking change",
-                    "change impact",
-                    "root path",
-                    "line data",
-                    "find symbol",
-                    "structural search",
-                    "rewrite pattern",
-                    "replacement plan",
-                    "apply replacement",
-                    "scan rules",
-                    "file imports",
-                    "file exports",
-                    ".",
-                    "[",
-                ]
+                term: structured_content(await client.call_tool("search_tools", {"pattern": term, "detail": "full"}))
+                for term in terms
             }
+            inventory_pages = []
+            cursor = None
+            while True:
+                arguments = {"pattern": ".", "detail": "full", "limit": 7}
+                if cursor is not None:
+                    arguments["cursor"] = cursor
+                page = structured_content(await client.call_tool("search_tools", arguments))
+                inventory_pages.append(page)
+                cursor = page.get("next_cursor")
+                if cursor is None:
+                    break
+            summary_inventory = structured_content(
+                await client.call_tool("search_tools", {"pattern": ".", "limit": 50})
+            )
+            legacy = structured_content(
+                await client.call_tool("search_tools", {"pattern": "legacy rewrite", "detail": "full"})
+            )
+            regex = structured_content(
+                await client.call_tool(
+                    "search_tools", {"pattern": "plan_replacement|verify_replacement", "mode": "regex"}
+                )
+            )
+            invalid_regex = await client.call_tool(
+                "search_tools", {"pattern": "[", "mode": "regex"}, raise_on_error=False
+            )
             calls = {
                 "explore_repo": await client.call_tool(
                     "call_tool",
@@ -1078,71 +1091,61 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
                     "call_tool",
                     {"name": "what_breaks", "arguments": {"exact_symbol": symbol}},
                 ),
+                "legacy_rewrite": await client.call_tool(
+                    "call_tool",
+                    {
+                        "name": "rewrite_pattern",
+                        "arguments": {
+                            "root_path": str(repo),
+                            "pattern": "never_matches($A)",
+                            "replacement": "still_never($A)",
+                            "lang": "python",
+                        },
+                    },
+                ),
             }
-            return searches, calls
+            return searches, inventory_pages, summary_inventory, legacy, regex, invalid_regex, calls
 
-    searches, calls = asyncio.run(inspect_search_and_calls())
+    searches, inventory_pages, summary_inventory, legacy, regex, invalid_regex, calls = asyncio.run(
+        inspect_search_and_calls()
+    )
+    matches = {term: result["matches"] for term, result in searches.items()}
 
-    assert searches["map"][0]["name"] == "explore_repo"
-    assert "compact relative-path entries" in searches["map"][0]["description"]
-    assert searches["tree"][0]["name"] == "explore_repo"
-    assert searches["find"][0]["name"] == "find_symbol"
-    assert any(match["name"] == "find_symbol" for match in searches["function"])
-    assert any(match["name"] == "find_symbol" for match in searches["class"])
-    assert searches["interface"][0]["name"] == "read_interface"
-    assert searches["signature"][0]["name"] == "read_interface"
-    assert searches["contract"][0]["name"] == "read_interface"
-    assert searches["docstring"][0]["name"] == "read_interface"
-    assert searches["impact"][0]["name"] == "what_breaks"
-    assert searches["usage"][0]["name"] == "what_breaks"
-    assert searches["caller"][0]["name"] == "what_breaks"
-    assert searches["dependency"][0]["name"] == "what_breaks"
-    assert "not a type-aware caller" in searches["caller"][0]["description"]
-    assert "dependency graph" in searches["dependency"][0]["description"]
-    assert searches["overview"][0]["name"] == "explore_repo"
-    assert searches["layout"][0]["name"] == "explore_repo"
-    assert searches["file tree"][0]["name"] == "explore_repo"
-    assert searches["definitions"][0]["name"] == "find_symbol"
-    assert searches["method"][0]["name"] == "find_symbol"
-    assert searches["type"][0]["name"] == "explore_repo"
-    assert any(match["name"] == "find_symbol" for match in searches["type"])
-    assert searches["enum"][0]["name"] == "find_symbol"
-    assert searches["api"][0]["name"] == "read_interface"
-    assert searches["summary"][0]["name"] == "read_interface"
-    assert searches["body"][0]["name"] == "read_interface"
-    assert any(match["name"] == "what_breaks" for match in searches["uses"])
-    assert searches["used by"][0]["name"] == "what_breaks"
-    assert searches["breaking change"][0]["name"] == "what_breaks"
-    assert searches["change impact"][0]["name"] == "what_breaks"
-    assert {match["name"] for match in searches["root path"]} >= {
-        "explore_repo",
-        "find_symbol",
-        "read_interface",
-    }
-    assert searches["line data"][0]["name"] == "what_breaks"
-    assert searches["find symbol"][0]["name"] == "find_symbol"
-    assert searches["structural search"][0]["name"] == "search_pattern"
-    assert searches["rewrite pattern"][0]["name"] == "rewrite_pattern"
-    assert searches["replacement plan"][0]["name"] == "plan_replacement"
-    assert searches["apply replacement"][0]["name"] == "apply_replacement"
-    assert searches["scan rules"][0]["name"] == "scan_rules"
-    assert searches["file imports"][0]["name"] == "file_imports"
-    assert searches["file exports"][0]["name"] == "file_exports"
-    assert [match["name"] for match in searches["."]] == [
-        "explore_repo",
-        "find_symbol",
-        "read_interface",
-        "read_interface_structured",
-        "read_symbol",
-        "symbol_at",
-        "what_breaks",
-        "search_pattern",
-        "rewrite_pattern",
-        "plan_replacement",
-    ]
-    assert searches["["] == []
+    assert matches["map"][0]["name"] == "explore_repo"
+    assert matches["find symbol"][0]["name"] == "find_symbol"
+    assert matches["interface"][0]["name"] == "read_interface"
+    for term in ("find usages", "who calls", "used by", "change impact"):
+        assert matches[term][0]["name"] == "what_breaks"
+    assert matches["structural search"][0]["name"] == "search_pattern"
+    for term in ("rename symbol", "change function safely", "replace expression", "replace", "fix"):
+        assert matches[term][0]["name"] == "plan_replacement"
+    assert matches["apply replacement"][0]["name"] == "apply_replacement"
+    assert matches["validate rule"][0]["name"] == "check_rules"
+    assert matches["scan rules"][0]["name"] == "scan_rules"
+    assert matches["file imports"][0]["name"] == "file_imports"
+    assert matches["file exports"][0]["name"] == "file_exports"
+    assert matches["help"][0]["name"] == "xray_capabilities"
+    assert all(match["name"] != "rewrite_pattern" for result in matches.values() for match in result)
+    assert legacy["matches"][0]["name"] == "rewrite_pattern"
+    assert legacy["legacy_tools_included"] is True
+    assert {match["name"] for match in regex["matches"]} >= {"plan_replacement", "verify_replacement"}
+    assert all(match["name"] != "rewrite_pattern" for match in regex["matches"])
+    assert invalid_regex.is_error is True
+    assert invalid_regex.structured_content is not None
+    assert invalid_regex.structured_content["error"]["code"] == "invalid_regex"
 
-    all_tools = {match["name"]: match for matches in searches.values() for match in matches}
+    assert len(inventory_pages) == 3
+    assert inventory_pages[0]["returned"] == 7
+    assert inventory_pages[0]["total"] == 20
+    assert inventory_pages[0]["total_exact"] is True
+    assert inventory_pages[0]["truncated"] is True
+    assert inventory_pages[-1]["truncated"] is False
+    inventory = [match for page in inventory_pages for match in page["matches"]]
+    assert summary_inventory["total"] == 20
+    assert summary_inventory["truncated"] is False
+    assert all("inputSchema" not in match for match in summary_inventory["matches"])
+    assert len(json.dumps(summary_inventory)) < len(json.dumps(inventory))
+    all_tools = {match["name"]: match for match in inventory}
     assert set(all_tools) == {
         "explore_repo",
         "find_symbol",
@@ -1152,16 +1155,21 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
         "symbol_at",
         "what_breaks",
         "search_pattern",
-        "rewrite_pattern",
         "plan_replacement",
+        "refine_replacement",
+        "verify_replacement",
         "apply_replacement",
         "scan_rules",
+        "apply_rule_fixes",
+        "check_rules",
         "explain_rules",
+        "test_rules",
+        "xray_capabilities",
         "file_imports",
         "file_exports",
     }
-    detail_tools = {"explore_repo", "search_pattern", "rewrite_pattern", "scan_rules"}
-    limited_tools = {"search_pattern", "rewrite_pattern", "scan_rules"}
+    detail_tools = {"explore_repo", "search_pattern", "scan_rules"}
+    limited_tools = {"search_pattern", "scan_rules"}
     cursor_tools = {"search_pattern", "scan_rules"}
     for name in detail_tools:
         assert all_tools[name]["inputSchema"]["properties"]["detail"]["default"] == "compact"
@@ -1169,38 +1177,30 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
         assert all_tools[name]["inputSchema"]["properties"]["limit"]["default"] == 50
     for name in cursor_tools:
         assert "cursor" in all_tools[name]["inputSchema"]["properties"]
-    assert "cursor" not in all_tools["rewrite_pattern"]["inputSchema"]["properties"]
     assert "at most 50 compact matches" in all_tools["search_pattern"]["description"]
-    assert "across every matching AST structure" in all_tools["rewrite_pattern"]["description"]
-    assert "never support continuation" in all_tools["rewrite_pattern"]["description"]
-    assert "Pass lang whenever the target language is known" in all_tools["rewrite_pattern"]["description"]
-    lang_description = all_tools["rewrite_pattern"]["inputSchema"]["properties"]["lang"]["description"]
-    assert "constrain destructive rewrite scope" in lang_description
     assert "read-only" in all_tools["scan_rules"]["description"]
     assert "identical root" in all_tools["search_pattern"]["inputSchema"]["properties"]["cursor"]["description"]
 
-    for matches in searches.values():
-        assert len(matches) <= 10
-        for match in matches:
-            properties = match["inputSchema"]["properties"]
-            assert "ctx" not in properties
-            assert match["description"]
-            assert match["meta"]["fastmcp"]["tags"]
-            if match["name"] in {"rewrite_pattern", "apply_replacement", "apply_rule_fixes"}:
-                assert match["annotations"] == {
-                    "readOnlyHint": False,
-                    "destructiveHint": True,
-                    "idempotentHint": False,
-                    "openWorldHint": False,
-                }
-            else:
-                assert match["annotations"] == {
-                    "readOnlyHint": True,
-                    "destructiveHint": False,
-                    "idempotentHint": True,
-                    "openWorldHint": False,
-                }
-            assert all(property_schema.get("description") for property_schema in properties.values())
+    for match in inventory:
+        properties = match["inputSchema"]["properties"]
+        assert "ctx" not in properties
+        assert match["description"]
+        assert match["meta"]["fastmcp"]["tags"]
+        if match["name"] in {"apply_replacement", "apply_rule_fixes"}:
+            assert match["annotations"] == {
+                "readOnlyHint": False,
+                "destructiveHint": True,
+                "idempotentHint": False,
+                "openWorldHint": False,
+            }
+        else:
+            assert match["annotations"] == {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            }
+        assert all(property_schema.get("description") for property_schema in properties.values())
 
     explore = structured_content(calls["explore_repo"])
     assert "tree_text" not in explore
@@ -1212,6 +1212,7 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
     impact = structured_content(calls["what_breaks"])
     assert impact["total_count"] >= 1
     assert all(reference["line"] >= 1 for reference in impact["references"])
+    assert structured_content(calls["legacy_rewrite"])["match_count"] == 0
 
 
 def test_mcp_explore_reports_context_progress(tmp_path):
@@ -1233,7 +1234,7 @@ def test_mcp_explore_reports_context_progress(tmp_path):
             progress_handler=progress_handler,
             log_handler=log_handler,
         ) as client:
-            search_result = await client.call_tool("search_tools", {"pattern": "map"})
+            search_result = await client.call_tool("search_tools", {"pattern": "map", "detail": "full"})
             call_result = await client.call_tool(
                 "call_tool",
                 {"name": "explore_repo", "arguments": {"root_path": str(repo), "max_depth": 1}},
@@ -1242,7 +1243,7 @@ def test_mcp_explore_reports_context_progress(tmp_path):
 
     search_result, call_result = asyncio.run(call_explore())
 
-    match = structured_content(search_result)["result"][0]
+    match = structured_content(search_result)["matches"][0]
     assert match["name"] == "explore_repo"
     assert "ctx" not in match["inputSchema"]["properties"]
     explore = structured_content(call_result)
@@ -1478,8 +1479,8 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     assert "relative-path `entries`" in workflow_text
     assert 'detail="full"' in workflow_text
     assert "return at most 50 compact items" in workflow_text
-    assert "regular expression and returns at most 10 matches" in workflow_text
-    assert "do not use `.` to inventory" in workflow_text
+    assert "ranked `search_tools`" in workflow_text
+    assert "regex mode is explicit" in workflow_text
     assert "regardless of the reporting limit" in workflow_text
     xray_workflow = next(resource for resource in resources if str(resource.uri) == "xray://workflow")
     annotations = xray_workflow.annotations
@@ -1489,8 +1490,8 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     skill_text = text_content(skill[0])
     assert skill_text.startswith("# XRAY Progressive Discovery")
     assert "search_tools" in skill_text
-    assert "regular expression and returns at most 10 matches" in skill_text
-    assert "a broad `.` can" in skill_text
+    assert "ranks natural intent" in skill_text
+    assert '`mode="regex"`' in skill_text
     assert "relative-path `entries`" in skill_text
     assert "signature" in skill_text
     assert "name-based references" in skill_text
@@ -1503,7 +1504,8 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     assert "plan_replacement" in workflow_text
     assert "apply_replacement" in workflow_text
     assert "independently copied digest" in prompt_text
-    assert "focused search_tools regular expression" in prompt_text
+    assert "ranked search_tools intent search" in prompt_text
+    assert "verify_replacement" in prompt_text
     assert "pass lang whenever the target language is known" in prompt_text
     assert "Legacy rewrite still applies every match" in prompt_text
     assert "Rule fixes require a reviewed plan" in prompt_text
@@ -1649,7 +1651,7 @@ def test_cli_version_returns_without_system_exit(capsys):
     exit_code = cli.main(["--version"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out.strip() == "xray 0.10.0"
+    assert capsys.readouterr().out.strip() == "xray 0.11.0"
 
 
 def test_cli_help_is_current_safe_and_token_bounded(capsys):
@@ -1662,6 +1664,8 @@ def test_cli_help_is_current_safe_and_token_bounded(capsys):
         "explore": get_help("explore"),
         "find": get_help("find"),
         "interface": get_help("interface"),
+        "read-symbol": get_help("read-symbol"),
+        "symbol-at": get_help("symbol-at"),
         "impact": get_help("impact"),
         "search": get_help("search"),
         "rewrite": get_help("rewrite"),
@@ -1669,10 +1673,16 @@ def test_cli_help_is_current_safe_and_token_bounded(capsys):
         "replace": get_help("replace"),
         "replace plan": get_help("replace", "plan"),
         "replace apply": get_help("replace", "apply"),
+        "replace refine": get_help("replace", "refine"),
+        "replace verify": get_help("replace", "verify"),
+        "rules check": get_help("rules", "check"),
+        "rules explain": get_help("rules", "explain"),
+        "rules test": get_help("rules", "test"),
         "skill": get_help("skill"),
         "skill install": get_help("skill", "install"),
         "imports": get_help("imports"),
         "exports": get_help("exports"),
+        "capabilities": get_help("capabilities"),
     }
     normalized = {name: " ".join(value.split()) for name, value in helps.items()}
 
@@ -1707,6 +1717,9 @@ def test_cli_help_is_current_safe_and_token_bounded(capsys):
     assert "must resolve inside the root" in interface
     assert "parent traversal and symlink escapes fail" in interface
     assert "legacy v1 string envelope" in interface
+    assert "Exact symbol JSON" in interface
+    assert "Maximum returned lines" in normalized["read-symbol"]
+    assert "narrowest symbol" in normalized["symbol-at"]
 
     impact = normalized["impact"]
     assert "Provide exactly one symbol source" in impact
@@ -1726,6 +1739,12 @@ def test_cli_help_is_current_safe_and_token_bounded(capsys):
     assert "Preview cap (default: 50)" in normalized["replace plan"]
     assert "bounded to 10 MiB" in normalized["replace apply"]
     assert "Independently copied reviewed plan digest" in normalized["replace apply"]
+    assert "stable edit ID" in normalized["replace refine"]
+    assert "without writes" in normalized["replace verify"]
+    assert "syntax" in normalized["replace verify"]
+    assert "--allow-dirty-affected" in normalized["replace plan"]
+    assert "--allow-new-parse-errors" in normalized["replace plan"]
+    assert "schemas, operations, bounds" in normalized["capabilities"]
     assert "Replace divergent content" in normalized["skill install"]
     assert "Use ROOT/.agents/skills" in normalized["skill install"]
     assert "Page size (default: 50)" in normalized["imports"]
@@ -1733,7 +1752,7 @@ def test_cli_help_is_current_safe_and_token_bounded(capsys):
 
     assert all("read-only repository scans" not in value for value in normalized.values())
     assert len(helps["root"].encode()) <= 3200
-    assert sum(len(value.encode()) for value in helps.values()) <= 20_000
+    assert sum(len(value.encode()) for value in helps.values()) <= 30_000
 
 
 @pytest.mark.parametrize(
@@ -2095,6 +2114,125 @@ def test_nested_map_focus_keeps_root_context_and_ancestor_chain(tmp_path):
     assert data["options"]["focus_dirs"] == ["src/pkg"]
 
 
+def test_deep_map_focus_uses_focus_relative_depth_and_explicit_context_mode(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    focused = repo / "src" / "xray" / "core"
+    (focused / "deeper").mkdir(parents=True)
+    (repo / "src" / "other").mkdir()
+    (repo / "README.md").write_text("context\n", encoding="utf-8")
+    (focused / "indexer.py").write_text("def indexer():\n    pass\n", encoding="utf-8")
+    (focused / "deeper" / "worker.py").write_text("def worker():\n    pass\n", encoding="utf-8")
+    (repo / "src" / "other" / "ignored.py").write_text("def ignored():\n    pass\n", encoding="utf-8")
+
+    assert cli.main(["map", str(repo), "--focus", "src/xray/core"]) == 0
+    contextual = json.loads(capsys.readouterr().out)
+    contextual_paths = {entry["path"] for entry in contextual["entries"]}
+    assert {
+        ".",
+        "src",
+        "src/xray",
+        "src/xray/core",
+        "src/xray/core/indexer.py",
+        "src/xray/core/deeper",
+        "src/xray/core/deeper/worker.py",
+        "README.md",
+    } <= contextual_paths
+    assert "src/other" not in contextual_paths
+    assert contextual["options"]["max_depth"] == 2
+    assert contextual["options"]["focus_mode"] == "root_context"
+
+    assert cli.main(["map", str(repo), "--focus", "src/xray/core/deeper/worker.py", "--strict-focus"]) == 0
+    strict = json.loads(capsys.readouterr().out)
+    strict_paths = {entry["path"] for entry in strict["entries"]}
+    assert "src/xray/core/deeper/worker.py" in strict_paths
+    assert "README.md" not in strict_paths
+    assert "src/xray/core/indexer.py" not in strict_paths
+    assert strict["options"]["include_root_context"] is False
+    assert strict["options"]["focus_mode"] == "strict"
+
+
+def test_mcp_deep_focus_defaults_are_relative_and_support_strict_mode(tmp_path):
+    repo = tmp_path / "repo"
+    focused = repo / "src" / "xray" / "core"
+    focused.mkdir(parents=True)
+    (repo / "README.md").write_text("context\n", encoding="utf-8")
+    (focused / "indexer.py").write_text("def indexer():\n    pass\n", encoding="utf-8")
+
+    async def exercise():
+        from fastmcp import Client
+
+        async with Client(mcp_server.mcp) as client:
+            contextual = await client.call_tool(
+                "call_tool",
+                {"name": "explore_repo", "arguments": {"root_path": str(repo), "focus_dirs": ["src/xray/core"]}},
+            )
+            strict = await client.call_tool(
+                "call_tool",
+                {
+                    "name": "explore_repo",
+                    "arguments": {
+                        "root_path": str(repo),
+                        "focus_dirs": ["src/xray/core/indexer.py"],
+                        "include_root_context": False,
+                    },
+                },
+            )
+            return structured_content(contextual), structured_content(strict)
+
+    contextual, strict = asyncio.run(exercise())
+    assert "src/xray/core/indexer.py" in {entry["path"] for entry in contextual["entries"]}
+    assert "README.md" in {entry["path"] for entry in contextual["entries"]}
+    assert contextual["options"]["max_depth"] == 2
+    assert strict["options"]["focus_mode"] == "strict"
+    assert "README.md" not in {entry["path"] for entry in strict["entries"]}
+
+
+def test_real_multilanguage_inventory_visibility_and_filters(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "sample.py").write_text(
+        "def public_py():\n    pass\n\ndef _private_py():\n    pass\n\ndef __dunder__():\n    pass\n",
+        encoding="utf-8",
+    )
+    (repo / "sample.js").write_text(
+        "export function exportedJs() {}\nfunction localJs() {}\nclass JsService { #privateJs() {} publicJs() {} }\n",
+        encoding="utf-8",
+    )
+    (repo / "sample.ts").write_text(
+        "export class TsService { public publicTs() {} private privateTs() {} #hashPrivate() {} }\n",
+        encoding="utf-8",
+    )
+    (repo / "sample.go").write_text(
+        "package demo\nfunc PublicGo() {}\nfunc privateGo() {}\n",
+        encoding="utf-8",
+    )
+    indexer = XRayIndexer(str(repo))
+
+    cases = [
+        ("public_py", "public"),
+        ("_private_py", "private"),
+        ("__dunder__", "public"),
+        ("exportedJs", "public"),
+        ("localJs", "unknown"),
+        ("#privateJs", "private"),
+        ("publicJs", "public"),
+        ("publicTs", "public"),
+        ("privateTs", "private"),
+        ("#hashPrivate", "private"),
+        ("PublicGo", "public"),
+        ("privateGo", "private"),
+    ]
+    for name, visibility in cases:
+        matching = indexer.find_symbol(name, min_score=100, visibility=[visibility])
+        rejected = indexer.find_symbol(
+            name,
+            min_score=100,
+            visibility=[next(value for value in ("public", "private", "unknown") if value != visibility)],
+        )
+        assert any(symbol["name"] == name and symbol.get("visibility") == visibility for symbol in matching)
+        assert all(symbol["name"] != name for symbol in rejected)
+
+
 def test_impact_reports_when_raw_safety_bound_blocks_filtered_page(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -2255,6 +2393,98 @@ def test_cli_map_defaults_all_depth_limit_alias_capabilities_and_leaf_errors(tmp
     assert error["schema_version"] == "xray.cli.v2"
     assert error["command"] == "replace.plan"
     assert error["error"]["code"] == "invalid_request"
+
+
+def test_compact_v3_exact_interface_impact_and_capabilities_preserve_v2(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = repo / "service.py"
+    source.write_text(
+        "class Service:\n"
+        "    def first(self):\n"
+        "        return 1\n"
+        "    def second(self):\n"
+        "        return 2\n"
+        "\n"
+        "def helper():\n"
+        "    return Service()\n",
+        encoding="utf-8",
+    )
+    exact = {
+        "name": "second",
+        "owner": "Service",
+        "qualified_name": "Service.second",
+        "type": "method",
+        "path": "service.py",
+        "start_line": 4,
+        "end_line": 5,
+    }
+
+    assert cli.main(["interface", str(repo), "service.py", "--limit", "1"]) == 0
+    compatible = json.loads(capsys.readouterr().out)
+    assert compatible["schema_version"] == "xray.cli.v2"
+    assert "returned_symbols" in compatible["interface"]
+    assert "completeness" not in compatible["interface"]
+
+    assert cli.main(["interface", str(repo), "service.py", "--schema", "v3", "--limit", "1", "--max-members", "1"]) == 0
+    incomplete = json.loads(capsys.readouterr().out)["interface"]
+    assert incomplete["completeness"]["complete"] is False
+    assert set(incomplete["completeness"]["reasons"]) == {"member_truncated", "page_truncated"}
+
+    assert (
+        cli.main(["interface", str(repo), "--symbol-json", json.dumps(exact), "--schema", "v3", "--max-members", "1"])
+        == 0
+    )
+    selected = json.loads(capsys.readouterr().out)
+    interface = selected["interface"]
+    assert selected["schema_version"] == "xray.cli.v3" and selected["ok"] is True
+    assert "returned_symbols" not in interface and "total_symbols" not in interface
+    assert interface["returned"] == 1 and interface["total"] == 1
+    assert interface["completeness"] == {"complete": True, "reasons": []}
+    assert [item["name"] for item in interface["symbols"]] == ["Service"]
+    assert [item["name"] for item in interface["symbols"][0]["members"]] == ["second"]
+
+    impact_result = {
+        "references": [{"file": str(source), "line": 5, "text": "        return 2", "type": "read"}],
+        "total_count": 1,
+        "raw_count": 3,
+        "filtered_count": 2,
+        "strategy": "structural",
+        "note": "one reference",
+        "total_exact": True,
+        "execution_limited": False,
+        "execution_cap": 51,
+    }
+    with patch.object(XRayIndexer, "what_breaks", return_value=impact_result):
+        assert cli.main(["impact", str(repo), "--symbol-json", json.dumps(exact), "--schema", "v3"]) == 0
+    impact = json.loads(capsys.readouterr().out)
+    assert impact["schema_version"] == "xray.cli.v3" and impact["ok"] is True
+    assert "total_count" not in impact["impact"] and "raw_count" not in impact["impact"]
+    assert impact["impact"]["total"] == 1
+    assert impact["impact"]["total_exact"] is True
+    assert impact["impact"]["diagnostics"]["raw_count"] == 3
+    assert "total_exact" not in impact["impact"]["diagnostics"]
+
+    assert cli.main(["capabilities", str(repo), "--schema", "v3"]) == 0
+    capabilities = json.loads(capsys.readouterr().out)
+    contract = capabilities["capabilities"]
+    assert capabilities["schema_version"] == "xray.cli.v3"
+    assert contract["schema_contracts"]["cli_default"] == "xray.cli.v2"
+    assert contract["surfaces"]["cli"]["defaults"]["read_symbol"]["max_bytes"] == 65536
+    assert contract["surfaces"]["mcp"]["cache"]["indexers"]["effective_limit"] >= 1
+    assert "scan" in contract["surfaces"]["cli"]["operations"]["read_only"]
+    assert contract["surfaces"]["cli"]["administrative"] == ["skill-install"]
+    assert contract["surfaces"]["mcp"]["resource_templates"] == ["skill://xray-progressive-discovery/{path*}"]
+    assert contract["cache"]["files"] == ["symbols.json", "inventory.json"]
+    assert contract["bounds"]["replacement_total_bytes"] == 50 * 1024 * 1024
+
+    assert cli.main(["explore", str(repo), "--schema", "v3", "--limit", "1"]) == 0
+    explore = json.loads(capsys.readouterr().out)
+    assert explore["schema_version"] == "xray.cli.v3" and explore["ok"] is True
+
+    assert cli.main(["interface", str(repo), "--schema", "v3"]) == 2
+    error = json.loads(capsys.readouterr().err)
+    assert error["schema_version"] == "xray.cli.v3" and error["ok"] is False
 
 
 def test_cli_rules_and_replacement_refinement_are_non_mutating(tmp_path, capsys):

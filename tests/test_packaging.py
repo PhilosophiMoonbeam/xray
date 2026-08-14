@@ -25,7 +25,7 @@ def test_project_metadata_is_cli_first_with_mcp_compatibility():
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     project = data["project"]
 
-    assert project["version"] == "0.10.0"
+    assert project["version"] == "0.11.0"
     assert "CLI" in project["description"]
     assert "MCP compatibility" in project["description"]
     assert "cli" in project["keywords"]
@@ -95,8 +95,8 @@ def test_packaged_cli_skill_exactly_matches_repository_source():
 def test_packaged_mcp_skill_is_current_and_token_bounded():
     content = (ROOT / "src" / "xray" / "skills" / "xray-progressive-discovery" / "SKILL.md").read_text(encoding="utf-8")
 
-    assert "regular expression and returns at most 10 matches" in content
-    assert "a broad `.` can" in content
+    assert "ranks natural intent" in content
+    assert '`mode="regex"`' in content
     assert "read_interface_structured" in content
     assert "read_symbol" in content
     assert "symbol_at" in content
@@ -105,6 +105,7 @@ def test_packaged_mcp_skill_is_current_and_token_bounded():
     assert "`scan_rules`, `check_rules`," in content
     assert "plan_replacement" in content
     assert "refine_replacement" in content
+    assert "verify_replacement" in content
     assert "apply_replacement" in content
     assert "xray.replace.v2" in content
     assert "`isError=true`" in content
@@ -143,7 +144,9 @@ def test_top_level_cli_skill_is_agent_skills_compliant():
     assert "xray search" in body
     assert "xray replace plan ROOT" in body
     assert "xray replace refine ROOT" in body
+    assert "xray replace verify ROOT" in body
     assert "xray replace apply ROOT" in body
+    assert "(.plan // .).edit_manifest[].edit_id" in body
     assert "xray.replace.v2" in body
     assert "REVIEWED_DIGEST" in body
     assert "Legacy `rewrite` and `scan --fix` remain destructive" in body
@@ -202,7 +205,10 @@ def test_readme_documents_generated_cli_decision():
     assert "xray skill install --user" in readme
     assert "xray skill install --project /path/to/project" in readme
     assert "does not forward arbitrary" in readme
-    assert "`search_tools` accepts a regular expression and returns at most 10 matches" in readme
+    assert "`search_tools` ranks natural intent by default" in readme
+    assert "xray replace verify ROOT" in readme
+    assert "(.plan // .).edit_manifest[].edit_id" in readme
+    assert "`symbol-at`/`symbol_at` resolves" in readme
     assert "`xray skill install` is intentionally CLI-only" in readme
     assert "`xray-mcp` fixes the FastMCP transport to stdio" in readme
     assert "mcp-config-generator.py cursor installed_script" in readme

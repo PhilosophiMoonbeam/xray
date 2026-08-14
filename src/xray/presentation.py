@@ -135,6 +135,38 @@ def compact_impact_references(
     return compact
 
 
+def compact_v3_interface(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Project interface data to one paging vocabulary and typed completeness."""
+    result = dict(data)
+    result.pop("returned_symbols", None)
+    result.pop("total_symbols", None)
+    reasons: list[str] = []
+    warnings = [str(value) for value in result.get("warnings", [])]
+    if any("Members for" in warning for warning in warnings):
+        reasons.append("member_truncated")
+    if bool(result.get("truncated")):
+        reasons.append("page_truncated")
+    if not bool(result.get("complete", True)) and not reasons:
+        reasons.append("source_incomplete")
+    result["completeness"] = {"complete": not reasons, "reasons": reasons}
+    result.pop("complete", None)
+    return result
+
+
+def compact_v3_impact(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove overlapping impact counters while retaining named diagnostics."""
+    result = dict(data)
+    diagnostics = {
+        key: result.pop(key)
+        for key in ("raw_count", "filtered_count", "execution_cap", "execution_limited")
+        if key in result
+    }
+    result.pop("total_count", None)
+    if diagnostics:
+        result["diagnostics"] = diagnostics
+    return result
+
+
 def cursor_fingerprint(command: str, root_path: Path, identity: Mapping[str, Any]) -> str:
     """Return a stable query binding for an opaque result cursor."""
     value = json.dumps([command, str(root_path.resolve()), identity], separators=(",", ":"), sort_keys=True)

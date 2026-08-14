@@ -129,8 +129,8 @@ the alias is used.
 ```bash
 xray explore ROOT [--max-depth N | --all-depths] [--include-symbols | --symbols] \
   [--focus PATH]... [--max-symbols-per-file N] [--type TYPE[,TYPE...]] [--max-entries N | --limit N] \
-  [--no-default-exclusions] \
-  [--detail compact|full] [--format json|text] [--pretty]
+  [--strict-focus] [--no-default-exclusions] \
+  [--detail compact|full] [--schema v2|v3] [--format json|text] [--pretty]
 ```
 
 Important options:
@@ -141,6 +141,7 @@ Important options:
 - `--focus PATH` accepts contained nested files or directories. Focus retains
   root-level context files and the complete ancestor chain, then traverses only
   selected descendant subtrees.
+- `--strict-focus` omits unrelated root context while retaining focus ancestors.
 - `--max-symbols-per-file N` limits skeleton detail per file and must be zero or greater.
 - `--max-entries N` and its `--limit N` alias bound map entries (default: 5000).
 - Compact JSON is the default and returns structured `entries` without duplicated `tree_text`, absolute paths, names derivable from paths, or empty envelope fields.
@@ -188,7 +189,8 @@ the v1 envelope. Find promises name identity matching, not semantic behavior sea
 ```bash
 xray interface ROOT FILE_PATH [--name NAME]... [--type TYPE]... \
   [--visibility VISIBILITY]... [--member-depth N] [--max-members N] \
-  [--limit N] [--cursor TOKEN] [--detail compact|full]
+  [--limit N] [--cursor TOKEN] [--detail compact|full] [--schema v2|v3]
+xray interface ROOT --symbol-json "$symbol" --schema v3
 ```
 
 `FILE_PATH` may be absolute or relative to `ROOT`, but it must resolve inside the
@@ -198,6 +200,10 @@ symbols, direct members, signatures, one-based ranges, visibility, role,
 documentation, `complete`, and warnings. `--detail full` preserves the legacy v1
 string envelope. Typed compact errors distinguish missing, unsupported,
 containment, parse, upstream, and size failures.
+
+V3 removes duplicate symbol/page counts, returns `completeness.reasons` such as
+`member_truncated` and `page_truncated`, and accepts exact symbol JSON/file input.
+A member symbol returns only its owner and selected member path.
 
 Use `xray read-symbol ROOT` with the same symbol JSON/file/manual inputs as
 impact to return a bounded exact source slice. `xray symbol-at ROOT FILE LINE`
@@ -213,7 +219,7 @@ xray impact ROOT --name target --path src/app.py --start-line 1 [--type function
 ```
 
 Impact also accepts `--limit N`, `--cursor TOKEN`, `--detail compact|full`,
-`--context-lines N`, `--format json|text`, and `--pretty`.
+`--context-lines N`, `--schema v2|v3`, `--format json|text`, and `--pretty`.
 
 Provide exactly one symbol source:
 
@@ -293,7 +299,9 @@ xray replace plan ROOT \
   --path src --glob '*.py' > plan.json
 
 # Review every edit_id, preview, diff, warning, bound, applicability value, hash, and digest.
+jq -r '(.plan // .).edit_manifest[].edit_id' plan.json
 xray replace refine ROOT --plan-file plan.json --edit-id EDIT_ID > refined.json
+xray replace verify ROOT --plan-file refined.json --expected-digest REVIEWED_DIGEST
 xray replace apply ROOT --plan-file refined.json --expected-digest REVIEWED_DIGEST
 ```
 
@@ -304,22 +312,26 @@ source/postimage hashes, warnings, applicability, and complete-artifact digest.
 Preview or diff truncation makes a plan inapplicable unless explicit
 `--allow-truncated-review` acknowledgement is recorded. Zero-candidate plans
 are inapplicable and all-no-op plans require `--allow-noop`. Applying rejects
-v1 plans and requires the complete plan plus an independently copied reviewed
+new parse errors and dirty affected files unless their exceptional
+`--allow-new-parse-errors` or `--allow-dirty-affected` acknowledgements were
+recorded in the plan. `replace verify` recomputes every apply guard without
+writing. Applying rejects v1 plans and requires the complete plan plus an independently copied reviewed
 digest. XRAY recomputes the candidate set and rejects root, query, count, digest,
-or source drift before writing. It prepares same-directory staged files, preserves
-file modes, verifies postimages, and restores already replaced files if a later
-replacement fails. Use `--rule` instead of pattern/replacement to plan a fix-bearing
+source, syntax, or dirty-state drift before writing. It prepares same-directory
+staged files, preserves file modes, verifies postimages, and restores already
+replaced files if a later replacement fails. Process termination cannot
+guarantee rollback, so use a recoverable worktree and inspect the final diff.
+Use `--rule` instead of pattern/replacement to plan a fix-bearing
 ast-grep rule. `rewrite` remains available only as an explicit legacy all-match
 operation.
 
 ## JSON Output
 
-Compact output uses `schema_version: "xray.cli.v2"`. `--detail full` preserves
-v1 where supported, including find and the legacy interface/impact projections.
-JSON is one line unless `--pretty` is requested; text is deliberately lossy.
-Compact successes include `ok: true`. Compact failures include the exact leaf
-command and `error: {code, message, details?}` with `ok: false`; full/v1 keeps
-legacy string errors where compatibility requires them.
+Compact output defaults to `schema_version: "xray.cli.v2"`; its established
+field presence is preserved. `--schema v3` opts into consistent `ok`, one paging
+vocabulary, typed interface completeness reasons, exact-symbol interface
+handoff, and named compact impact diagnostics. `--detail full` preserves v1
+where supported. JSON is one line unless `--pretty` is requested; text is lossy.
 
 Exit codes are `0` for success, `1` for command failure, and `2` for parse or
 validation errors.
@@ -379,10 +391,11 @@ Clients initially see only `search_tools` and `call_tool`. They discover the
 underlying XRAY operations through search, then execute them through `call_tool`
 with a `{name, arguments}` payload.
 
-`search_tools` accepts a regular expression and returns at most 10 matches. Use
-a focused literal or alternation such as `interface|signature`; a broad `.` can
-hide later operations. Natural intents include `lookup`, `blast radius`,
-`callers`, `rename`, `safe code replacement`, `help`, and `workflow`.
+`search_tools` ranks natural intent by default and supports `mode: "regex"` for
+explicit regular expressions. Summary results omit full schemas; request
+`detail: "full"` only when preparing a call. Results report exact totals,
+truncation, and `next_cursor`. Ordinary change intent ranks guarded planning and
+hides legacy `rewrite_pattern`; exact legacy intent can still discover it.
 
 ```json
 {
@@ -402,11 +415,12 @@ The transformed MCP surface exposes compact metadata and tags for:
   explicitly removes the depth bound.
 - `find_symbol`: calibrated name/qualified-identity filters, scores, and paging.
 - `read_interface`: read a text file interface without implementation bodies.
-- `read_interface_structured`: bounded/filterable typed hierarchy with paging.
+- `read_interface_structured`: bounded/filterable typed hierarchy with paging;
+  v3 `exact_symbol` returns only the selected owner/member path.
 - `read_symbol` and `symbol_at`: bounded exact source and line-to-symbol lookup.
 - `search_pattern`: compact structural matches, bounded to 50 by default, with `returned`, `total`, `truncated`, and snapshot-bound `next_cursor` continuation. Set `detail: "full"` for raw ast-grep matches.
 - `rewrite_pattern`: in-place replacement with a compact count/path summary by default. Full detail is bounded but never advertises continuation after mutation.
-- `plan_replacement` and `refine_replacement`: non-mutating v2 review and edit selection.
+- `plan_replacement`, `refine_replacement`, and `verify_replacement`: non-mutating v2 review, edit selection, and guard verification.
 - `apply_replacement`: destructive guarded application requiring the complete plan and independently supplied digest.
 - `scan_rules`, `check_rules`, `explain_rules`, and `test_rules`: read-only rule operations.
 - `apply_rule_fixes`: destructive application of a reviewed v2 rule plan.
@@ -575,7 +589,8 @@ XRAY is intentionally smaller than a language server:
 - `what_breaks` is a symbol-name reference search, not a type-aware dependency graph.
 - Impact fallback text search may include comments or strings.
 - XRAY does not answer direct "what depends on this class?" graph queries unless that can be approximated from symbol references.
-- XRAY does not provide a direct "what symbol is defined at line N?" tool.
+- `symbol-at`/`symbol_at` resolves the narrowest supported symbol at a line; it
+  does not provide language-server type or reference resolution.
 - Unsupported languages may still appear in repository maps, but symbol extraction is limited to the supported patterns above.
 - `interface` and `impact` reject paths outside the requested repository root.
 

@@ -1,19 +1,21 @@
 """XRAY's search-first stdio MCP server."""
 
 import asyncio
+import hashlib
 import json
 import os
+import re
 import threading
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Annotated, Any, Literal, TypeVar
 
 from fastmcp import Context, FastMCP
 from fastmcp.server.providers.skills import SkillsDirectoryProvider
 from fastmcp.server.transforms import ToolTransform
-from fastmcp.server.transforms.search import RegexSearchTransform
-from fastmcp.tools import ToolResult
+from fastmcp.server.transforms.search.base import BaseSearchTransform
+from fastmcp.tools import Tool, ToolResult
 from fastmcp.tools.tool_transform import ArgTransformConfig, ToolTransformConfig
 
 from xray.core.indexer import InterfaceReadError, XRayIndexer
@@ -29,8 +31,11 @@ from xray.presentation import (
     compact_explore,
     compact_impact_references,
     compact_structural_items,
+    compact_v3_impact,
+    compact_v3_interface,
     cursor_fingerprint,
     decode_cursor,
+    encode_cursor,
     page_items,
 )
 
@@ -62,8 +67,8 @@ def mcp_error(code: str, message: str, *, details: dict[str, Any] | None = None)
 
 XRAY_WORKFLOW_GUIDE = """# XRAY Progressive Discovery
 
-Discover tools with `search_tools`, which accepts a regular expression and returns at most 10 matches.
-Use a focused literal or alternation such as `interface|signature`; do not use `.` to inventory the surface.
+Discover tools with ranked `search_tools`. Intent mode is the default; regex mode is explicit.
+Use phrases such as `find usages` or `change function safely`. Results page with a cursor and summary detail.
 Execute one discovered operation through `call_tool` with its exact name and arguments.
 
 Use XRAY as map -> find -> interface -> impact:
@@ -75,6 +80,7 @@ Use XRAY as map -> find -> interface -> impact:
    Keep the returned symbol object, including path and line data.
 3. Inspect source contracts with `read_interface_structured` when typed hierarchy,
    documentation, and completeness matter. `read_interface` preserves the legacy text projection.
+   Pass the complete find symbol as `exact_symbol` with `schema="v3"` to return only its owner/member path.
    Python uses enriched standard-library AST data; other supported languages expose ast-grep completeness warnings.
 4. Check likely symbol-name code references with `what_breaks`.
    Pass the entire symbol object from `find_symbol`.
@@ -86,9 +92,10 @@ return at most 50 compact items by default. Check `returned`, `total`, `total_ex
 Request `detail="full"` only for raw ast-grep metadata. `scan_rules` is read-only. Build a reviewed rule plan with
 `plan_replacement`, then use `apply_rule_fixes` for guarded rule mutation. `rewrite_pattern` remains a legacy
 all-match mutation regardless of the reporting limit and never supports continuation after mutation.
-For replacement, call read-only `plan_replacement`, review every count, path, warning, hash, preview,
-and `plan_digest`, then pass the complete plan plus an independently copied digest to destructive
-`apply_replacement`. It rejects query or source drift before writing and rolls back partial application.
+For replacement, call read-only `plan_replacement`, review every edit in `edit_manifest`, syntax result,
+dirty-file acknowledgement, warning, hash, diff, and `plan_digest`, then call `verify_replacement`.
+Only then pass the complete plan plus an independently copied digest to destructive `apply_replacement`.
+Apply revalidates syntax and source state before writing and rolls back partial application.
 Pass `lang` whenever known for pattern plans and rewrites. Keep `rewrite_pattern` only for explicit
 legacy all-match mutation.
 """
@@ -105,6 +112,310 @@ DESTRUCTIVE_TOOL_ANNOTATIONS = {
     "idempotentHint": False,
     "openWorldHint": False,
 }
+
+DEFAULT_TOOL_SEARCH_LIMIT = 10
+MAX_TOOL_SEARCH_LIMIT = 50
+READ_ONLY_SEARCH_BASE_SCORE = 5
+LEGACY_DISCOVERY_TERMS = {"legacy", "unsafe", "all-match", "all match", "destructive"}
+MUTATION_INTENT_TERMS = {"change", "fix", "rename", "replace", "rewrite"}
+TOOL_WORKFLOW_STAGES = {
+    "explore_repo": "discover",
+    "find_symbol": "discover",
+    "search_pattern": "discover",
+    "scan_rules": "discover",
+    "file_imports": "discover",
+    "file_exports": "discover",
+    "read_interface": "inspect",
+    "read_interface_structured": "inspect",
+    "read_symbol": "inspect",
+    "symbol_at": "inspect",
+    "what_breaks": "analyze",
+    "check_rules": "analyze",
+    "explain_rules": "analyze",
+    "test_rules": "analyze",
+    "xray_capabilities": "inspect",
+    "plan_replacement": "plan",
+    "refine_replacement": "plan",
+    "verify_replacement": "verify",
+    "apply_replacement": "apply",
+    "apply_rule_fixes": "apply",
+    "rewrite_pattern": "legacy_mutate",
+}
+TOOL_INTENT_ALIASES = {
+    "explore_repo": {"map", "tree", "repository overview", "layout", "file tree", "project structure"},
+    "find_symbol": {"find", "find symbol", "lookup", "definition", "definitions", "function", "method", "class"},
+    "read_interface": {"interface", "signature", "contract", "docstring", "api", "summary", "body"},
+    "read_interface_structured": {"structured interface", "typed interface", "api hierarchy"},
+    "read_symbol": {"read symbol", "source body", "implementation"},
+    "symbol_at": {"symbol at line", "line data", "enclosing symbol"},
+    "what_breaks": {
+        "blast radius",
+        "breaking change",
+        "callers",
+        "change impact",
+        "find usages",
+        "references",
+        "used by",
+        "usages",
+        "who calls",
+    },
+    "search_pattern": {"structural search", "ast search", "code pattern"},
+    "plan_replacement": {
+        "change function safely",
+        "fix",
+        "rename",
+        "rename symbol",
+        "replace",
+        "replace expression",
+        "replacement plan",
+        "safe change",
+        "safe code replacement",
+    },
+    "refine_replacement": {"select edits", "refine replacement", "edit ids"},
+    "verify_replacement": {"verify replacement", "validate replacement", "check replacement plan"},
+    "apply_replacement": {"apply replacement", "approved replacement"},
+    "scan_rules": {"scan rules", "rule diagnostics", "lint rules"},
+    "check_rules": {"validate rule", "rule validation", "check rule"},
+    "explain_rules": {"explain rule", "inspect rule"},
+    "test_rules": {"test rule", "rule tests"},
+    "apply_rule_fixes": {"apply rule fixes", "fix rule matches"},
+    "file_imports": {"file imports", "imports", "dependencies"},
+    "file_exports": {"file exports", "exports", "public api"},
+    "xray_capabilities": {"help", "workflow", "capabilities", "doctor", "limits"},
+    "rewrite_pattern": {"legacy rewrite", "unsafe rewrite", "all-match rewrite", "destructive rewrite"},
+}
+INTENT_SYNONYMS = {
+    "calls": {"caller", "callers", "references", "usage"},
+    "caller": {"callers", "references", "usage"},
+    "callers": {"caller", "references", "usage"},
+    "usage": {"references", "usages", "used"},
+    "usages": {"references", "usage", "used"},
+    "rename": {"change", "replace"},
+    "validate": {"check", "verification"},
+    "validation": {"check", "verification"},
+}
+WORKFLOW_STAGE_ORDER = {
+    "discover": 0,
+    "inspect": 1,
+    "analyze": 2,
+    "plan": 3,
+    "verify": 4,
+    "apply": 5,
+    "legacy_mutate": 6,
+}
+
+
+class XRayToolSearchTransform(BaseSearchTransform):
+    """Expose deterministic intent and explicit-regex discovery with bounded metadata."""
+
+    @staticmethod
+    def _tokens(value: str) -> set[str]:
+        return set(re.findall(r"[a-z0-9]+", value.casefold()))
+
+    @staticmethod
+    def _tool_dump(tool: Tool) -> dict[str, Any]:
+        annotations: dict[str, Any] = {}
+        if tool.annotations is not None:
+            annotations = tool.annotations.model_dump(mode="json", by_alias=True, exclude_none=True)
+        return {
+            "name": tool.name,
+            "description": tool.description or "",
+            "tags": sorted(str(value) for value in tool.tags),
+            "parameters": tool.parameters,
+            "annotations": annotations,
+        }
+
+    @classmethod
+    def _mutation_class(cls, tool: Tool) -> str:
+        if tool.name == "rewrite_pattern":
+            return "legacy_mutation"
+        annotations = cls._tool_dump(tool).get("annotations", {})
+        if annotations.get("destructiveHint"):
+            return "guarded_mutation"
+        return "read_only"
+
+    @staticmethod
+    def _legacy_intent(query: str) -> bool:
+        normalized = " ".join(query.casefold().replace("_", " ").split())
+        return any(term in normalized for term in LEGACY_DISCOVERY_TERMS)
+
+    @classmethod
+    def _catalog_digest(cls, tools: Sequence[Tool]) -> str:
+        payload = [cls._tool_dump(tool) for tool in tools]
+        return hashlib.sha256(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()).hexdigest()[:24]
+
+    @classmethod
+    def _rank_intent(cls, tool: Tool, query: str) -> tuple[int, list[str]]:
+        normalized = " ".join(query.casefold().replace("_", " ").split())
+        query_tokens = cls._tokens(normalized)
+        aliases = TOOL_INTENT_ALIASES.get(tool.name, set())
+        dump = cls._tool_dump(tool)
+        name_tokens = cls._tokens(tool.name)
+        tag_tokens = cls._tokens(" ".join(str(value) for value in dump.get("tags", [])))
+        description_tokens = cls._tokens(tool.description or "")
+        parameter_tokens = cls._tokens(
+            " ".join(str(value) for value in dump.get("parameters", {}).get("properties", {}))
+        )
+        alias_tokens = cls._tokens(" ".join(sorted(aliases)))
+        score = 0
+        reasons: list[str] = []
+        if normalized == tool.name.casefold().replace("_", " "):
+            score += 160
+            reasons.append("exact_name")
+        if normalized in aliases:
+            score += 140
+            reasons.append("exact_alias")
+        for token in query_tokens:
+            variants = {token, *INTENT_SYNONYMS.get(token, set())}
+            if variants & name_tokens:
+                score += 32
+                reasons.append(f"name:{token}")
+            if variants & tag_tokens:
+                score += 24
+                reasons.append(f"tag:{token}")
+            if variants & alias_tokens:
+                score += 20
+                reasons.append(f"alias:{token}")
+            if variants & description_tokens:
+                score += 8
+                reasons.append(f"description:{token}")
+            if variants & parameter_tokens:
+                score += 4
+                reasons.append(f"parameter:{token}")
+        stage = TOOL_WORKFLOW_STAGES.get(tool.name, "inspect")
+        mutation_intent = bool(query_tokens & MUTATION_INTENT_TERMS)
+        if mutation_intent and stage == "plan":
+            score += 45
+            reasons.append("safe_plan_first")
+        if "verify" in query_tokens and stage == "verify":
+            score += 70
+            reasons.append("requested_verify_stage")
+        if "apply" in query_tokens and stage == "apply":
+            score += 70
+            reasons.append("requested_apply_stage")
+        if cls._mutation_class(tool) == "read_only":
+            score += READ_ONLY_SEARCH_BASE_SCORE
+        return score, list(dict.fromkeys(reasons))
+
+    @classmethod
+    def _rank_tools(
+        cls, tools: Sequence[Tool], query: str, mode: Literal["intent", "regex"]
+    ) -> list[tuple[Tool, int, list[str]]]:
+        legacy_intent = cls._legacy_intent(query)
+        broad = mode == "intent" and query.strip().casefold() in {".", "*", "all", "inventory", "tools"}
+        compiled: re.Pattern[str] | None = None
+        if mode == "regex":
+            compiled = re.compile(query, re.IGNORECASE)
+        ranked: list[tuple[Tool, int, list[str]]] = []
+        for tool in tools:
+            if tool.name == "rewrite_pattern" and not legacy_intent:
+                continue
+            score, reasons = cls._rank_intent(tool, query)
+            if compiled is not None:
+                searchable = json.dumps(cls._tool_dump(tool), separators=(",", ":"), sort_keys=True)
+                match = compiled.search(searchable)
+                if match is None:
+                    continue
+                score += 100 if compiled.fullmatch(tool.name) else 40
+                reasons.append("regex_match")
+            elif not broad and score <= READ_ONLY_SEARCH_BASE_SCORE:
+                continue
+            if legacy_intent and tool.name == "rewrite_pattern":
+                score += 100
+                reasons.append("explicit_legacy_intent")
+            ranked.append((tool, score, list(dict.fromkeys(reasons))))
+        ranked.sort(
+            key=lambda item: (
+                -item[1],
+                WORKFLOW_STAGE_ORDER.get(TOOL_WORKFLOW_STAGES.get(item[0].name, "inspect"), 99),
+                item[0].name,
+            )
+        )
+        return ranked
+
+    async def _search(self, tools: Sequence[Tool], query: str) -> Sequence[Tool]:
+        return [item[0] for item in self._rank_tools(tools, query, "intent")[: self._max_results]]
+
+    @classmethod
+    def _summary(cls, tool: Tool, score: int, reasons: list[str]) -> dict[str, Any]:
+        dump = cls._tool_dump(tool)
+        return {
+            "name": tool.name,
+            "description": tool.description or "",
+            "annotations": dump.get("annotations", {}),
+            "tags": sorted(str(value) for value in dump.get("tags", [])),
+            "parameters": sorted(str(value) for value in dump.get("parameters", {}).get("properties", {})),
+            "mutation_class": cls._mutation_class(tool),
+            "workflow_stage": TOOL_WORKFLOW_STAGES.get(tool.name, "inspect"),
+            "score": score,
+            "match_reasons": reasons,
+        }
+
+    def _make_search_tool(self) -> Tool:
+        transform = self
+
+        async def search_tools(
+            pattern: Annotated[str, "Natural-language intent, or a regex when mode='regex'"],
+            mode: Annotated[Literal["intent", "regex"], "intent (default) or explicit regex compatibility"] = "intent",
+            limit: Annotated[int, "Page size from 1 to 50"] = DEFAULT_TOOL_SEARCH_LIMIT,
+            cursor: Annotated[str | None, "next_cursor from the identical catalog and query"] = None,
+            detail: Annotated[
+                Literal["summary", "full"], "summary metadata (default) or complete tool schemas"
+            ] = "summary",
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> dict[str, Any] | ToolResult:
+            """Find tools by ranked intent or explicit regex with bounded, exact paging."""
+            if limit < 1 or limit > MAX_TOOL_SEARCH_LIMIT:
+                return mcp_error("invalid_request", f"limit must be between 1 and {MAX_TOOL_SEARCH_LIMIT}.")
+            if not pattern:
+                return mcp_error("invalid_request", "pattern must not be empty.")
+            hidden = await transform._get_visible_tools(ctx)
+            try:
+                ranked = transform._rank_tools(hidden, pattern, mode)
+            except re.error as exc:
+                return mcp_error("invalid_regex", f"Invalid tool-search regex: {exc}.")
+            identity = {
+                "catalog": transform._catalog_digest(hidden),
+                "pattern": pattern,
+                "mode": mode,
+                "detail": detail,
+                "legacy_intent": transform._legacy_intent(pattern),
+            }
+            fingerprint = cursor_fingerprint("search_tools", Path("/"), identity)
+            try:
+                offset = decode_cursor(cursor, fingerprint)
+            except ValueError as exc:
+                return mcp_error("invalid_cursor", str(exc))
+            page = ranked[offset : offset + limit]
+            if detail == "full":
+                rendered = await transform._render_results([item[0] for item in page])
+                if not isinstance(rendered, list):
+                    return mcp_error("search_failed", "FastMCP returned a non-list tool catalog projection.")
+                matches = []
+                for serialized, (_tool, score, reasons) in zip(rendered, page, strict=True):
+                    match = dict(serialized)
+                    match["discovery"] = transform._summary(_tool, score, reasons)
+                    matches.append(match)
+            else:
+                matches = [transform._summary(tool, score, reasons) for tool, score, reasons in page]
+            next_offset = offset + len(page)
+            result: dict[str, Any] = {
+                "query": pattern,
+                "mode": mode,
+                "detail": detail,
+                "matches": matches,
+                "returned": len(matches),
+                "total": len(ranked),
+                "total_exact": True,
+                "truncated": next_offset < len(ranked),
+                "catalog_total": len(hidden),
+                "legacy_tools_included": transform._legacy_intent(pattern),
+            }
+            if result["truncated"]:
+                result["next_cursor"] = encode_cursor(next_offset, fingerprint)
+            return result
+
+        return Tool.from_function(fn=search_tools, name=self._search_tool_name)
 
 
 @mcp.resource(
@@ -127,16 +438,18 @@ def xray_discovery_plan(goal: str = "understand a code change") -> str:
     """Create a short XRAY discovery plan for a client task."""
     return (
         f"Goal: {goal}\n\n"
-        "Use a focused search_tools regular expression, then call the discovered tool through call_tool.\n"
+        "Use ranked search_tools intent search, then call the discovered tool through call_tool.\n"
         "Use XRAY progressively:\n"
         "1. Call explore_repo; use compact entries for file selection and request detail='full' only for tree_text.\n"
         "2. Call find_symbol with the most relevant symbol name or owner-qualified identity.\n"
-        "3. Call read_interface_structured for typed hierarchy/completeness, or read_interface for legacy text.\n"
+        "3. Call read_interface_structured with exact_symbol and schema='v3' for its owner/member path, "
+        "or read_interface for legacy text.\n"
         "4. Call what_breaks with the full symbol object before changing public code; "
         "treat results as name-based references, not a type-aware dependency graph.\n\n"
         "For structural reads, inspect returned/total/total_exact/truncated and continue next_cursor only with "
         "identical arguments and an unchanged source snapshot. For mutation, call plan_replacement, review the "
-        "complete plan and digest, then call apply_replacement with that plan and an independently copied digest. "
+        "edit_manifest, syntax/dirty evidence, and digest; call verify_replacement; then call apply_replacement "
+        "with that plan and an independently copied digest. "
         "For pattern plans or rewrites, pass lang whenever the target language is known. "
         "Legacy rewrite still applies every match and cannot be continued. Rule fixes require a reviewed plan.\n\n"
         "Fetch xray://workflow only if more detailed XRAY usage guidance is needed."
@@ -260,6 +573,7 @@ async def explore_repo(
     all_depths: bool | str = False,
     include_symbols: bool | str = False,
     focus_dirs: list[str] | None = None,
+    include_root_context: bool | str = True,
     max_symbols_per_file: int | str = 5,
     symbol_types: list[str] | str | None = None,
     max_entries: int | str = 5000,
@@ -279,6 +593,8 @@ async def explore_repo(
             max_entries = int(max_entries)
         if isinstance(include_symbols, str):
             include_symbols = include_symbols.lower() in ("true", "1", "yes")
+        if isinstance(include_root_context, str):
+            include_root_context = include_root_context.lower() in ("true", "1", "yes")
         if isinstance(all_depths, str):
             all_depths = all_depths.lower() in ("true", "1", "yes")
         if all_depths:
@@ -296,15 +612,16 @@ async def explore_repo(
             run_indexer_operation,
             root_path,
             lambda indexer: build_explore_result(
-                indexer,
-                max_depth,
-                include_symbols,
-                focus_dirs,
-                max_symbols_per_file,
-                symbol_types,
-                max_entries,
-                detail,
-                use_default_exclusions,
+                indexer=indexer,
+                max_depth=max_depth,
+                include_symbols=include_symbols,
+                focus_dirs=focus_dirs,
+                max_symbols_per_file=max_symbols_per_file,
+                symbol_types=symbol_types,
+                max_entries=max_entries,
+                detail=detail,
+                use_default_exclusions=use_default_exclusions,
+                include_root_context=include_root_context,
             ),
         )
         await ctx.report_progress(2, 2, "repository map ready")
@@ -324,6 +641,7 @@ def build_explore_result(
     max_entries: int = 5000,
     detail: str = "compact",
     use_default_exclusions: bool = True,
+    include_root_context: bool = True,
 ) -> dict[str, Any] | ToolResult:
     """Return compact repository entries or the full legacy map payload."""
     _validate_detail(detail)
@@ -332,6 +650,7 @@ def build_explore_result(
             max_depth=max_depth,
             include_symbols=include_symbols,
             focus_dirs=focus_dirs,
+            include_root_context=include_root_context,
             max_symbols_per_file=max_symbols_per_file,
             symbol_types=symbol_types,
             max_entries=max_entries,
@@ -354,6 +673,11 @@ def build_explore_result(
 def _validate_detail(detail: str) -> None:
     if detail not in {"compact", "full"}:
         raise ValueError("detail must be 'compact' or 'full'.")
+
+
+def _validate_schema(schema: str) -> None:
+    if schema not in {"v2", "v3"}:
+        raise ValueError("schema must be 'v2' or 'v3'.")
 
 
 def _prepare_page(
@@ -500,7 +824,10 @@ def read_interface(root_path: str, file_path: str) -> str | ToolResult:
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def read_interface_structured(
     root_path: str,
-    file_path: str,
+    file_path: Annotated[str | None, "Contained source file; omit when exact_symbol supplies its path"] = None,
+    exact_symbol: Annotated[
+        dict[str, Any] | None, "Exact find_symbol object; schema v3 selects only its owner/member path"
+    ] = None,
     symbol_names: list[str] | None = None,
     visibility: list[str] | None = None,
     symbol_types: list[str] | None = None,
@@ -508,16 +835,29 @@ def read_interface_structured(
     max_members: int = 20,
     limit: int | str = 50,
     cursor: str | None = None,
+    schema: Annotated[str, "Response projection: v2 compatibility default or compact v3"] = "v2",
 ) -> dict[str, Any] | ToolResult:
-    """Return a hierarchical typed interface with completeness and warnings."""
+    """Return a typed interface; v3 exact_symbol selects only its owner/member path."""
     try:
+        _validate_schema(schema)
+        selected_symbol = validate_symbol_input(exact_symbol) if exact_symbol is not None else None
+        if selected_symbol is not None:
+            if file_path is not None:
+                raise ValueError("Do not combine file_path with exact_symbol.")
+            file_path = str(selected_symbol.get("abs_path") or selected_symbol["path"])
+        if file_path is None:
+            raise ValueError("Provide file_path or exact_symbol.")
+        if selected_symbol is not None and schema != "v3":
+            raise ValueError("exact_symbol requires schema='v3'.")
         identity = {
             "file_path": file_path,
+            **({"exact_symbol": selected_symbol} if selected_symbol is not None else {}),
             "symbol_names": symbol_names or [],
             "visibility": visibility or [],
             "symbol_types": symbol_types or [],
             "member_depth": member_depth,
             "max_members": max_members,
+            **({"schema": "v3"} if schema == "v3" else {}),
         }
         normalized, parsed_limit, identity, _offset = _prepare_page(root_path, "interface", identity, limit, cursor)
         result = run_indexer_operation(
@@ -531,6 +871,7 @@ def read_interface_structured(
                     member_depth=member_depth,
                     max_symbols=None,
                     max_members=max_members,
+                    exact_symbol=selected_symbol,
                 )
             ),
         )
@@ -547,7 +888,7 @@ def read_interface_structured(
         if metadata["truncated"]:
             result["complete"] = False
             result["warnings"].append("Top-level interface symbols are paged; continue with next_cursor.")
-        return result
+        return compact_v3_interface(result) if schema == "v3" else result
     except InterfaceReadError as exc:
         return mcp_error(exc.code, str(exc))
     except Exception as exc:
@@ -596,6 +937,7 @@ def what_breaks(
     limit: int | str = DEFAULT_RESULT_LIMIT,
     cursor: str | None = None,
     detail: str = "compact",
+    schema: Annotated[str, "Response projection: v2 compatibility default or compact v3"] = "v2",
 ) -> dict[str, Any] | ToolResult:
     """Find likely symbol-name code references for impact review."""
     try:
@@ -612,11 +954,13 @@ def what_breaks(
         symbol_for_indexer = dict(exact_symbol)
         symbol_for_indexer["path"] = str(symbol_path)
         _validate_detail(detail)
+        _validate_schema(schema)
         identity = {
             "symbol": {
                 key: exact_symbol.get(key) for key in ("name", "path", "abs_path", "start_line", "end_line", "type")
             },
             "detail": detail,
+            **({"schema": "v3"} if schema == "v3" else {}),
         }
         normalized, parsed_limit, identity, offset = _prepare_page(str(root_path), "impact", identity, limit, cursor)
         result = run_indexer_operation(
@@ -640,7 +984,8 @@ def what_breaks(
             cursor=cursor,
             total_exact=bool(result.get("total_exact", True)),
         )
-        return dump_impact_result({**result, "references": page, **metadata})
+        presented = dump_impact_result({**result, "references": page, **metadata})
+        return compact_v3_impact(presented) if schema == "v3" and detail == "compact" else presented
     except Exception as e:
         return mcp_error("invalid_request", str(e))
 
@@ -739,6 +1084,8 @@ def plan_replacement(
     max_files: int = 100,
     allow_noop: bool = False,
     allow_truncated_review: bool = False,
+    allow_dirty_affected: bool = False,
+    allow_new_parse_errors: bool = False,
     preview_limit: int = 50,
     diff_limit: int = 100_000,
 ) -> dict[str, Any] | ToolResult:
@@ -757,6 +1104,8 @@ def plan_replacement(
                 max_files=max_files,
                 allow_noop=allow_noop,
                 allow_truncated_review=allow_truncated_review,
+                allow_dirty_affected=allow_dirty_affected,
+                allow_new_parse_errors=allow_new_parse_errors,
                 preview_limit=preview_limit,
                 diff_limit=diff_limit,
             ),
@@ -775,6 +1124,18 @@ def refine_replacement(root_path: str, plan: dict[str, Any], edit_ids: list[str]
         )
     except Exception as exc:
         return mcp_error("invalid_request", str(exc))
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+def verify_replacement(root_path: str, plan: dict[str, Any], expected_digest: str) -> dict[str, Any] | ToolResult:
+    """Recompute every replacement apply guard without writing files."""
+    try:
+        return run_indexer_operation(
+            root_path,
+            lambda indexer: indexer.verify_replacement(plan, expected_digest=expected_digest),
+        )
+    except Exception as exc:
+        return mcp_error("replacement_verification_failed", str(exc))
 
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
@@ -983,6 +1344,9 @@ mcp.add_transform(
                     "all_depths": ArgTransformConfig(description="Explicitly disable the depth limit when true."),
                     "include_symbols": ArgTransformConfig(description="Include function/class skeletons when true."),
                     "focus_dirs": ArgTransformConfig(description="Contained nested file/directory focuses."),
+                    "include_root_context": ArgTransformConfig(
+                        description="Keep unrelated root files as named context; false selects strict focus."
+                    ),
                     "max_symbols_per_file": ArgTransformConfig(description="Symbol skeleton limit per file."),
                     "symbol_types": ArgTransformConfig(
                         description="Optional symbol types to include, as a list or comma-separated string."
@@ -1147,6 +1511,12 @@ mcp.add_transform(
                     "allow_truncated_review": ArgTransformConfig(
                         description="Record explicit acknowledgement of bounded preview or diff content."
                     ),
+                    "allow_dirty_affected": ArgTransformConfig(
+                        description="Record acknowledgement that affected files already contain Git changes."
+                    ),
+                    "allow_new_parse_errors": ArgTransformConfig(
+                        description="Explicitly record permission for newly introduced parse errors."
+                    ),
                     "preview_limit": ArgTransformConfig(description="Maximum preview edits returned."),
                     "diff_limit": ArgTransformConfig(description="Maximum unified-diff characters returned."),
                 },
@@ -1158,6 +1528,18 @@ mcp.add_transform(
                     "root_path": ArgTransformConfig(description="Absolute root exactly matching the plan."),
                     "plan": ArgTransformConfig(description="Complete reviewed xray.replace.v2 plan."),
                     "edit_ids": ArgTransformConfig(description="Stable edit IDs selected from the plan manifest."),
+                },
+            ),
+            "verify_replacement": ToolTransformConfig(
+                description=(
+                    "Verify a safe code replacement plan without mutation by recomputing its digest, source, "
+                    "selection, syntax, dirty-file, completeness, and applicability guards."
+                ),
+                tags={"replace", "verify", "validate", "guarded", "safe code replacement"},
+                arguments={
+                    "root_path": ArgTransformConfig(description="Absolute root exactly matching the plan."),
+                    "plan": ArgTransformConfig(description="Complete reviewed xray.replace.v2 plan."),
+                    "expected_digest": ArgTransformConfig(description="Independently copied reviewed plan digest."),
                 },
             ),
             "apply_replacement": ToolTransformConfig(
@@ -1271,7 +1653,7 @@ mcp.add_transform(
     )
 )
 
-mcp.add_transform(RegexSearchTransform(max_results=10))
+mcp.add_transform(XRayToolSearchTransform(max_results=DEFAULT_TOOL_SEARCH_LIMIT))
 
 
 def main():

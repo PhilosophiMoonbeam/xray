@@ -78,6 +78,8 @@ class ExploreOptions(PublicModel):
     max_depth: int | None = None
     include_symbols: bool
     focus_dirs: list[str] = Field(default_factory=list)
+    include_root_context: bool = True
+    focus_mode: str = "root_context"
     max_symbols_per_file: int
     symbol_types: list[str] = Field(default_factory=list)
     max_entries: int = 5000

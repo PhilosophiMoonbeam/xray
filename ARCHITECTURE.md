@@ -34,12 +34,53 @@ skills, reports, tests, or harness. Presentation and public models may describe
 core values but do not perform repository analysis. Distribution and guidance
 wrap the adapters without becoming runtime dependencies of them.
 
-## Frozen xray-s3b design
+## XRAY 0.11.0 current contract
 
-This section is the implemented XRAY 0.10.0 candidate contract and is
-authoritative for current product behavior. Final qualification remains tracked
-by `xray-s3b.6`. The contract changes agent defaults only through the versioned
-migration below.
+XRAY 0.11.0 preserves Python 3.10+, default compact `xray.cli.v2`, explicit
+full/v1 output, JSON and `jq` pipelines, stdio MCP, repository containment,
+snapshot-bound cursors, and direct legacy mutation. Compact `xray.cli.v3` is
+opt-in through `--schema v3`; it standardizes success and paging fields without
+changing the v2 projection.
+
+V3 interface output uses only `returned`, `total`, `total_exact`, `truncated`,
+and `next_cursor` for paging. `completeness` contains a Boolean and typed reasons
+such as `member_truncated` and `page_truncated`. CLI symbol JSON/file input and
+MCP `exact_symbol` select only the found symbol's owner/member path. V3 compact
+impact retains page `total` and moves raw/filter/execution evidence under
+`diagnostics`; impact remains name-based rather than a semantic dependency graph.
+
+Repository focus depth is relative to each focus while entry `depth` remains
+root-relative. Default focus retains root context and ancestors; CLI
+`--strict-focus` and MCP `include_root_context=false` remove unrelated root
+context. Inventory visibility follows explicit Python underscore, Go
+capitalization, and JavaScript/TypeScript private/export conventions before
+public/private/unknown filtering.
+
+MCP discovery ranks natural intent over aliases, descriptions, tags, parameters,
+workflow stages, and mutation classes. Search returns exact paged totals and
+summary metadata by default; full detail supplies input schemas. Regex mode is
+explicit. Ordinary change intent ranks guarded `plan_replacement` and omits the
+direct legacy `rewrite_pattern`, which remains callable by exact name.
+
+Replacement plans contain a flat `edit_manifest`, per-file preimage/postimage
+syntax evidence, and top-level syntax validation. Planning rejects newly
+introduced parse diagnostics and dirty affected files unless their exceptional
+acknowledgements are recorded before digest calculation. `replace verify` and
+MCP `verify_replacement` recompute digest, selection, source, syntax, dirtiness,
+and applicability without writes. Apply repeats these checks for staged and
+final postimages, preserves modes, and rolls back partial ordinary failures.
+Process termination can interrupt rollback; callers keep a recoverable worktree
+and inspect the resulting diff.
+
+Capabilities separate CLI and MCP operation names, defaults, maxima, schemas,
+resources, prompts, caches, and mutation classes. Optional disk cache files are
+`symbols.json` and `inventory.json`; the MCP indexer LRU remains process-local.
+YAML remains only ast-grep rule/test input and is never XRAY product output.
+
+## Historical frozen xray-s3b design
+
+This section preserves the implemented XRAY 0.10.0 contract as transformation
+evidence. XRAY 0.11.0 above supersedes it for current behavior.
 
 ### Compatibility
 
@@ -393,6 +434,9 @@ is explicitly lossy and intended for visual scanning.
 
 - Compact `explore`, `interface`, `impact`, replacement, `search`, `scan`, `rewrite`, `imports`, and `exports`
   responses use sparse `schema_version: "xray.cli.v2"` envelopes by default.
+- Compact-capable CLI commands accept `--schema v3`; v3 consistently includes
+  success state and standardizes paging, interface completeness, and compact
+  impact diagnostics. Cursor identity includes v3 when its shape differs.
 - `--detail full` preserves verbose v1-compatible data for commands that offer
   detail selection. `find` and legacy full interface/impact remain `xray.cli.v1`.
 - `map` is an alias for `explore`; JSON records `command: "explore"` and
@@ -425,16 +469,15 @@ safety—not identical names, arguments, envelopes, or discovery mechanics.
 | Likely references | `impact` | `what_breaks` | MCP requires an absolute `path` or `abs_path`; the CLI accepts contained relative symbol paths and offers several symbol input forms. |
 | Structural search | `search` | `search_pattern` | MCP exposes tool metadata/annotations and tool-native paging arguments. |
 | Structural rewrite | `rewrite` | `rewrite_pattern` | MCP marks the operation destructive; there is no CLI approval protocol in the server. |
-| Guarded replacement | `replace plan` / `replace apply` | `plan_replacement`, `apply_replacement` | MCP passes the full plan object directly; plan is read-only and apply is destructive. |
-| Rule scan | `scan` | `scan_rules` | The MCP tool bears destructive annotations because `fix=true` can mutate; YAML is an ast-grep rule input format, not XRAY output. |
+| Guarded replacement | `replace plan` / `replace verify` / `replace apply` | `plan_replacement`, `verify_replacement`, `apply_replacement` | MCP passes the full plan object directly; plan and verify are read-only, while apply is destructive. |
+| Rule scan | `scan` | `scan_rules`, `apply_rule_fixes` | MCP scan is read-only; guarded rule mutation uses a reviewed plan. YAML is ast-grep input, not XRAY output. |
 | File dependency outline | `imports` | `file_imports` | MCP returns tool content rather than CLI envelopes. |
 | File public-API outline | `exports` | `file_exports` | MCP returns tool content rather than CLI envelopes. |
 | Agent skill installation | `skill install` | None | Local `.agents/skills` management is CLI-only and is not repository analysis. |
 
 MCP clients initially see FastMCP's `search_tools` and `call_tool`, then locate
-and invoke underlying XRAY operations by name. Search accepts a regular
-expression and returns at most 10 matches, so clients use focused literals or
-alternation instead of broad inventory patterns. MCP additionally owns
+and invoke underlying XRAY operations by name. Search ranks natural intent by
+default, supports explicit regex mode, and exposes exact paged inventory. MCP additionally owns
 `xray://workflow`, `xray_discovery_plan`, the packaged skill resource/template,
 read-only versus destructive annotations, contexts, and progress events. These
 have no required one-to-one CLI commands. Conversely, CLI aliases, JSON/text
@@ -487,8 +530,8 @@ Product mutation is limited to three explicit paths:
 2. `rewrite` / `rewrite_pattern` invokes the shared staged replacement engine across every
    match. Callers should specify `lang`; inference can include pattern-like
    configuration or documentation text.
-3. `scan --fix` / `scan_rules(fix=true)` applies every fix declared by the
-   contained ast-grep rule configuration.
+3. CLI `scan --fix` applies every fix declared by the contained ast-grep rule
+   configuration. MCP instead uses a reviewed rule plan with `apply_rule_fixes`.
 
 No mutation path supplies automatic commits or external approval. Guarded
 replacement supplies staged rollback but not a durable backup after success.
@@ -503,6 +546,7 @@ and ast-grep on demand. It may write an optimization cache at:
 
 ```text
 /tmp/.xray_cache/{root_hash}-{git_commit}/symbols.json
+/tmp/.xray_cache/{root_hash}-{git_commit}/inventory.json
 ```
 
 The repository-root hash prevents repositories at the same commit from sharing

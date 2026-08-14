@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -56,7 +57,7 @@ def test_rewrite_pattern_uses_staged_writer_and_truthful_summary(tmp_path: Path)
     assert result["no_op_count"] == 0
     assert result["files_modified"] == [str(repo / "sample.py")]
     assert "return new(1)" in (repo / "sample.py").read_text(encoding="utf-8")
-    assert run.call_args.args[0] == [
+    assert run.call_args_list[0].args[0] == [
         "run",
         "--pattern",
         "old($A)",
@@ -412,6 +413,25 @@ def test_replacement_plan_is_non_mutating_and_guarded_apply_changes_exact_bytes(
     assert plan["review_complete"] is True
     assert plan["applicable"] is True
     assert plan["files"][0]["edits"][0]["edit_id"] == plan["preview"][0]["edit_id"]
+    assert plan["edit_manifest"] == [
+        {
+            "edit_id": plan["preview"][0]["edit_id"],
+            "path": "sample.py",
+            "line": 6,
+            "column": 12,
+            "before_sha256": plan["files"][0]["edits"][0]["before_sha256"],
+            "after_sha256": plan["files"][0]["edits"][0]["after_sha256"],
+            "changed": True,
+            "selected": True,
+        }
+    ]
+    assert plan["syntax_validation"] == {
+        "parser": "ast-grep",
+        "checked_file_count": 1,
+        "unchecked_file_count": 0,
+        "new_diagnostic_count": 0,
+        "valid": True,
+    }
     assert "--- a/sample.py" in plan["diff"]
 
     result = indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
@@ -421,6 +441,92 @@ def test_replacement_plan_is_non_mutating_and_guarded_apply_changes_exact_bytes(
     assert result["files"][0]["postimage_sha256"] == plan["files"][0]["postimage_sha256"]
     assert "return new(1)" in sample.read_text(encoding="utf-8")
     assert sample.stat().st_mode == original_mode
+
+
+@pytest.mark.parametrize(
+    ("filename", "language", "source", "replacement"),
+    [
+        ("sample.py", "python", "def caller():\n    return old(1)\n", "class"),
+        ("sample.js", "javascript", "function caller() { return old(1); }\n", "class"),
+        ("sample.ts", "typescript", "function caller(): number { return old(1); }\n", "class"),
+        ("sample.go", "go", "package sample\nfunc caller() int { return old(1) }\n", "func"),
+    ],
+)
+def test_replacement_plan_blocks_new_parse_errors_for_supported_languages(
+    tmp_path: Path, filename: str, language: str, source: str, replacement: str
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / filename
+    target.write_text(source, encoding="utf-8")
+    indexer = XRayIndexer(str(repo))
+
+    plan = indexer.plan_replacement(pattern="old($A)", replacement=replacement, lang=language)
+
+    assert target.read_text(encoding="utf-8") == source
+    assert plan["applicable"] is False
+    assert plan["applicability_reason"] == "new_parse_errors"
+    assert plan["syntax_validation"]["new_diagnostic_count"] > 0
+    assert plan["files"][0]["syntax"]["new_diagnostics"]
+    with pytest.raises(ValueError, match="new_parse_errors"):
+        indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
+
+
+def test_replacement_existing_parse_errors_may_remain_but_not_worsen(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sample = repo / "sample.py"
+    sample.write_text("def caller():\n    value = old(1)\n    if\n", encoding="utf-8")
+    indexer = XRayIndexer(str(repo))
+
+    safe = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
+    unsafe = indexer.plan_replacement(pattern="old($A)", replacement="if", lang="python")
+
+    assert safe["files"][0]["syntax"]["preimage"]["diagnostic_count"] > 0
+    assert safe["syntax_validation"]["new_diagnostic_count"] == 0
+    assert safe["applicable"] is True
+    assert unsafe["syntax_validation"]["new_diagnostic_count"] > 0
+    assert unsafe["applicable"] is False
+
+
+def test_replacement_parse_error_escape_hatch_is_digested_and_applies(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    indexer = XRayIndexer(str(repo))
+
+    plan = indexer.plan_replacement(pattern="old($A)", replacement="if", lang="python", allow_new_parse_errors=True)
+
+    assert plan["allow_new_parse_errors"] is True
+    assert plan["syntax_validation"]["valid"] is False
+    assert plan["applicable"] is True
+    result = indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
+    assert result["syntax_validation"]["valid"] is False
+    assert "return if" in (repo / "sample.py").read_text(encoding="utf-8")
+
+
+def test_replacement_dirty_affected_file_requires_digested_acknowledgement(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "sample.py"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=XRAY Test", "-c", "user.email=xray@example.invalid", "commit", "-qm", "base"],
+        cwd=repo,
+        check=True,
+    )
+    sample = repo / "sample.py"
+    sample.write_text(sample.read_text(encoding="utf-8") + "# local work\n", encoding="utf-8")
+    indexer = XRayIndexer(str(repo))
+
+    blocked = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
+    acknowledged = indexer.plan_replacement(
+        pattern="old($A)", replacement="new($A)", lang="python", allow_dirty_affected=True
+    )
+
+    assert blocked["dirty_affected_paths"] == ["sample.py"]
+    assert blocked["applicability_reason"] == "dirty_affected_files_not_acknowledged"
+    assert acknowledged["allow_dirty_affected"] is True
+    assert acknowledged["applicable"] is True
+    indexer.apply_replacement(acknowledged, expected_digest=acknowledged["plan_digest"])
+    assert "# local work" in sample.read_text(encoding="utf-8")
 
 
 def test_replacement_apply_rejects_digest_mismatch_and_source_drift(tmp_path: Path) -> None:
@@ -517,6 +623,43 @@ def test_replacement_diff_and_edit_ids_are_deterministic_and_refinable(tmp_path:
     assert [file["path"] for file in refined["files"]] == [first["files"][0]["path"]]
     result = indexer.apply_replacement(refined, expected_digest=refined["plan_digest"])
     assert result["changed_count"] == 1
+
+
+def test_replacement_verify_recomputes_all_guards_without_writing(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    sample = repo / "sample.py"
+    original = sample.read_bytes()
+    indexer = XRayIndexer(str(repo))
+    plan = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
+
+    verified = indexer.verify_replacement(plan, expected_digest=plan["plan_digest"])
+
+    assert verified["verified"] is True
+    assert verified["ready_to_apply"] is True
+    assert verified["selected_edit_ids"] == [plan["edit_manifest"][0]["edit_id"]]
+    assert verified["syntax_validation"]["valid"] is True
+    assert sample.read_bytes() == original
+
+    sample.write_text(sample.read_text(encoding="utf-8").replace("old(1)", "old(2)"), encoding="utf-8")
+    drifted = sample.read_bytes()
+    with pytest.raises(ReplacementApplyError, match="no longer matches"):
+        indexer.verify_replacement(plan, expected_digest=plan["plan_digest"])
+    assert sample.read_bytes() == drifted
+
+
+def test_pre_0_11_v2_plan_remains_applicable_after_current_safety_recomputation(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    indexer = XRayIndexer(str(repo))
+    current = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
+    legacy = indexer._legacy_v2_projection(current)
+
+    verified = indexer.verify_replacement(legacy, expected_digest=legacy["plan_digest"])
+    result = indexer.apply_replacement(legacy, expected_digest=legacy["plan_digest"])
+
+    assert verified["legacy_v2"] is True
+    assert result["legacy_v2"] is True
+    assert result["plan_digest"] == legacy["plan_digest"]
+    assert "return new(1)" in (repo / "sample.py").read_text(encoding="utf-8")
 
 
 def test_replacement_zero_candidate_plan_is_not_applicable(tmp_path: Path) -> None:
@@ -633,6 +776,59 @@ def test_replacement_rechecks_source_after_staging_before_first_write(tmp_path: 
     assert not list(repo.glob(".xray-stage-*"))
 
 
+def test_replacement_final_syntax_evidence_drift_rolls_back(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    sample = repo / "sample.py"
+    original = sample.read_bytes()
+    indexer = XRayIndexer(str(repo))
+    plan = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
+    real_snapshot = indexer._syntax_snapshot
+    calls = 0
+
+    def drift_final_evidence(content, language):
+        nonlocal calls
+        calls += 1
+        evidence, signatures = real_snapshot(content, language)
+        if calls == 4:
+            evidence = json.loads(json.dumps(evidence))
+            evidence["diagnostic_count"] += 1
+        return evidence, signatures
+
+    with patch.object(indexer, "_syntax_snapshot", side_effect=drift_final_evidence):
+        with pytest.raises(ReplacementApplyError, match="Final syntax evidence drifted") as raised:
+            indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
+
+    assert raised.value.rollback_count == 1
+    assert raised.value.rollback_succeeded is True
+    assert sample.read_bytes() == original
+
+
+def test_replacement_staged_syntax_evidence_drift_writes_nothing(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    sample = repo / "sample.py"
+    original = sample.read_bytes()
+    indexer = XRayIndexer(str(repo))
+    plan = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
+    real_snapshot = indexer._syntax_snapshot
+    calls = 0
+
+    def drift_staged_evidence(content, language):
+        nonlocal calls
+        calls += 1
+        evidence, signatures = real_snapshot(content, language)
+        if calls == 3:
+            evidence = json.loads(json.dumps(evidence))
+            evidence["diagnostic_count"] += 1
+        return evidence, signatures
+
+    with patch.object(indexer, "_syntax_snapshot", side_effect=drift_staged_evidence):
+        with pytest.raises(ReplacementApplyError, match="Staged syntax evidence drifted"):
+            indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
+
+    assert sample.read_bytes() == original
+    assert not list(repo.glob(".xray-stage-*"))
+
+
 def test_replacement_uses_utf8_byte_offsets_and_contained_path_scope(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     sample = repo / "sample.py"
@@ -710,6 +906,24 @@ def test_replace_cli_plan_file_and_guarded_apply_end_to_end(tmp_path: Path, caps
 
     plan_file = tmp_path / "plan.json"
     plan_file.write_text(json.dumps(envelope), encoding="utf-8")
+    assert (
+        cli.main(
+            [
+                "replace",
+                "verify",
+                str(repo),
+                "--plan-file",
+                str(plan_file),
+                "--expected-digest",
+                plan["plan_digest"],
+            ]
+        )
+        == 0
+    )
+    verified = json.loads(capsys.readouterr().out)
+    assert verified["command"] == "replace.verify"
+    assert verified["result"]["ready_to_apply"] is True
+    assert sample.read_bytes() == original
     assert (
         cli.main(
             [
@@ -817,7 +1031,7 @@ def test_mcp_replacement_tools_have_truthful_annotations_and_apply_reviewed_plan
         async with Client(cli_mcp_server.mcp) as client:
             search_call = await client.call_tool("search_tools", {"pattern": "replacement"})
             assert search_call.structured_content is not None
-            discovered = search_call.structured_content["result"]
+            discovered = search_call.structured_content["matches"]
             plan_call = await client.call_tool(
                 "call_tool",
                 {
@@ -832,6 +1046,17 @@ def test_mcp_replacement_tools_have_truthful_annotations_and_apply_reviewed_plan
             )
             assert plan_call.structured_content is not None
             plan = plan_call.structured_content
+            verify_call = await client.call_tool(
+                "call_tool",
+                {
+                    "name": "verify_replacement",
+                    "arguments": {
+                        "root_path": str(repo),
+                        "plan": plan,
+                        "expected_digest": plan["plan_digest"],
+                    },
+                },
+            )
             apply_call = await client.call_tool(
                 "call_tool",
                 {
@@ -843,13 +1068,16 @@ def test_mcp_replacement_tools_have_truthful_annotations_and_apply_reviewed_plan
                     },
                 },
             )
+            assert verify_call.structured_content is not None
             assert apply_call.structured_content is not None
-            return discovered, apply_call.structured_content
+            return discovered, verify_call.structured_content, apply_call.structured_content
 
-    discovered, applied = asyncio.run(exercise())
+    discovered, verified, applied = asyncio.run(exercise())
     by_name = {tool["name"]: tool for tool in discovered}
     assert by_name["plan_replacement"]["annotations"]["readOnlyHint"] is True
     assert by_name["plan_replacement"]["annotations"]["destructiveHint"] is False
+    assert by_name["verify_replacement"]["annotations"]["readOnlyHint"] is True
     assert by_name["apply_replacement"]["annotations"]["destructiveHint"] is True
+    assert verified["ready_to_apply"] is True
     assert applied["changed_count"] == 1
     assert "return new(1)" in sample.read_text(encoding="utf-8")

@@ -30,6 +30,8 @@ from xray.presentation import (
     compact_explore,
     compact_impact_references,
     compact_structural_items,
+    compact_v3_impact,
+    compact_v3_interface,
     cursor_fingerprint,
     decode_cursor,
     page_items,
@@ -38,6 +40,7 @@ from xray.skill_installer import SkillInstallError, install_cli_skill
 
 SCHEMA_VERSION = "xray.cli.v1"
 COMPACT_SCHEMA_VERSION = "xray.cli.v2"
+V3_SCHEMA_VERSION = "xray.cli.v3"
 DEFAULT_STRUCTURAL_LIMIT = 50
 MAX_SCORE = 100
 MAX_SYMBOL_JSON_CHARS = 1024 * 1024
@@ -49,15 +52,18 @@ ROOT_HELP_EPILOG = """\
 Agent flow:
   xray explore ROOT --max-depth 2
   symbol=$(xray find ROOT "target symbol" --limit 1 | jq -c '.symbols[0]')
-  xray interface ROOT path/from/find.py
+  xray interface ROOT --symbol-json "$symbol" --schema v3
   xray impact ROOT --symbol-json "$symbol"
 
 Guarded change:
   xray replace plan ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' -l python > plan.json
+  jq -r '(.plan // .).edit_manifest[].edit_id' plan.json
+  xray replace verify ROOT --plan-file plan.json --expected-digest REVIEWED_DIGEST
   xray replace apply ROOT --plan-file plan.json --expected-digest REVIEWED_DIGEST
 
 Compact JSON is default; where offered, use --detail full for legacy fields or
---format text for lossy scans. Pages report total_exact; next_cursor requires the
+--format text for lossy scans. Use --schema v3 for consistent success/paging
+and exact-symbol interfaces. Pages report total_exact; next_cursor requires the
 same query and snapshot. YAML output is unsupported. replace apply, rewrite, and
 scan --fix mutate files; --limit never bounds legacy edits. Exit codes: 0 success,
 1 command failure, 2 parse or validation error.
@@ -89,10 +95,11 @@ Show one file's typed hierarchy without implementation bodies.
 
 INTERFACE_EPILOG = """\
 Example: xray interface ROOT src/package/module.py
+Exact handoff: xray interface ROOT --symbol-json "$symbol" --schema v3
 
 FILE_PATH must resolve inside ROOT; parent traversal and symlink escapes fail.
-Compact JSON includes hierarchy and completeness. --detail full returns the
-legacy v1 string envelope.
+Compact v3 accepts an exact find symbol and reports typed completeness reasons.
+--detail full returns the legacy v1 string envelope.
 """
 
 IMPACT_HELP = """\
@@ -194,6 +201,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Contained file or directory focus. Repeat for multiple nested scopes.",
     )
     explore.add_argument(
+        "--strict-focus",
+        action="store_false",
+        dest="include_root_context",
+        help="Return only each focus, its ancestors, and focus-relative descendants; omit unrelated root files.",
+    )
+    explore.add_argument(
         "--max-symbols-per-file",
         type=int,
         default=5,
@@ -224,6 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=OUTPUT_FORMAT_HELP,
     )
     explore.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    add_schema_arg(explore)
     explore.add_argument(
         "--detail",
         choices=("compact", "full"),
@@ -264,6 +278,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=OUTPUT_FORMAT_HELP,
     )
     find.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    add_schema_arg(find)
     find.set_defaults(handler=handle_find)
 
     interface = subparsers.add_parser(
@@ -273,7 +288,13 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=INTERFACE_EPILOG,
     )
     interface.add_argument("root_path", help="Repository root to inspect.")
-    interface.add_argument("file_path", help="File path, absolute or relative; must resolve inside the root.")
+    interface.add_argument(
+        "file_path", nargs="?", help="File path that must resolve inside the root; optional with exact-symbol input."
+    )
+    interface.add_argument(
+        "--symbol-json", help="Exact symbol JSON from find; v3 returns its owner and selected member."
+    )
+    interface.add_argument("--symbol-file", help="Exact symbol JSON file, or '-' for stdin.")
     interface.add_argument("--name", dest="symbol_names", action="append", help="Top-level symbol name; repeatable.")
     interface.add_argument("--type", dest="symbol_types", action="append", help="Top-level symbol type; repeatable.")
     interface.add_argument(
@@ -296,22 +317,33 @@ def build_parser() -> argparse.ArgumentParser:
         help=OUTPUT_FORMAT_HELP,
     )
     interface.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    add_schema_arg(interface)
     interface.set_defaults(handler=handle_interface)
 
-    read_symbol = subparsers.add_parser("read-symbol", help="Read one exact symbol source slice with bounds.")
+    read_symbol = subparsers.add_parser(
+        "read-symbol",
+        help="Read one exact symbol source slice with bounds.",
+        description="Read one exact contained symbol source slice with explicit line and byte bounds.",
+    )
     read_symbol.add_argument("root_path", help="Repository root containing the symbol.")
     add_symbol_input_args(read_symbol)
     read_symbol.add_argument("--context-lines", type=int, default=0, help="Context lines around the symbol.")
     read_symbol.add_argument("--max-lines", type=int, default=200, help="Maximum returned lines (default: 200).")
     read_symbol.add_argument("--max-bytes", type=int, default=64 * 1024, help="Maximum returned UTF-8 bytes.")
     read_symbol.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    add_schema_arg(read_symbol)
     read_symbol.set_defaults(handler=handle_read_symbol, format="json")
 
-    symbol_at = subparsers.add_parser("symbol-at", help="Find the narrowest symbol enclosing a source line.")
+    symbol_at = subparsers.add_parser(
+        "symbol-at",
+        help="Find the narrowest symbol enclosing a source line.",
+        description="Find the narrowest symbol enclosing one contained source line.",
+    )
     symbol_at.add_argument("root_path", help="Repository root containing the file.")
     symbol_at.add_argument("file_path", help="Contained source file.")
     symbol_at.add_argument("line", type=int, help="One-based source line.")
     symbol_at.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    add_schema_arg(symbol_at)
     symbol_at.set_defaults(handler=handle_symbol_at, format="json")
 
     impact = subparsers.add_parser(
@@ -352,6 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=OUTPUT_FORMAT_HELP,
     )
     impact.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    add_schema_arg(impact)
     impact.set_defaults(handler=handle_impact)
 
     search = subparsers.add_parser("search", help="Search with an ast-grep pattern.")
@@ -394,20 +427,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     rules = subparsers.add_parser("rules", help="Validate, explain, or test ast-grep rules without mutation.")
     rules_subparsers = rules.add_subparsers(dest="rules_command", required=True, parser_class=XRayArgumentParser)
-    rules_check = rules_subparsers.add_parser("check", help="Validate and scan one contained rule source.")
+    rules_check = rules_subparsers.add_parser(
+        "check", help="Validate and scan one contained rule source.", description="Validate and scan without fixes."
+    )
     rules_check.add_argument("root_path")
     rules_check.add_argument("--rule", required=True)
     add_scope_args(rules_check)
     rules_check.add_argument("--limit", type=int, default=DEFAULT_STRUCTURAL_LIMIT)
     rules_check.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
     rules_check.set_defaults(handler=handle_rules_check, format="json")
-    rules_explain = rules_subparsers.add_parser("explain", help="Show bounded source and upstream inspection.")
+    rules_explain = rules_subparsers.add_parser(
+        "explain", help="Show bounded source and upstream inspection.", description="Inspect one rule without mutation."
+    )
     rules_explain.add_argument("root_path")
     rules_explain.add_argument("--rule", required=True)
     rules_explain.add_argument("--source-limit", type=int, default=32_000)
     rules_explain.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
     rules_explain.set_defaults(handler=handle_rules_explain, format="json")
-    rules_test = rules_subparsers.add_parser("test", help="Run contained rule tests without snapshot updates.")
+    rules_test = rules_subparsers.add_parser(
+        "test",
+        help="Run contained rule tests without snapshot updates.",
+        description="Run contained tests non-interactively without updating snapshots.",
+    )
     rules_test.add_argument("root_path")
     rules_test.add_argument("--test-dir", default=".")
     rules_test.add_argument("--config")
@@ -439,15 +480,44 @@ def build_parser() -> argparse.ArgumentParser:
     replace_plan.add_argument(
         "--allow-truncated-review", action="store_true", help="Acknowledge applying from bounded review content."
     )
+    replace_plan.add_argument(
+        "--allow-dirty-affected",
+        action="store_true",
+        help="Acknowledge that affected files already contain Git worktree changes.",
+    )
+    replace_plan.add_argument(
+        "--allow-new-parse-errors",
+        action="store_true",
+        help="Explicitly record permission for newly introduced ast-grep parse errors.",
+    )
     replace_plan.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
     replace_plan.set_defaults(handler=handle_replace_plan, format="json")
 
-    replace_refine = replace_subparsers.add_parser("refine", help="Re-plan a reviewed subset by stable edit ID.")
+    replace_refine = replace_subparsers.add_parser(
+        "refine",
+        help="Re-plan a reviewed subset by stable edit ID.",
+        description="Re-plan repeated stable edit IDs without writing files.",
+    )
     replace_refine.add_argument("root_path", help="Repository root bound by the plan.")
     replace_refine.add_argument("--plan-file", required=True, help="Full v2 plan JSON file, or '-' for stdin.")
     replace_refine.add_argument("--edit-id", dest="edit_ids", action="append", required=True)
     replace_refine.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
     replace_refine.set_defaults(handler=handle_replace_refine, format="json")
+
+    replace_verify = replace_subparsers.add_parser(
+        "verify",
+        help="Recompute every apply guard without writing.",
+        description=(
+            "Verify digest, source, selection, syntax, dirtiness, completeness, and applicability without writes."
+        ),
+    )
+    replace_verify.add_argument("root_path", help="Repository root bound by the plan.")
+    replace_verify.add_argument(
+        "--plan-file", required=True, help="Full v2 plan JSON file, or '-' for standard input (bounded to 10 MiB)."
+    )
+    replace_verify.add_argument("--expected-digest", required=True, help="Independently copied reviewed plan digest.")
+    replace_verify.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    replace_verify.set_defaults(handler=handle_replace_verify, format="json")
 
     replace_apply = replace_subparsers.add_parser(
         "apply",
@@ -480,10 +550,14 @@ def build_parser() -> argparse.ArgumentParser:
     skill_install.set_defaults(handler=handle_skill_install, format="json")
 
     capabilities = subparsers.add_parser(
-        "capabilities", aliases=["doctor"], help="Report schemas, operations, bounds, and dependency health."
+        "capabilities",
+        aliases=["doctor"],
+        help="Report schemas, operations, bounds, and dependency health.",
+        description="Report schemas, operations, bounds, caches, dependencies, and health.",
     )
     capabilities.add_argument("root_path", nargs="?", help="Optional repository root for repository checks.")
     capabilities.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    add_schema_arg(capabilities)
     capabilities.set_defaults(handler=handle_capabilities, format="json")
 
     for command in ("imports", "exports"):
@@ -513,6 +587,16 @@ def add_symbol_input_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--end-line", type=int, default=None, help="One-based symbol end line.")
 
 
+def add_schema_arg(parser: argparse.ArgumentParser, *, visible: bool = True) -> None:
+    """Add the opt-in compact response projection selector."""
+    parser.add_argument(
+        "--schema",
+        choices=("v2", "v3"),
+        default="v2",
+        help="Compact schema." if visible else argparse.SUPPRESS,
+    )
+
+
 def add_structural_output_args(
     parser: argparse.ArgumentParser,
     *,
@@ -537,6 +621,7 @@ def add_structural_output_args(
         parser.set_defaults(cursor=None)
     parser.add_argument("--format", choices=("json", "text"), default="json", help=OUTPUT_FORMAT_HELP)
     parser.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    add_schema_arg(parser, visible=False)
 
 
 def handle_explore(args: argparse.Namespace) -> int:
@@ -553,6 +638,7 @@ def handle_explore(args: argparse.Namespace) -> int:
         max_depth=args.max_depth,
         include_symbols=args.include_symbols,
         focus_dirs=args.focus_dirs,
+        include_root_context=args.include_root_context,
         max_symbols_per_file=args.max_symbols_per_file,
         symbol_types=symbol_types,
         max_entries=args.max_entries,
@@ -565,7 +651,8 @@ def handle_explore(args: argparse.Namespace) -> int:
             compact = compact_explore(data)
             compact.update(
                 {
-                    "schema_version": COMPACT_SCHEMA_VERSION,
+                    "schema_version": compact_schema_version(args),
+                    **({"ok": True} if args.schema == "v3" else {}),
                     "command": "explore",
                     "invoked_as": invoked_as,
                 }
@@ -657,7 +744,7 @@ def handle_find(args: argparse.Namespace) -> int:
     elif args.detail == "compact":
         print_json(
             {
-                "schema_version": COMPACT_SCHEMA_VERSION,
+                "schema_version": compact_schema_version(args),
                 "ok": not search_failed,
                 "command": "find",
                 "root_path": str(indexer.root_path),
@@ -694,8 +781,17 @@ def handle_find(args: argparse.Namespace) -> int:
 
 def handle_interface(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
+    exact_symbol = load_interface_symbol(args, indexer.root_path)
+    if exact_symbol is not None:
+        if args.detail == "full" or args.schema != "v3":
+            raise ValueError("Exact-symbol interface selection requires --schema v3 compact JSON.")
+        file_path = str(exact_symbol["path"])
+    elif args.file_path:
+        file_path = args.file_path
+    else:
+        raise ValueError("Provide FILE_PATH or exactly one of --symbol-json/--symbol-file.")
     if args.detail == "full":
-        rendered = indexer.read_interface(args.file_path)
+        rendered = indexer.read_interface(file_path)
         failed = rendered.startswith("Error reading interface:")
         if args.format == "text":
             print(rendered)
@@ -707,7 +803,7 @@ def handle_interface(args: argparse.Namespace) -> int:
                         "ok": not failed,
                         "command": "interface",
                         "root_path": str(indexer.root_path),
-                        "file_path": args.file_path,
+                        "file_path": file_path,
                         "interface": None if failed else rendered,
                         "error": rendered if failed else None,
                         "warnings": [],
@@ -719,13 +815,14 @@ def handle_interface(args: argparse.Namespace) -> int:
     try:
         structured = dump_interface_data(
             indexer.read_interface_structured(
-                args.file_path,
+                file_path,
                 symbol_names=args.symbol_names,
                 visibility=args.visibility,
                 symbol_types=args.symbol_types,
                 member_depth=args.member_depth,
                 max_symbols=None,
                 max_members=args.max_members,
+                exact_symbol=exact_symbol,
             )
         )
     except InterfaceReadError as exc:
@@ -736,7 +833,8 @@ def handle_interface(args: argparse.Namespace) -> int:
         "interface",
         indexer.root_path,
         {
-            "file_path": args.file_path,
+            "file_path": file_path,
+            **({"exact_symbol": exact_symbol} if exact_symbol is not None else {}),
             "symbol_names": args.symbol_names or [],
             "visibility": args.visibility or [],
             "symbol_types": args.symbol_types or [],
@@ -760,12 +858,14 @@ def handle_interface(args: argparse.Namespace) -> int:
         structured["warnings"].append("Top-level interface symbols are paged; continue with next_cursor.")
 
     rendered = indexer.render_interface(structured)
+    if args.schema == "v3":
+        structured = compact_v3_interface(structured)
     if args.format == "text":
         print(rendered)
     else:
         print_json(
             {
-                "schema_version": COMPACT_SCHEMA_VERSION,
+                "schema_version": compact_schema_version(args),
                 "ok": True,
                 "command": "interface",
                 "root_path": str(indexer.root_path),
@@ -786,7 +886,9 @@ def handle_read_symbol(args: argparse.Namespace) -> int:
         max_lines=args.max_lines,
         max_bytes=args.max_bytes,
     )
-    print_json(_compact_envelope("read-symbol", root_path=str(indexer.root_path), result=result), pretty=args.pretty)
+    print_json(
+        _compact_envelope("read-symbol", args=args, root_path=str(indexer.root_path), result=result), pretty=args.pretty
+    )
     return 0
 
 
@@ -799,6 +901,7 @@ def handle_symbol_at(args: argparse.Namespace) -> int:
     print_json(
         _compact_envelope(
             "symbol-at",
+            args=args,
             root_path=str(indexer.root_path),
             file_path=args.file_path,
             line=args.line,
@@ -857,12 +960,15 @@ def handle_impact(args: argparse.Namespace) -> int:
         total_exact=bool(result.get("total_exact", True)),
     )
     presented = {**result, "references": [dict(reference) for reference in page], **metadata}
+    if args.schema == "v3" and args.detail == "compact":
+        presented = compact_v3_impact(presented)
     if args.format == "text":
         print(format_impact(presented))
     elif args.detail == "compact":
         print_json(
             {
-                "schema_version": COMPACT_SCHEMA_VERSION,
+                "schema_version": compact_schema_version(args),
+                **({"ok": not is_error} if args.schema == "v3" else {}),
                 "command": "impact",
                 "root_path": str(indexer.root_path),
                 "symbol": format_symbol_for_json(symbol, indexer.root_path),
@@ -910,7 +1016,11 @@ def _validate_page_args(
     """Bind paging to a content snapshot and validate it before repository work."""
     if args.limit < 0:
         raise ValueError("--limit must be 0 or greater.")
-    bound_identity = {**identity, "source_snapshot": source_snapshot}
+    bound_identity = {
+        **identity,
+        **({"schema": "v3"} if getattr(args, "schema", "v2") == "v3" else {}),
+        "source_snapshot": source_snapshot,
+    }
     fingerprint = cursor_fingerprint(command, root_path, bound_identity)
     try:
         offset = decode_cursor(args.cursor, fingerprint)
@@ -944,8 +1054,14 @@ def _structural_payload(
     )
 
 
-def _compact_envelope(command: str, **payload: Any) -> dict[str, Any]:
-    return {"schema_version": COMPACT_SCHEMA_VERSION, "ok": True, "command": command, **payload}
+def compact_schema_version(args: argparse.Namespace) -> str:
+    """Return the selected compact schema without changing the v2 default."""
+    return V3_SCHEMA_VERSION if getattr(args, "schema", "v2") == "v3" else COMPACT_SCHEMA_VERSION
+
+
+def _compact_envelope(command: str, *, args: argparse.Namespace | None = None, **payload: Any) -> dict[str, Any]:
+    schema_version = V3_SCHEMA_VERSION if getattr(args, "schema", "v2") == "v3" else COMPACT_SCHEMA_VERSION
+    return {"schema_version": schema_version, "ok": True, "command": command, **payload}
 
 
 def handle_search(args: argparse.Namespace) -> int:
@@ -978,7 +1094,7 @@ def handle_search(args: argparse.Namespace) -> int:
             print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
         return 0
     if args.detail == "compact":
-        print_json(_compact_envelope("search", matches=page, **metadata), pretty=args.pretty)
+        print_json(_compact_envelope("search", args=args, matches=page, **metadata), pretty=args.pretty)
         return 0
     print_json(
         _command_envelope(
@@ -1011,7 +1127,7 @@ def handle_rewrite(args: argparse.Namespace) -> int:
     page, metadata = _structural_payload(matches, args, "rewrite", indexer.root_path, identity, continuable=False)
     metadata.pop("next_cursor", None)
     if args.detail == "compact":
-        print_json(_compact_envelope("rewrite", **summary), pretty=args.pretty)
+        print_json(_compact_envelope("rewrite", args=args, **summary), pretty=args.pretty)
         return 0
     print_json(
         _command_envelope(
@@ -1072,7 +1188,7 @@ def handle_scan(args: argparse.Namespace) -> int:
             print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
         return 0
     if args.detail == "compact":
-        payload = _compact_envelope("scan", matches=page, fixed=args.fix, **metadata)
+        payload = _compact_envelope("scan", args=args, matches=page, fixed=args.fix, **metadata)
         if mutation_summary is not None:
             payload["mutation"] = mutation_summary
         print_json(payload, pretty=args.pretty)
@@ -1123,7 +1239,7 @@ def handle_capabilities(args: argparse.Namespace) -> int:
     root = normalize_path(args.root_path) if supplied_root else str(Path.cwd().resolve())
     result = XRayIndexer(root).capabilities(include_repository=supplied_root)
     print_json(
-        _compact_envelope("capabilities", invoked_as=args.command, capabilities=result),
+        _compact_envelope("capabilities", args=args, invoked_as=args.command, capabilities=result),
         pretty=args.pretty,
     )
     return 0 if result["healthy"] else 1
@@ -1147,7 +1263,7 @@ def handle_outline_items(args: argparse.Namespace) -> int:
             print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
         return 0
     if args.detail == "compact":
-        print_json(_compact_envelope(args.outline_item, items=page, **metadata), pretty=args.pretty)
+        print_json(_compact_envelope(args.outline_item, args=args, items=page, **metadata), pretty=args.pretty)
         return 0
     print_json(
         _command_envelope(args.outline_item, indexer.root_path, file_path=args.file_path, items=page, **metadata),
@@ -1195,6 +1311,8 @@ def handle_replace_plan(args: argparse.Namespace) -> int:
         max_files=args.max_files,
         allow_noop=args.allow_noop,
         allow_truncated_review=args.allow_truncated_review,
+        allow_dirty_affected=args.allow_dirty_affected,
+        allow_new_parse_errors=args.allow_new_parse_errors,
         preview_limit=args.preview_limit,
         diff_limit=args.diff_limit,
     )
@@ -1245,6 +1363,15 @@ def handle_replace_apply(args: argparse.Namespace) -> int:
     plan = _read_plan_json(args.plan_file)
     result = indexer.apply_replacement(plan, expected_digest=args.expected_digest)
     print_json(_compact_envelope("replace.apply", result=result), pretty=args.pretty)
+    return 0
+
+
+def handle_replace_verify(args: argparse.Namespace) -> int:
+    """Recompute every replacement apply guard without writing files."""
+    indexer = XRayIndexer(normalize_path(args.root_path))
+    plan = _read_plan_json(args.plan_file)
+    result = indexer.verify_replacement(plan, expected_digest=args.expected_digest)
+    print_json(_compact_envelope("replace.verify", result=result), pretty=args.pretty)
     return 0
 
 
@@ -1328,6 +1455,31 @@ def load_symbol(args: argparse.Namespace, root_path: Path | None = None) -> dict
         if "abs_path" in symbol:
             resolve_inside_root(str(symbol["abs_path"]), root_path, "abs_path")
         symbol["path"] = str(resolve_inside_root(str(symbol["path"]), root_path, "path"))
+    return symbol
+
+
+def load_interface_symbol(args: argparse.Namespace, root_path: Path) -> dict[str, Any] | None:
+    """Load the JSON-only exact-symbol alternatives accepted by interface."""
+    if args.symbol_json and args.symbol_file:
+        raise ValueError("Provide only one of --symbol-json or --symbol-file.")
+    if not args.symbol_json and not args.symbol_file:
+        return None
+    if args.file_path:
+        raise ValueError("Do not combine FILE_PATH with --symbol-json or --symbol-file.")
+    if args.symbol_json:
+        raw = args.symbol_json
+    elif args.symbol_file == "-":
+        raw = read_bounded_symbol_json(sys.stdin, "stdin")
+    else:
+        try:
+            raw = read_bounded_symbol_json_file(Path(str(args.symbol_file)))
+        except OSError as exc:
+            raise ValueError(f"Could not read symbol file '{args.symbol_file}': {exc.strerror or exc}") from exc
+    symbol = validate_symbol_input(json.loads(raw))
+    symbol = dict(symbol)
+    if "abs_path" in symbol:
+        resolve_inside_root(str(symbol["abs_path"]), root_path, "abs_path")
+    symbol["path"] = str(resolve_inside_root(str(symbol["path"]), root_path, "path"))
     return symbol
 
 
@@ -1438,7 +1590,7 @@ def print_error(message: str, args: argparse.Namespace, *, code: str = "command_
         print_json(
             dump_error_envelope(
                 {
-                    "schema_version": COMPACT_SCHEMA_VERSION if compact else SCHEMA_VERSION,
+                    "schema_version": compact_schema_version(args) if compact else SCHEMA_VERSION,
                     "ok": False,
                     "command": leaf_command(args),
                     "error": {"code": code, "message": message} if compact else message,
@@ -1506,13 +1658,27 @@ def wants_full_output(argv: Sequence[str] | None) -> bool:
     )
 
 
+def wants_v3_output(argv: Sequence[str] | None) -> bool:
+    args = list(sys.argv[1:] if argv is None else argv)
+    return any(
+        (value == "--schema" and index + 1 < len(args) and args[index + 1] == "v3") or value == "--schema=v3"
+        for index, value in enumerate(args)
+    )
+
+
 def print_parse_error(message: str, argv: Sequence[str] | None) -> None:
     if wants_json_output(argv):
         compact = not wants_full_output(argv)
         print_json(
             dump_error_envelope(
                 {
-                    "schema_version": COMPACT_SCHEMA_VERSION if compact else SCHEMA_VERSION,
+                    "schema_version": (
+                        V3_SCHEMA_VERSION
+                        if compact and wants_v3_output(argv)
+                        else COMPACT_SCHEMA_VERSION
+                        if compact
+                        else SCHEMA_VERSION
+                    ),
                     "ok": False,
                     "command": parse_command_name(argv),
                     "error": {"code": "invalid_arguments", "message": message} if compact else message,

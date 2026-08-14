@@ -30,7 +30,8 @@ version 2 is the active harness authority.
 
 Preserved public interfaces include the `xray` and `xray-mcp` entry points,
 compact `xray.cli.v2` JSON plus full/v1 compatibility, the intentional CLI/MCP
-surface differences, MCP's search-first `search_tools`/`call_tool` exposure,
+surface differences, opt-in compact `xray.cli.v3`, MCP's ranked search-first
+`search_tools`/`call_tool` exposure,
 resource `xray://workflow`, prompt `xray_discovery_plan`, skill
 `skill://xray-progressive-discovery/SKILL.md`, and skill template
 `skill://xray-progressive-discovery/{path*}`.
@@ -123,8 +124,9 @@ user separately grants them. A passing local gate never expands that authority.
 - Each writer uses an isolated Git worktree and disjoint primary write set.
 - Worktrees may share uv's dependency/download cache; dependency installation
   must remain project-local through uv and must not modify product installers.
-- Tests create temporary repositories and files. Symbol skeletons may be cached
-  under `/tmp/.xray_cache/{root_hash}-{git_commit}/symbols.json`; the root hash
+- Tests create temporary repositories and files. Symbol skeletons and inventory
+  may be cached under `/tmp/.xray_cache/{root_hash}-{git_commit}/symbols.json`
+  and `inventory.json`; the root hash
   prevents same-commit repositories from sharing entries, and writes are
   atomic. Do not delete another worktree's active cache.
 - XRAY launches ast-grep, Git, and ripgrep subprocesses on demand. Avoid
@@ -142,8 +144,9 @@ user separately grants them. A passing local gate never expands that authority.
 - `xray rewrite` / MCP `rewrite_pattern` modifies every structural match in the
   selected root. The reporting limit does not limit edits; pass a language when
   known and inspect the full worktree afterward.
-- `xray scan --fix` / MCP `scan_rules(fix=true)` applies every configured fix and
-  cannot continue against the changed result set. Read-only scans are distinct.
+- `xray scan --fix` applies every configured fix and cannot continue against the
+  changed result set. MCP `scan_rules` is read-only; guarded MCP rule mutation
+  uses `apply_rule_fixes` with a reviewed plan and digest.
 - `install.sh` may download uv, use network and Git, delete/reclone
   `$HOME/.xray`, force-install the uv tool, and update shell `PATH`.
 - `uninstall.sh` uninstalls the uv tool and recursively deletes `$HOME/.xray`.

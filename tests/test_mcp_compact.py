@@ -155,13 +155,13 @@ def test_mcp_protocol_errors_natural_discovery_and_annotations(tmp_path: Path) -
             for term in ("lookup", "blast radius", "callers", "rename", "safe code replacement", "help", "workflow"):
                 result = await client.call_tool("search_tools", {"pattern": term})
                 assert result.structured_content is not None
-                searches[term] = result.structured_content["result"]
-            scan_result = await client.call_tool("search_tools", {"pattern": "scan_rules"})
-            fixes_result = await client.call_tool("search_tools", {"pattern": "apply_rule_fixes"})
+                searches[term] = result.structured_content["matches"]
+            scan_result = await client.call_tool("search_tools", {"pattern": "scan_rules", "detail": "full"})
+            fixes_result = await client.call_tool("search_tools", {"pattern": "apply_rule_fixes", "detail": "full"})
             assert scan_result.structured_content is not None
             assert fixes_result.structured_content is not None
-            scan = scan_result.structured_content["result"][0]
-            fixes = fixes_result.structured_content["result"][0]
+            scan = scan_result.structured_content["matches"][0]
+            fixes = fixes_result.structured_content["matches"][0]
             return visible, invalid, searches, scan, fixes
 
     visible, invalid, searches, scan, fixes = asyncio.run(exercise())
@@ -258,3 +258,49 @@ def test_mcp_find_reads_capabilities_rules_and_replacement_refinement(tmp_path: 
         )
     )
     assert refined["query"]["selected_edit_ids"] == [edit_id]
+
+
+def test_mcp_v3_exact_interface_and_named_impact_diagnostics(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    source = repo / "sample.py"
+    source.write_text(
+        "class Service:\n    def first(self):\n        return 1\n    def second(self):\n        return 2\n",
+        encoding="utf-8",
+    )
+    exact = {
+        "name": "second",
+        "owner": "Service",
+        "qualified_name": "Service.second",
+        "type": "method",
+        "path": "sample.py",
+        "abs_path": str(source),
+        "start_line": 4,
+        "end_line": 5,
+    }
+
+    interface = success_value(
+        mcp_server.read_interface_structured(str(repo), exact_symbol=exact, schema="v3", max_members=1)
+    )
+    assert interface["completeness"] == {"complete": True, "reasons": []}
+    assert "returned_symbols" not in interface and interface["returned"] == 1
+    assert interface["symbols"][0]["members"][0]["name"] == "second"
+
+    result = {
+        "references": [{"file": str(source), "line": 5, "text": "return 2", "type": "read"}],
+        "total_count": 1,
+        "raw_count": 2,
+        "filtered_count": 1,
+        "strategy": "structural",
+        "note": "one reference",
+        "total_exact": True,
+        "execution_limited": False,
+        "execution_cap": 51,
+    }
+    with patch.object(XRayIndexer, "what_breaks", return_value=result):
+        impact = success_value(mcp_server.what_breaks(exact, schema="v3"))
+    assert impact["total"] == 1 and "total_count" not in impact
+    assert impact["total_exact"] is True
+    assert impact["diagnostics"]["raw_count"] == 2
+
+    compatible_error = mcp_server.read_interface_structured(str(repo), exact_symbol=exact)
+    assert error_value(compatible_error)["code"] == "invalid_request"
