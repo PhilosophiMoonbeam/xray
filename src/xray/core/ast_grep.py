@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import tempfile
+import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, cast
@@ -24,6 +27,14 @@ class AstGrepResult:
     stderr: str
     returncode: int
     no_matches: bool = False
+
+
+@dataclass(frozen=True)
+class BoundedAstGrepResult:
+    """Parsed streaming matches with honest execution-completion metadata."""
+
+    matches: list[dict[str, Any]]
+    total_exact: bool
 
 
 class AstGrepError(RuntimeError):
@@ -90,6 +101,100 @@ def run_ast_grep(args: Sequence[str], input_text: str | None = None) -> AstGrepR
 
     error_output = stderr.strip() if stderr else "(no error output)"
     raise AstGrepCommandError(f"ast-grep failed with exit code {completed.returncode}: {error_output}")
+
+
+def run_ast_grep_bounded(args: Sequence[str], max_results: int) -> BoundedAstGrepResult:
+    """Stream JSON matches and terminate ast-grep once the execution cap is reached."""
+    if max_results < 1:
+        raise ValueError("max_results must be 1 or greater.")
+    command = ["ast-grep", *args, "--json=stream"]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+    except FileNotFoundError as exc:
+        raise AstGrepNotFoundError("ast-grep executable was not found; symbol search could not run.") from exc
+
+    stdout_stream = process.stdout
+    stderr_stream = process.stderr
+    assert stdout_stream is not None
+    assert stderr_stream is not None
+    stdout_lines: queue.Queue[str | None] = queue.Queue()
+    stderr_chunks: list[str] = []
+
+    def read_stdout() -> None:
+        try:
+            for line in stdout_stream:
+                stdout_lines.put(line)
+        finally:
+            stdout_lines.put(None)
+
+    def read_stderr() -> None:
+        stderr_chunks.append(stderr_stream.read())
+
+    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    matches: list[dict[str, Any]] = []
+    captured_chars = 0
+    reached_cap = False
+    deadline = time.monotonic() + get_ast_grep_timeout()
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, get_ast_grep_timeout())
+            try:
+                line = stdout_lines.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise subprocess.TimeoutExpired(command, get_ast_grep_timeout()) from exc
+            if line is None:
+                break
+            captured_chars += len(line)
+            if captured_chars > get_ast_grep_output_limit():
+                raise AstGrepCommandError(f"ast-grep stdout exceeded {get_ast_grep_output_limit()} characters.")
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise AstGrepCommandError("ast-grep returned invalid streaming JSON.") from exc
+            if not isinstance(parsed, dict):
+                raise AstGrepCommandError("ast-grep returned unexpected streaming JSON; expected match objects.")
+            matches.append(cast(dict[str, Any], parsed))
+            if len(matches) >= max_results:
+                reached_cap = True
+                process.terminate()
+                break
+        if not reached_cap:
+            remaining = max(0.1, deadline - time.monotonic())
+            process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.wait()
+        raise AstGrepCommandError(f"ast-grep timed out after {get_ast_grep_timeout():g} seconds.") from exc
+    except Exception:
+        process.kill()
+        process.wait()
+        raise
+    finally:
+        if reached_cap:
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+
+    stderr = _limit_output("".join(stderr_chunks), "stderr")
+    if not reached_cap and process.returncode not in (0, 1):
+        error_output = stderr.strip() if stderr else "(no error output)"
+        raise AstGrepCommandError(f"ast-grep failed with exit code {process.returncode}: {error_output}")
+    return BoundedAstGrepResult(matches=matches, total_exact=not reached_cap)
 
 
 def _completed_stream_text(completed_text: str | None, stream: Any, name: str) -> str:

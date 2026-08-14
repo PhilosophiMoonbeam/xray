@@ -9,11 +9,12 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
+import pytest
 import tomllib
 
 from xray import cli, mcp_server
-from xray.core.ast_grep import AstGrepCommandError, AstGrepNotFoundError, AstGrepResult
-from xray.core.indexer import XRayIndexer
+from xray.core.ast_grep import AstGrepCommandError, AstGrepNotFoundError, AstGrepResult, BoundedAstGrepResult
+from xray.core.indexer import InterfaceReadError, XRayIndexer
 
 
 def structured_content(result: Any) -> dict[str, Any]:
@@ -184,6 +185,48 @@ def test_interface_cli_prints_file_skeleton(tmp_path, capsys):
     assert "def caller():" in output
 
 
+def test_interface_cli_compact_is_structured_and_full_preserves_legacy_string(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+
+    assert cli.main(["interface", str(repo), "src/sample.py"]) == 0
+    compact = json.loads(capsys.readouterr().out)
+    assert compact["schema_version"] == "xray.cli.v2"
+    assert compact["interface"]["path"] == "src/sample.py"
+    assert compact["interface"]["complete"] is True
+    assert compact["interface"]["symbols"][0]["signature"] == "def target_function(value):"
+
+    assert cli.main(["interface", str(repo), "src/sample.py", "--detail", "full"]) == 0
+    full = json.loads(capsys.readouterr().out)
+    assert full["schema_version"] == "xray.cli.v1"
+    assert full["ok"] is True
+    assert isinstance(full["interface"], str)
+    assert "def target_function(value):" in full["interface"]
+
+
+def test_mcp_structured_interface_is_read_only_and_returns_hierarchy(tmp_path):
+    repo = write_sample_repo(tmp_path)
+
+    async def exercise():
+        from fastmcp import Client
+
+        async with Client(mcp_server.mcp) as client:
+            search = await client.call_tool("search_tools", {"pattern": "read_interface_structured"})
+            call = await client.call_tool(
+                "call_tool",
+                {
+                    "name": "read_interface_structured",
+                    "arguments": {"root_path": str(repo), "file_path": "src/sample.py"},
+                },
+            )
+            return structured_content(search)["result"], structured_content(call)
+
+    discovered, result = asyncio.run(exercise())
+    tool = next(item for item in discovered if item["name"] == "read_interface_structured")
+    assert tool["annotations"]["readOnlyHint"] is True
+    assert result["path"] == "src/sample.py"
+    assert result["symbols"][0]["role"] == "item"
+
+
 def test_interface_cli_rejects_absolute_path_outside_root(tmp_path, capsys):
     repo = write_sample_repo(tmp_path)
     outside = tmp_path / "outside.py"
@@ -194,9 +237,9 @@ def test_interface_cli_rejects_absolute_path_outside_root(tmp_path, capsys):
     assert exit_code == 1
     result = json.loads(capsys.readouterr().out)
     assert result["ok"] is False
-    assert result["interface"] is None
-    assert result["error"].startswith("Error reading interface:")
-    assert "outside repository root" in result["error"]
+    assert result["schema_version"] == "xray.cli.v2"
+    assert result["error"]["code"] == "path_outside_root"
+    assert "outside repository root" in result["error"]["message"]
 
 
 def test_interface_cli_rejects_parent_traversal_outside_root(tmp_path, capsys):
@@ -225,8 +268,9 @@ def test_interface_cli_rejects_symlink_file_outside_root(tmp_path, capsys):
     assert exit_code == 1
     result = json.loads(capsys.readouterr().out)
     assert result["ok"] is False
-    assert "outside repository root" in result["error"]
-    assert "def leaked" not in result["error"]
+    assert result["error"]["code"] == "path_outside_root"
+    assert "outside repository root" in result["error"]["message"]
+    assert "def leaked" not in result["error"]["message"]
 
 
 def test_mcp_read_interface_preserves_string_error_for_outside_root(tmp_path):
@@ -601,35 +645,34 @@ def test_find_cli_reports_ast_grep_nonzero_as_json_error(tmp_path, capsys):
     assert "parser failed" in result["warnings"][0]
 
 
-def test_find_cli_keeps_success_when_results_exist_with_warnings(tmp_path, capsys):
+def test_find_cli_uses_one_expanded_outline_inventory(tmp_path, capsys):
     repo = write_sample_repo(tmp_path)
-    match = {
-        "text": "def target_function(value):\n    return value + 1",
-        "file": str(repo / "src" / "sample.py"),
-        "range": {
-            "start": {"line": 0},
-            "end": {"line": 1},
-        },
-        "metaVariables": {"single": {"NAME": {"text": "target_function"}}},
-    }
-    successful = AstGrepResult(stdout=json.dumps([match]), stderr="", returncode=0)
+    outline = [
+        {
+            "path": str(repo / "src" / "sample.py"),
+            "language": "Python",
+            "items": [
+                {
+                    "role": "item",
+                    "symbolType": "function",
+                    "name": "target_function",
+                    "signature": "def target_function(value):",
+                    "range": {"start": {"line": 0}, "end": {"line": 1}},
+                }
+            ],
+        }
+    ]
 
-    ast_grep_results = iter([successful])
-
-    def fake_run(cmd, *args, **kwargs):
-        try:
-            return next(ast_grep_results)
-        except StopIteration:
-            raise AstGrepCommandError("ast-grep failed with exit code 2: one pattern failed")
-
-    with patch("xray.core.indexer.run_ast_grep", side_effect=fake_run):
+    with patch("xray.core.indexer.run_ast_grep", return_value=AstGrepResult(json.dumps(outline), "", 0)) as run:
         exit_code = cli.main(["find", str(repo), "target"])
 
     assert exit_code == 0
     result = json.loads(capsys.readouterr().out)
     assert result["ok"] is True
     assert result["symbols"][0]["name"] == "target_function"
-    assert result["warnings"]
+    assert result["warnings"] == []
+    run.assert_called_once()
+    assert run.call_args.args[0][:3] == ["outline", "--json=compact", "--view=expanded"]
 
 
 def test_find_cli_rejects_invalid_min_score(tmp_path, capsys):
@@ -663,7 +706,7 @@ def test_impact_cli_accepts_manual_symbol_json(tmp_path, capsys):
         "end_line": 2,
     }
 
-    exit_code = cli.main(["impact", str(repo), "--symbol-json", json.dumps(symbol)])
+    exit_code = cli.main(["impact", str(repo), "--symbol-json", json.dumps(symbol), "--detail", "full"])
 
     assert exit_code == 0
     result = json.loads(capsys.readouterr().out)
@@ -736,10 +779,14 @@ def test_impact_cli_accepts_relative_symbol_from_find_json(tmp_path, capsys):
 
     assert impact_exit == 0
     result = json.loads(capsys.readouterr().out)
-    assert result["ok"] is True
+    assert result["schema_version"] == "xray.cli.v2"
     assert result["symbol"]["path"] == "src/sample.py"
     assert result["impact"]["total_count"] >= 1
+    assert result["impact"]["total_exact"] is True
     assert all(reference["line"] >= 1 for reference in result["impact"]["references"])
+    assert all(not Path(reference["path"]).is_absolute() for reference in result["impact"]["references"])
+    assert {reference["type"] for reference in result["impact"]["references"]} == {"call"}
+    assert {reference["confidence"] for reference in result["impact"]["references"]} == {"high"}
 
 
 def test_impact_filters_duplicate_non_source_and_inexact_structural_matches(tmp_path):
@@ -795,7 +842,8 @@ def test_impact_filters_duplicate_non_source_and_inexact_structural_matches(tmp_
             "file": str(repo / "src" / "sample.py"),
             "line": 5,
             "text": "def caller():\n    return target_function(41)",
-            "type": "code",
+            "type": "call",
+            "confidence": "high",
         }
     ]
 
@@ -929,6 +977,8 @@ def test_mcp_tool_surface_is_search_first_with_compact_metadata(tmp_path):
 
     assert [tool.name for tool in tools] == ["search_tools", "call_tool"]
     assert all("PROGRESSIVE DISCOVERY WORKFLOW" not in (tool.description or "") for tool in tools)
+    assert "regex pattern" in (tools[0].description or "")
+    assert "tool names, descriptions, and parameters" in tools[0].inputSchema["properties"]["pattern"]["description"]
     matches = structured_content(search_result)["result"]
     assert [match["name"] for match in matches] == ["what_breaks"]
     assert matches[0]["description"].startswith("Find likely symbol-name code references")
@@ -988,6 +1038,14 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
                     "change impact",
                     "root path",
                     "line data",
+                    "find symbol",
+                    "structural search",
+                    "rewrite pattern",
+                    "replacement plan",
+                    "apply replacement",
+                    "scan rules",
+                    "file imports",
+                    "file exports",
                     ".",
                     "[",
                 ]
@@ -1051,23 +1109,46 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
         "read_interface",
     }
     assert searches["line data"][0]["name"] == "what_breaks"
+    assert searches["find symbol"][0]["name"] == "find_symbol"
+    assert searches["structural search"][0]["name"] == "search_pattern"
+    assert searches["rewrite pattern"][0]["name"] == "rewrite_pattern"
+    assert searches["replacement plan"][0]["name"] == "plan_replacement"
+    assert searches["apply replacement"][0]["name"] == "apply_replacement"
+    assert searches["scan rules"][0]["name"] == "scan_rules"
+    assert searches["file imports"][0]["name"] == "file_imports"
+    assert searches["file exports"][0]["name"] == "file_exports"
     assert [match["name"] for match in searches["."]] == [
         "explore_repo",
         "find_symbol",
         "read_interface",
+        "read_interface_structured",
         "what_breaks",
         "search_pattern",
         "rewrite_pattern",
+        "plan_replacement",
+        "apply_replacement",
         "scan_rules",
-        "file_imports",
-        "file_exports",
     ]
     assert searches["["] == []
 
-    all_tools = {match["name"]: match for match in searches["."]}
-    detail_tools = {"explore_repo", "search_pattern", "rewrite_pattern", "scan_rules", "file_imports", "file_exports"}
-    limited_tools = {"search_pattern", "rewrite_pattern", "scan_rules", "file_imports", "file_exports"}
-    cursor_tools = {"search_pattern", "scan_rules", "file_imports", "file_exports"}
+    all_tools = {match["name"]: match for matches in searches.values() for match in matches}
+    assert set(all_tools) == {
+        "explore_repo",
+        "find_symbol",
+        "read_interface",
+        "read_interface_structured",
+        "what_breaks",
+        "search_pattern",
+        "rewrite_pattern",
+        "plan_replacement",
+        "apply_replacement",
+        "scan_rules",
+        "file_imports",
+        "file_exports",
+    }
+    detail_tools = {"explore_repo", "search_pattern", "rewrite_pattern", "scan_rules"}
+    limited_tools = {"search_pattern", "rewrite_pattern", "scan_rules"}
+    cursor_tools = {"search_pattern", "scan_rules"}
     for name in detail_tools:
         assert all_tools[name]["inputSchema"]["properties"]["detail"]["default"] == "compact"
     for name in limited_tools:
@@ -1076,12 +1157,13 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
         assert "cursor" in all_tools[name]["inputSchema"]["properties"]
     assert "cursor" not in all_tools["rewrite_pattern"]["inputSchema"]["properties"]
     assert "at most 50 compact matches" in all_tools["search_pattern"]["description"]
-    assert "Rewrite every matching" in all_tools["rewrite_pattern"]["description"]
+    assert "across every matching AST structure" in all_tools["rewrite_pattern"]["description"]
     assert "never support continuation" in all_tools["rewrite_pattern"]["description"]
     assert "Pass lang whenever the target language is known" in all_tools["rewrite_pattern"]["description"]
     lang_description = all_tools["rewrite_pattern"]["inputSchema"]["properties"]["lang"]["description"]
     assert "constrain destructive rewrite scope" in lang_description
     assert "apply every configured fix" in all_tools["scan_rules"]["description"]
+    assert "read-only by default" in all_tools["scan_rules"]["description"]
     assert "identical root" in all_tools["search_pattern"]["inputSchema"]["properties"]["cursor"]["description"]
 
     for matches in searches.values():
@@ -1090,7 +1172,8 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
             properties = match["inputSchema"]["properties"]
             assert "ctx" not in properties
             assert match["description"]
-            if match["name"] in {"rewrite_pattern", "scan_rules"}:
+            assert match["meta"]["fastmcp"]["tags"]
+            if match["name"] in {"rewrite_pattern", "scan_rules", "apply_replacement"}:
                 assert match["annotations"] == {
                     "readOnlyHint": False,
                     "destructiveHint": True,
@@ -1109,10 +1192,9 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
     explore = structured_content(calls["explore_repo"])
     assert "tree_text" not in explore
     assert any(entry["path"] == "src" for entry in explore["entries"])
-    assert any(
-        symbol_result["name"] == "target_function"
-        for symbol_result in structured_content(calls["find_symbol"])["result"]
-    )
+    found_symbols = structured_content(calls["find_symbol"])["result"]
+    assert any(symbol_result["name"] == "target_function" for symbol_result in found_symbols)
+    assert all(Path(symbol_result["abs_path"]).is_absolute() for symbol_result in found_symbols)
     assert "def target_function(value):" in structured_content(calls["read_interface"])["result"]
     impact = structured_content(calls["what_breaks"])
     assert impact["total_count"] >= 1
@@ -1365,6 +1447,8 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     assert "relative-path `entries`" in workflow_text
     assert 'detail="full"' in workflow_text
     assert "return at most 50 compact items" in workflow_text
+    assert "regular expression and returns at most 10 matches" in workflow_text
+    assert "do not use `.` to inventory" in workflow_text
     assert "regardless of the reporting limit" in workflow_text
     xray_workflow = next(resource for resource in resources if str(resource.uri) == "xray://workflow")
     annotations = xray_workflow.annotations
@@ -1374,6 +1458,8 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     skill_text = text_content(skill[0])
     assert skill_text.startswith("# XRAY Progressive Discovery")
     assert "search_tools" in skill_text
+    assert "regular expression and returns at most 10 matches" in skill_text
+    assert "a broad `.` can" in skill_text
     assert "`entries` for file selection" in skill_text
     assert "signature" in skill_text
     assert "name-based reference search" in skill_text
@@ -1382,8 +1468,13 @@ def test_mcp_workflow_guidance_is_available_on_demand():
     assert prompt_text.startswith("Goal: review impact")
     assert "use compact entries for file selection" in prompt_text
     assert "detail='full' only for tree_text" in prompt_text
-    assert "inspect returned/total/truncated" in prompt_text
-    assert "Rewrite and scan fixes apply every match" in prompt_text
+    assert "returned/total/total_exact/truncated" in prompt_text
+    assert "plan_replacement" in workflow_text
+    assert "apply_replacement" in workflow_text
+    assert "independently copied digest" in prompt_text
+    assert "focused search_tools regular expression" in prompt_text
+    assert "pass lang whenever the target language is known" in prompt_text
+    assert "Legacy rewrite and scan fixes still apply every match" in prompt_text
     assert "name-based references" in prompt_text
     assert "Fetch xray://workflow" in prompt_text
 
@@ -1524,69 +1615,137 @@ def test_cli_version_returns_without_system_exit(capsys):
     exit_code = cli.main(["--version"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out.strip() == "xray 0.8.3"
+    assert capsys.readouterr().out.strip() == "xray 0.9.1"
 
 
-def test_cli_help_documents_agent_workflow_json_and_safety(capsys):
-    root_exit = cli.main(["--help"])
-    root_help = " ".join(capsys.readouterr().out.split())
+def test_cli_help_is_current_safe_and_token_bounded(capsys):
+    def get_help(*command: str) -> str:
+        assert cli.main([*command, "--help"]) == 0
+        return capsys.readouterr().out
 
-    explore_exit = cli.main(["explore", "--help"])
-    explore_help = " ".join(capsys.readouterr().out.split())
+    helps = {
+        "root": get_help(),
+        "explore": get_help("explore"),
+        "find": get_help("find"),
+        "interface": get_help("interface"),
+        "impact": get_help("impact"),
+        "search": get_help("search"),
+        "rewrite": get_help("rewrite"),
+        "scan": get_help("scan"),
+        "replace": get_help("replace"),
+        "replace plan": get_help("replace", "plan"),
+        "replace apply": get_help("replace", "apply"),
+        "skill": get_help("skill"),
+        "skill install": get_help("skill", "install"),
+        "imports": get_help("imports"),
+        "exports": get_help("exports"),
+    }
+    normalized = {name: " ".join(value.split()) for name, value in helps.items()}
 
-    find_exit = cli.main(["find", "--help"])
-    find_help = " ".join(capsys.readouterr().out.split())
+    root = normalized["root"]
+    assert "xray explore ROOT --max-depth 2" in root
+    assert "jq -c '.symbols[0]'" in root
+    assert "xray replace plan ROOT" in root
+    assert "xray replace apply ROOT" in root
+    assert "Compact JSON is default" in root
+    assert "where offered, use --detail full" in root
+    assert "total_exact" in root
+    assert "YAML output is unsupported" in root
+    assert "replace apply, rewrite, and scan --fix mutate files" in root
+    assert "--limit never bounds legacy edits" in root
+    assert "Exit codes: 0 success, 1 command failure, 2 parse or validation error" in root
+    assert "Install the bundled xray-cli agent skill." in root
 
-    interface_exit = cli.main(["interface", "--help"])
-    interface_help = " ".join(capsys.readouterr().out.split())
+    explore = normalized["explore"]
+    assert "Start shallow" in explore
+    assert "--no-default-exclusions" in explore
+    assert "--detail {compact,full}" in explore
+    assert "invoked_as" in explore
 
-    impact_exit = cli.main(["impact", "--help"])
-    impact_help = " ".join(capsys.readouterr().out.split())
+    find = normalized["find"]
+    assert "owner-qualified identity" in find
+    assert "--min-score 60" in find
+    assert "qualified identity" in find
+    assert "match reason" in find
 
-    rewrite_exit = cli.main(["rewrite", "--help"])
-    rewrite_help = " ".join(capsys.readouterr().out.split())
+    interface = normalized["interface"]
+    assert "typed hierarchy" in interface
+    assert "must resolve inside the root" in interface
+    assert "parent traversal and symlink escapes fail" in interface
+    assert "legacy v1 string envelope" in interface
 
-    assert root_exit == 0
-    assert "Progressive workflow" in root_help
-    assert "xray explore ROOT --max-depth 2" in root_help
-    assert "jq -c '.symbols[0]'" in root_help
-    assert "structurally search, rewrite, scan, or outline code" in root_help
-    assert "Structural workflow" in root_help
-    assert "xray search ROOT -p 'old_api($ARG)' -l python" in root_help
-    assert "xray imports ROOT src/package/module.py" in root_help
-    assert "Subcommands emit compact JSON by default" in root_help
-    assert "YAML output is unsupported" in root_help
-    assert "Commands rewrite and scan --fix modify files in place" in root_help
-    assert "Exit codes: 0 success, 1 command failure, 2 parse or validation error" in root_help
-    assert explore_exit == 0
-    assert "Start shallow" in explore_help
-    assert "--format {json,text}" in explore_help
-    assert "xray map ROOT --format text" in explore_help
-    assert "invoked_as" in explore_help
-    assert "json is the default automation contract" in explore_help
-    assert "--pretty" in explore_help
-    assert find_exit == 0
-    assert "owner-qualified symbol path" in find_help
-    assert "--format {json,text}" in find_help
-    assert "path, abs_path, start_line, end_line, type, and score" in find_help
-    assert "json is the default automation contract" in find_help
-    assert rewrite_exit == 0
-    assert "specify it when known" in rewrite_help
-    assert "pattern-like non-code text" in rewrite_help
-    assert interface_exit == 0
-    assert "--format {json,text}" in interface_help
-    assert "must resolve inside the root" in interface_help
-    assert "rejects parent traversal and symlink escapes" in interface_help
-    assert impact_exit == 0
-    assert "Provide exactly one symbol source" in impact_help
-    assert "likely symbol-name code references" in impact_help
-    assert "not a type-aware caller or dependency graph" in impact_help
-    assert "--format {json,text}" in impact_help
-    assert "required with --name and --path" in impact_help
-    assert "--symbol-file -" in impact_help
-    assert "Symbol paths must resolve inside ROOT" in impact_help
-    assert "Review results for same-name symbols" in impact_help
-    assert "impact.strategy, counts, references, and note" in impact_help
+    impact = normalized["impact"]
+    assert "Provide exactly one symbol source" in impact
+    assert "not a type-aware dependency graph" in impact
+    assert "required with --name and --path" in impact
+    assert "--symbol-file -" in impact
+    assert "definition/import/call/read/text" in impact
+    assert "total_exact=false means a lower bound" in impact
+
+    assert "also bounds upstream search" in normalized["search"]
+    assert "edits still cover every match" in normalized["rewrite"]
+    assert "pattern-like non-code text" in normalized["rewrite"]
+    assert "--fix still applies every fix" in normalized["scan"]
+    assert "without writing files" in normalized["replace plan"]
+    assert "Candidate cap (default: 1000)" in normalized["replace plan"]
+    assert "Affected-file cap (default: 100)" in normalized["replace plan"]
+    assert "Preview cap (default: 50)" in normalized["replace plan"]
+    assert "bounded to 10 MiB" in normalized["replace apply"]
+    assert "Independently copied reviewed plan digest" in normalized["replace apply"]
+    assert "Replace divergent content" in normalized["skill install"]
+    assert "Use ROOT/.agents/skills" in normalized["skill install"]
+    assert "Page size (default: 50)" in normalized["imports"]
+    assert "Page size (default: 50)" in normalized["exports"]
+
+    assert all("read-only repository scans" not in value for value in normalized.values())
+    assert len(helps["root"].encode()) <= 2200
+    assert sum(len(value.encode()) for value in helps.values()) <= 16_000
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["explore", "ROOT", "--max-depth", "2"],
+        ["map", "ROOT", "--max-depth", "2"],
+        ["find", "ROOT", "AuthService.validate_user", "--limit", "5", "--min-score", "60"],
+        ["interface", "ROOT", "src/package/module.py"],
+        ["impact", "ROOT", "--symbol-file", "-"],
+        ["search", "ROOT", "-p", "old_api($ARG)", "-l", "python"],
+        ["imports", "ROOT", "src/package/module.py"],
+        ["exports", "ROOT", "src/package/module.py"],
+        ["scan", "ROOT", "--rule", "sgconfig.yml"],
+        [
+            "replace",
+            "plan",
+            "ROOT",
+            "-p",
+            "old_api($ARG)",
+            "-r",
+            "new_api($ARG)",
+            "-l",
+            "python",
+            "--path",
+            "src",
+            "--glob",
+            "*.py",
+        ],
+        [
+            "replace",
+            "apply",
+            "ROOT",
+            "--plan-file",
+            "plan.json",
+            "--expected-digest",
+            "REVIEWED_DIGEST",
+        ],
+        ["rewrite", "ROOT", "-p", "old_api($ARG)", "-r", "new_api($ARG)", "-l", "python"],
+        ["scan", "ROOT", "--rule", "sgconfig.yml", "--fix"],
+    ],
+)
+def test_cli_skill_examples_parse_current_options(argv):
+    args = cli.build_parser().parse_args(argv)
+
+    assert callable(args.handler)
 
 
 def test_explore_focus_keeps_root_and_focused_top_level_dir(tmp_path, capsys):
@@ -1662,6 +1821,209 @@ def test_explore_json_includes_structured_entries(tmp_path, capsys):
     assert entries["src/sample.py"]["language"] == "python"
     assert "abs_path" not in entries["src/sample.py"]
     assert any(symbol["signature"] == "def target_function(value):" for symbol in entries["src/sample.py"]["symbols"])
+
+
+def test_symbol_inventory_prevents_owner_pollution_and_filters_nonsense(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "service.py").write_text(
+        "class BillingService:\n    def unrelated_member(self):\n        return 1\n",
+        encoding="utf-8",
+    )
+    indexer = XRayIndexer(str(repo))
+
+    owner_results = indexer.find_symbol("BillingService", min_score=60, include_scores=True)
+    qualified = indexer.find_symbol("BillingService.unrelated_member", min_score=60, include_scores=True)
+    nonsense = indexer.find_symbol(
+        "this query has no plausible symbol identity whatsoever", min_score=60, include_scores=True
+    )
+
+    assert [result["name"] for result in owner_results] == ["BillingService"]
+    assert qualified[0].get("qualified_name") == "BillingService.unrelated_member"
+    assert qualified[0].get("owner") == "BillingService"
+    assert qualified[0].get("match_reason") == "exact_qualified_name"
+    assert qualified[0].get("confidence") == "high"
+    assert nonsense == []
+
+
+def test_symbol_inventory_invalidates_on_same_size_dirty_source_change(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = repo / "sample.py"
+    source.write_text("def alpha():\n    pass\n", encoding="utf-8")
+    first_outline = [
+        {
+            "path": str(source),
+            "items": [
+                {
+                    "name": "alpha",
+                    "symbolType": "function",
+                    "signature": "def alpha():",
+                    "range": {"start": {"line": 0}, "end": {"line": 1}},
+                }
+            ],
+        }
+    ]
+    second_outline = [
+        {
+            "path": str(source),
+            "items": [
+                {
+                    "name": "bravo",
+                    "symbolType": "function",
+                    "signature": "def bravo():",
+                    "range": {"start": {"line": 0}, "end": {"line": 1}},
+                }
+            ],
+        }
+    ]
+    indexer = XRayIndexer(str(repo))
+
+    with patch(
+        "xray.core.indexer.run_ast_grep",
+        side_effect=[AstGrepResult(json.dumps(first_outline), "", 0), AstGrepResult(json.dumps(second_outline), "", 0)],
+    ) as run:
+        assert indexer.find_symbol("alpha", min_score=100)[0]["name"] == "alpha"
+        source.write_text("def bravo():\n    pass\n", encoding="utf-8")
+        assert indexer.find_symbol("bravo", min_score=100)[0]["name"] == "bravo"
+
+    assert run.call_count == 2
+
+
+def test_structured_python_interface_preserves_hierarchy_docs_and_signatures(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = repo / "service.py"
+    source.write_text(
+        '''class Service(Base):
+    """Public service contract."""
+
+    def fetch(self, key: str, retries: int = 2) -> bytes:
+        """Fetch one value."""
+        secret_implementation = key * retries
+        return secret_implementation.encode()
+''',
+        encoding="utf-8",
+    )
+    indexer = XRayIndexer(str(repo))
+
+    result = indexer.read_interface_structured("service.py")
+    rendered = indexer.render_interface(result)
+
+    assert result["path"] == "service.py"
+    assert result["language"] == "python"
+    assert result["complete"] is True
+    assert result["symbols"][0]["documentation"] == "Public service contract."
+    member = result["symbols"][0]["members"][0]
+    assert member["signature"] == "def fetch(self, key: str, retries: int=2) -> bytes:"
+    assert member["documentation"] == "Fetch one value."
+    assert "secret_implementation" not in rendered
+    assert "    def fetch" in rendered
+
+
+def test_structured_interface_surfaces_typed_errors_and_incompleteness(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+    (repo / "notes.md").write_text("# Notes\n", encoding="utf-8")
+    script = repo / "script.js"
+    script.write_text("const value = 1;\n", encoding="utf-8")
+    indexer = XRayIndexer(str(repo))
+
+    with pytest.raises(InterfaceReadError) as parse_error:
+        indexer.read_interface_structured("broken.py")
+    with pytest.raises(InterfaceReadError) as unsupported:
+        indexer.read_interface_structured("notes.md")
+    with pytest.raises(InterfaceReadError) as missing:
+        indexer.read_interface_structured("missing.py")
+    assert parse_error.value.code == "parse_error"
+    assert unsupported.value.code == "unsupported_file"
+    assert missing.value.code == "not_found"
+
+    incomplete_outline = [
+        {
+            "path": str(script),
+            "items": [{"name": "value", "symbolType": "constant", "range": {"start": {"line": 0}}}],
+        }
+    ]
+    with patch("xray.core.indexer.run_ast_grep", return_value=AstGrepResult(json.dumps(incomplete_outline), "", 0)):
+        incomplete = indexer.read_interface_structured("script.js")
+    assert incomplete["complete"] is False
+    assert incomplete["warnings"]
+    assert incomplete["symbols"][0]["signature"] == "value"
+
+
+def test_bounded_impact_classifies_definitions_imports_and_calls(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "target.py"
+    target.write_text("def work():\n    pass\n", encoding="utf-8")
+    other = repo / "other.py"
+    other.write_text("def work():\n    pass\nfrom target import work\nwork()\n", encoding="utf-8")
+    matches = [
+        {"file": str(target), "text": "work", "lines": "def work():", "range": {"start": {"line": 0}}},
+        {"file": str(other), "text": "work", "lines": "def work():", "range": {"start": {"line": 0}}},
+        {
+            "file": str(other),
+            "text": "work",
+            "lines": "from target import work",
+            "range": {"start": {"line": 2}},
+        },
+        {"file": str(other), "text": "work", "lines": "work()", "range": {"start": {"line": 3}}},
+    ]
+    indexer = XRayIndexer(str(repo))
+
+    with patch(
+        "xray.core.indexer.run_ast_grep_bounded",
+        return_value=BoundedAstGrepResult(matches=matches, total_exact=False),
+    ) as run:
+        result = indexer.what_breaks(
+            {"name": "work", "path": str(target), "start_line": 1, "end_line": 2}, max_results=4
+        )
+
+    assert [reference.get("type") for reference in result["references"]] == ["definition", "import", "call"]
+    assert [reference.get("confidence") for reference in result["references"]] == ["high", "high", "high"]
+    assert result["total_exact"] is False
+    assert "not dependents" in result["note"]
+    assert run.call_args.args[1] == 4
+
+
+@pytest.mark.parametrize("with_git_directory", [False, True])
+def test_gitignore_wildmatch_anchoring_negation_nested_rules_and_builtin_policy(tmp_path, with_git_directory):
+    repo = tmp_path / ("git-repo" if with_git_directory else "plain-repo")
+    (repo / "ignored").mkdir(parents=True)
+    (repo / "src" / "deep").mkdir(parents=True)
+    (repo / ".codex").mkdir()
+    if with_git_directory:
+        (repo / ".git").mkdir()
+    (repo / ".gitignore").write_text("/root_only.py\nignored/*.py\n!ignored/keep.py\n", encoding="utf-8")
+    (repo / "src" / ".gitignore").write_text("/secret.py\n", encoding="utf-8")
+    for relative in (
+        "root_only.py",
+        "src/root_only.py",
+        "ignored/drop.py",
+        "ignored/keep.py",
+        "src/secret.py",
+        "src/deep/secret.py",
+        ".codex/state.py",
+    ):
+        (repo / relative).write_text("def visible():\n    pass\n", encoding="utf-8")
+
+    indexer = XRayIndexer(str(repo))
+    default_paths = {entry["path"] for entry in indexer.explore_repo_data(max_depth=4)["entries"]}
+    unfiltered = indexer.explore_repo_data(max_depth=4, use_default_exclusions=False)
+    unfiltered_paths = {entry["path"] for entry in unfiltered["entries"]}
+
+    assert "root_only.py" not in default_paths
+    assert "src/root_only.py" in default_paths
+    assert "ignored/drop.py" not in default_paths
+    assert "ignored/keep.py" in default_paths
+    assert "src/secret.py" not in default_paths
+    assert "src/deep/secret.py" in default_paths
+    assert ".codex/state.py" not in default_paths
+    assert ".codex/state.py" in unfiltered_paths
+    assert "root_only.py" not in unfiltered_paths
+    assert unfiltered["options"]["use_default_exclusions"] is False
 
 
 def test_explore_cli_bounds_and_reports_truncated_output(tmp_path, capsys):

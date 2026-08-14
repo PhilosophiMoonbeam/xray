@@ -32,6 +32,7 @@ def test_project_metadata_is_cli_first_with_mcp_compatibility():
     assert project["scripts"]["xray"] == "xray.cli:main"
     assert project["scripts"]["xray-mcp"] == "xray.mcp_server:main"
     assert "pydantic>=2.0,<3" in project["dependencies"]
+    assert "pathspec>=0.12,<1" in project["dependencies"]
     assert "pyright>=1.1.407" in data["dependency-groups"]["dev"]
     assert "pytest>=9.0.0" in data["dependency-groups"]["dev"]
     assert "ruff>=0.14.0" in data["dependency-groups"]["dev"]
@@ -69,18 +70,44 @@ def test_quality_tooling_is_configured_for_repo_layout():
 def test_fastmcp_dependency_requires_verified_modern_surface():
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "fastmcp>=3.4.2,<4" in data["project"]["dependencies"]
+    assert "fastmcp>=3.4.7,<4" in data["project"]["dependencies"]
 
 
-def test_packaging_includes_mcp_skill_markdown():
+def test_packaging_includes_mcp_and_agent_skill_data():
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert data["tool"]["setuptools"]["package-data"]["xray"] == ["skills/**/*"]
+    assert data["tool"]["setuptools"]["package-data"]["xray"] == ["skills/**/*", "agent_skills/**/*"]
+
+
+def test_packaged_cli_skill_exactly_matches_repository_source():
+    source = ROOT / "skills" / "xray-cli"
+    packaged = ROOT / "src" / "xray" / "agent_skills" / "xray-cli"
+
+    source_files = {path.relative_to(source) for path in source.rglob("*") if path.is_file()}
+    packaged_files = {path.relative_to(packaged) for path in packaged.rglob("*") if path.is_file()}
+
+    assert source_files == packaged_files == {Path("SKILL.md"), Path("agents/openai.yaml")}
+    for relative in source_files:
+        assert (packaged / relative).read_bytes() == (source / relative).read_bytes()
+
+
+def test_packaged_mcp_skill_is_current_and_token_bounded():
+    content = (ROOT / "src" / "xray" / "skills" / "xray-progressive-discovery" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "regular expression and returns at most 10 matches" in content
+    assert "a broad `.` can" in content
+    assert "read_interface_structured" in content
+    assert "plan_replacement" in content
+    assert "apply_replacement" in content
+    assert "Pass `lang` whenever the pattern language is known" in content
+    assert len(content.split()) <= 500
+    assert len(content.encode()) <= 3600
 
 
 def test_top_level_cli_skill_is_agent_skills_compliant():
     skill_dir = ROOT / "skills" / "xray-cli"
     skill_path = skill_dir / "SKILL.md"
+    openai_path = skill_dir / "agents" / "openai.yaml"
 
     assert skill_path.exists()
     assert not (ROOT / "skills" / "XRAY-CLI").exists()
@@ -102,12 +129,25 @@ def test_top_level_cli_skill_is_agent_skills_compliant():
     assert "xray interface" in body
     assert "xray impact" in body
     assert "xray search" in body
+    assert "xray replace plan ROOT" in body
+    assert "xray replace apply ROOT" in body
+    assert "REVIEWED_DIGEST" in body
     assert "xray rewrite ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' -l python" in body
-    assert "pass `-l/--lang` whenever the target language is known" in body
+    assert "Pass `-l/--lang` for pattern mutations when known" in body
     assert "xray scan" in body
     assert "xray imports" in body
     assert "xray exports" in body
-    assert "Do not request YAML" in body
+    assert "never XRAY output" in body
+    assert "total_exact: false" in body
+    assert "--limit` limits reporting, not edits" in body
+    assert "`find` remains `xray.cli.v1` and has no `--detail` option" in body
+    assert len(content.split()) <= 500
+    assert len(content.encode()) <= 3600
+
+    openai = openai_path.read_text(encoding="utf-8")
+    assert "$xray-cli" in openai
+    assert "guarded structural changes" in openai
+    assert len(openai.encode()) <= 256
 
 
 def test_mcp_server_imports_with_verified_fastmcp_surface():
@@ -115,9 +155,20 @@ def test_mcp_server_imports_with_verified_fastmcp_surface():
 
     version = tuple(int(part) for part in importlib.metadata.version("fastmcp").split(".")[:3])
 
-    assert (3, 4, 2) <= version < (4, 0, 0)
+    assert (3, 4, 7) <= version < (4, 0, 0)
     assert mcp_server.mcp.name == "XRAY Code Intelligence"
     assert callable(mcp_server.main)
+
+
+def test_mcp_entrypoint_forces_documented_stdio_transport(monkeypatch):
+    from xray import mcp_server
+
+    calls = []
+    monkeypatch.setattr(mcp_server.mcp, "run", lambda **kwargs: calls.append(kwargs))
+
+    mcp_server.main()
+
+    assert calls == [{"transport": "stdio"}]
 
 
 def test_readme_documents_generated_cli_decision():
@@ -129,6 +180,12 @@ def test_readme_documents_generated_cli_decision():
     assert "**Source checkout**" in readme
     assert "**Installed uv tool**" in readme
     assert "uv tool install ." in readme
+    assert "xray skill install --user" in readme
+    assert "xray skill install --project /path/to/project" in readme
+    assert "does not forward arbitrary" in readme
+    assert "`search_tools` accepts a regular expression and returns at most 10 matches" in readme
+    assert "`xray skill install` is intentionally CLI-only" in readme
+    assert "`xray-mcp` fixes the FastMCP transport to stdio" in readme
     assert "mcp-config-generator.py cursor installed_script" in readme
     assert "mcp-config-generator.py vscode installed_script" in readme
     assert "[mcp_servers.xray]" in readme
@@ -143,15 +200,20 @@ def test_readme_documents_current_installation_and_cli_contract():
     normalized_readme = " ".join(readme.split())
 
     assert "https://github.com/PhilosophiMoonbeam/xray.git" in readme
-    assert "`fastmcp>=3.4.2,<4`" in readme
+    assert "`fastmcp>=3.4.7,<4`" in readme
     assert "`ast-grep-cli>=0.44.1`" in readme
+    assert "`pathspec>=0.12,<1`" in readme
     assert "no separate installation is normally required" in normalized_readme
     assert "JSON symbols include `name`" in readme
     assert "`rewrite` and `scan --fix` modify files in place" in readme
     assert "Exit codes are `0` for success" in readme
     assert "symbols.json" in readme
     assert "symbols.pkl" not in readme
-    assert "Interface reads use ast-grep's expanded outline" in readme
+    assert "Python interface reads use the standard-library AST" in readme
+    assert "xray replace plan ROOT" in readme
+    assert "--expected-digest REVIEWED_DIGEST" in readme
+    assert "plan_replacement" in readme
+    assert "apply_replacement" in readme
 
 
 def test_package_fallback_version_matches_pyproject():

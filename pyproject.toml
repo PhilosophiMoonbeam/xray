@@ -1,6 +1,6 @@
 [project]
 name = "xray"
-version = "0.8.3"
+version = "0.9.1"
 description = "XRAY: Agent-centric code intelligence CLI with MCP compatibility - Map, Find, Interface, Impact"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,10 +18,11 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "fastmcp>=3.4.2,<4",
+    "fastmcp>=3.4.7,<4",
     "ast-grep-cli>=0.44.1",
     "thefuzz>=0.20.0",
     "pydantic>=2.0,<3",
+    "pathspec>=0.12,<1",
 ]
 
 [dependency-groups]
@@ -45,7 +46,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-xray = ["skills/**/*"]
+xray = ["skills/**/*", "agent_skills/**/*"]
 
 [project.scripts]
 xray = "xray.cli:main"

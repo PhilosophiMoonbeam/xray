@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
-import binascii
-import hashlib
 import json
 import os
 import sys
@@ -16,7 +13,7 @@ from typing import Any, NoReturn
 
 from xray import __version__
 from xray.core.ast_grep import AstGrepError
-from xray.core.indexer import XRayIndexer
+from xray.core.indexer import InterfaceReadError, ReplacementApplyError, XRayIndexer
 from xray.models import (
     dump_error_envelope,
     dump_explore_data,
@@ -24,96 +21,93 @@ from xray.models import (
     dump_find_envelope,
     dump_impact_envelope,
     dump_impact_result,
+    dump_interface_data,
     dump_interface_envelope,
     dump_symbol_output,
     validate_symbol_input,
 )
-from xray.presentation import compact_explore, compact_structural_items
+from xray.presentation import (
+    compact_explore,
+    compact_impact_references,
+    compact_structural_items,
+    cursor_fingerprint,
+    decode_cursor,
+    page_items,
+)
+from xray.skill_installer import SkillInstallError, install_cli_skill
 
 SCHEMA_VERSION = "xray.cli.v1"
 COMPACT_SCHEMA_VERSION = "xray.cli.v2"
 DEFAULT_STRUCTURAL_LIMIT = 50
 MAX_SCORE = 100
 MAX_SYMBOL_JSON_CHARS = 1024 * 1024
-OUTPUT_FORMAT_HELP = "Output format. json is the default automation contract; text is a lossy scan mode."
-PRETTY_HELP = "Pretty-print JSON output; ignored with --format text."
+MAX_PLAN_JSON_CHARS = 10 * 1024 * 1024
+OUTPUT_FORMAT_HELP = "Output: compact JSON (default) or lossy text."
+PRETTY_HELP = "Indent JSON output."
 
 ROOT_HELP_EPILOG = """\
-Progressive workflow:
+Agent flow:
   xray explore ROOT --max-depth 2
-  xray find ROOT "target symbol" --min-score 60
-  xray interface ROOT path/from/find.py
   symbol=$(xray find ROOT "target symbol" --limit 1 | jq -c '.symbols[0]')
-  xray impact ROOT --symbol-json "$symbol"  # likely symbol-name references
+  xray interface ROOT path/from/find.py
+  xray impact ROOT --symbol-json "$symbol"
 
-Structural workflow:
-  xray search ROOT -p 'old_api($ARG)' -l python
-  xray imports ROOT src/package/module.py
+Guarded change:
+  xray replace plan ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' -l python > plan.json
+  xray replace apply ROOT --plan-file plan.json --expected-digest REVIEWED_DIGEST
 
-Subcommands emit compact JSON by default. Structural commands bound output and
-support --cursor continuation; use --detail full for upstream payloads.
-Use --pretty for indented JSON or --format text for compact lossy scans.
-YAML output is unsupported.
-Commands rewrite and scan --fix modify files in place.
-Exit codes: 0 success, 1 command failure, 2 parse or validation error.
+Compact JSON is default; where offered, use --detail full for legacy fields or
+--format text for lossy scans. Pages report total_exact; next_cursor requires the
+same query and snapshot. YAML output is unsupported. replace apply, rewrite, and
+scan --fix mutate files; --limit never bounds legacy edits. Exit codes: 0 success,
+1 command failure, 2 parse or validation error.
 """
 
 EXPLORE_HELP = """\
-Map repository structure before reading large files. Start shallow, then add
---focus and --include-symbols when you know where to zoom in.
+Map a repository. Start shallow; add --focus or --include-symbols as needed.
 """
 
 EXPLORE_EPILOG = """\
 Examples:
   xray explore ROOT --max-depth 2
   xray explore ROOT --focus src --include-symbols --max-symbols-per-file 5
-  xray map ROOT --format text
 
-Compact JSON includes structured relative-path entries without a duplicate tree
-or absolute paths. Use --detail full for the v1 payload. The map alias reports
-command "explore" and invoked_as "map".
+Compact JSON contains relative-path entries. --detail full adds the v1 tree and
+absolute paths. map aliases explore and sets invoked_as to "map".
 """
 
 FIND_EPILOG = """\
-Examples:
-  xray find ROOT "AuthService.validate_user" --limit 5 --min-score 60
-  xray find ROOT "target_function" --format text
+Example: xray find ROOT "AuthService.validate_user" --limit 5 --min-score 60
 
-Default JSON symbols are complete inputs for name-based impact analysis: path, abs_path,
-start_line, end_line, type, and score.
-Use --min-score 60 or higher to suppress weak fuzzy matches.
+JSON symbols are complete impact inputs, including qualified identity, match
+reason, confidence, paths, lines, type, and score.
 """
 
 INTERFACE_HELP = """\
-Show signatures, class definitions, types, and docstrings for one file without
-printing implementation bodies.
+Show one file's typed hierarchy without implementation bodies.
 """
 
 INTERFACE_EPILOG = """\
-Examples:
-  xray interface ROOT src/package/module.py
-  xray interface ROOT /absolute/path/inside/root.py --format text
+Example: xray interface ROOT src/package/module.py
 
-FILE_PATH may be absolute or relative, but it must resolve inside ROOT. XRAY
-rejects parent traversal and symlink escapes rather than reading outside files.
+FILE_PATH must resolve inside ROOT; parent traversal and symlink escapes fail.
+Compact JSON includes hierarchy and completeness. --detail full returns the
+legacy v1 string envelope.
 """
 
 IMPACT_HELP = """\
-Find likely symbol-name code references for impact review. This is not a
-type-aware caller or dependency graph. Provide exactly one symbol source:
+Find bounded symbol-name references; this is not a type-aware dependency graph.
+Provide exactly one symbol source:
 --symbol-json, --symbol-file, or --name with --path and --start-line.
 """
 
 IMPACT_EPILOG = """\
-Examples:
-  symbol=$(xray find ROOT "target_function" --limit 1 | jq -c '.symbols[0]')
-  xray impact ROOT --symbol-json "$symbol"
+Pipeline:
   xray find ROOT "target_function" --limit 1 | jq -c '.symbols[0]' | xray impact ROOT --symbol-file -
-  xray impact ROOT --name target_function --path src/app.py --start-line 42 --type function
 
-Symbols returned by xray find are the safest input. Symbol paths must resolve
-inside ROOT. Default JSON includes impact.strategy, counts, references, and note.
-Review results for same-name symbols; impact analysis is name-based.
+Symbol paths must resolve inside ROOT. Compact references classify
+definition/import/call/read/text with confidence and snapshot-bound paging.
+total_exact=false means a lower bound; review same-name definitions separately.
 """
 
 
@@ -161,10 +155,7 @@ def get_version() -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = XRayArgumentParser(
         prog="xray",
-        description=(
-            "Agent-centric code intelligence CLI: explore repositories, find and inspect symbols,\n"
-            "review name-based impact, and structurally search, rewrite, scan, or outline code."
-        ),
+        description="Code intelligence for LLM agents: inspect, assess impact, and make structural changes.",
         epilog=ROOT_HELP_EPILOG,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {get_version()}")
@@ -211,6 +202,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum files and directories returned (default: 5000); truncation is reported.",
     )
     explore.add_argument(
+        "--no-default-exclusions",
+        action="store_false",
+        dest="use_default_exclusions",
+        help="Include generated/agent-state paths while still honoring repository .gitignore rules.",
+    )
+    explore.add_argument(
         "--format",
         choices=("json", "text"),
         default="json",
@@ -227,8 +224,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     find = subparsers.add_parser(
         "find",
-        help="Find functions, classes, methods, and types by fuzzy query.",
-        description="Find definitions by fuzzy name, behavior phrase, or owner-qualified symbol path.",
+        help="Find symbols by calibrated name match.",
+        description="Find definitions by name or owner-qualified identity.",
         epilog=FIND_EPILOG,
     )
     find.add_argument("root_path", help="Repository root to inspect.")
@@ -257,6 +254,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     interface.add_argument("root_path", help="Repository root to inspect.")
     interface.add_argument("file_path", help="File path, absolute or relative; must resolve inside the root.")
+    interface.add_argument(
+        "--detail",
+        choices=("compact", "full"),
+        default="compact",
+        help="Structured compact v2 contract (default) or legacy v1 string envelope.",
+    )
     interface.add_argument(
         "--format",
         choices=("json", "text"),
@@ -289,6 +292,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     impact.add_argument("--end-line", type=int, default=None, help="Definition end line for manual symbols.")
     impact.add_argument("--context-lines", type=int, default=2, help="Context lines around each reference.")
+    impact.add_argument("--limit", type=int, default=DEFAULT_STRUCTURAL_LIMIT, help="Maximum returned references.")
+    impact.add_argument("--cursor", help="Opaque continuation cursor from an identical unchanged query.")
+    impact.add_argument(
+        "--detail",
+        choices=("compact", "full"),
+        default="compact",
+        help="Compact relative-path v2 results (default) or full v1-compatible context.",
+    )
     impact.add_argument(
         "--format",
         choices=("json", "text"),
@@ -298,11 +309,15 @@ def build_parser() -> argparse.ArgumentParser:
     impact.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
     impact.set_defaults(handler=handle_impact)
 
-    search = subparsers.add_parser("search", help="Search code with an ast-grep structural pattern.")
+    search = subparsers.add_parser("search", help="Search with an ast-grep pattern.")
     search.add_argument("root_path", help="Repository root to search.")
     search.add_argument("-p", "--pattern", required=True, help="ast-grep structural pattern.")
     search.add_argument("-l", "--lang", help="Pattern language when it cannot be inferred.")
-    add_structural_output_args(search)
+    add_scope_args(search)
+    add_structural_output_args(
+        search,
+        limit_help=f"Result cap (default: {DEFAULT_STRUCTURAL_LIMIT}); also bounds upstream search.",
+    )
     search.set_defaults(handler=handle_search)
 
     rewrite = subparsers.add_parser("rewrite", help="Apply an ast-grep structural rewrite in place.")
@@ -314,27 +329,100 @@ def build_parser() -> argparse.ArgumentParser:
         "--lang",
         help="Target language; specify it when known to keep mutations from matching pattern-like non-code text.",
     )
-    add_structural_output_args(rewrite, supports_cursor=False)
+    add_structural_output_args(
+        rewrite,
+        supports_cursor=False,
+        limit_help=f"Reported-match cap (default: {DEFAULT_STRUCTURAL_LIMIT}); edits still cover every match.",
+    )
     rewrite.set_defaults(handler=handle_rewrite)
 
     scan = subparsers.add_parser("scan", help="Scan code with ast-grep YAML rules.")
     scan.add_argument("root_path", help="Repository root to scan.")
     scan.add_argument("--rule", required=True, help="Rule configuration file or directory inside the root.")
     scan.add_argument("--fix", action="store_true", help="Apply every rule fix without prompting.")
-    add_structural_output_args(scan)
+    add_scope_args(scan)
+    add_structural_output_args(
+        scan,
+        limit_help=f"Diagnostic cap (default: {DEFAULT_STRUCTURAL_LIMIT}); --fix still applies every fix.",
+    )
     scan.set_defaults(handler=handle_scan)
+
+    replace = subparsers.add_parser(
+        "replace",
+        help="Plan or guardedly apply a bounded structural replacement.",
+        description="Plan without writes; apply only a reviewed unchanged plan.",
+    )
+    replace_subparsers = replace.add_subparsers(dest="replace_command", required=True, parser_class=XRayArgumentParser)
+    replace_plan = replace_subparsers.add_parser(
+        "plan",
+        help="Create a non-mutating exact replacement plan.",
+        description="Emit an exact JSON plan without writing files.",
+    )
+    replace_plan.add_argument("root_path", help="Repository root to inspect without mutation.")
+    replace_plan.add_argument("-p", "--pattern", help="ast-grep structural pattern.")
+    replace_plan.add_argument("-r", "--replacement", help="Replacement template paired with --pattern.")
+    replace_plan.add_argument("--rule", help="Fix-bearing ast-grep rule/config path inside the root.")
+    replace_plan.add_argument("-l", "--lang", help="Pattern language when using --pattern.")
+    add_scope_args(replace_plan)
+    replace_plan.add_argument("--max-matches", type=int, default=1000, help="Candidate cap (default: 1000).")
+    replace_plan.add_argument("--max-files", type=int, default=100, help="Affected-file cap (default: 100).")
+    replace_plan.add_argument("--preview-limit", type=int, default=50, help="Preview cap (default: 50).")
+    replace_plan.add_argument("--allow-noop", action="store_true", help="Record permission to apply an all-no-op plan.")
+    replace_plan.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    replace_plan.set_defaults(handler=handle_replace_plan, format="json")
+
+    replace_apply = replace_subparsers.add_parser(
+        "apply",
+        help="Apply a reviewed plan after all guards pass.",
+        description="Validate plan, digest, and source; then stage, replace, and verify.",
+    )
+    replace_apply.add_argument("root_path", help="Repository root bound by the plan.")
+    replace_apply.add_argument(
+        "--plan-file", required=True, help="Full plan JSON file, or '-' for standard input (bounded to 10 MiB)."
+    )
+    replace_apply.add_argument("--expected-digest", required=True, help="Independently copied reviewed plan digest.")
+    replace_apply.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    replace_apply.set_defaults(handler=handle_replace_apply, format="json")
+
+    skill = subparsers.add_parser(
+        "skill",
+        help="Install the bundled xray-cli agent skill.",
+        description="Install for this user or one project.",
+    )
+    skill_subparsers = skill.add_subparsers(dest="skill_command", required=True, parser_class=XRayArgumentParser)
+    skill_install = skill_subparsers.add_parser(
+        "install",
+        help="Install; divergent content requires --force.",
+    )
+    scope = skill_install.add_mutually_exclusive_group()
+    scope.add_argument("--user", action="store_true", help="Use ~/.agents/skills (default).")
+    scope.add_argument("--project", metavar="ROOT", help="Use ROOT/.agents/skills.")
+    skill_install.add_argument("--force", action="store_true", help="Replace divergent content.")
+    skill_install.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
+    skill_install.set_defaults(handler=handle_skill_install, format="json")
 
     for command in ("imports", "exports"):
         outline = subparsers.add_parser(command, help=f"List file {command} using ast-grep outline.")
         outline.add_argument("root_path", help="Repository root containing the file.")
         outline.add_argument("file_path", help="File path, absolute or relative; must stay inside the root.")
-        add_structural_output_args(outline)
+        add_structural_output_args(outline, limit_help=f"Page size (default: {DEFAULT_STRUCTURAL_LIMIT}).")
         outline.set_defaults(handler=handle_outline_items, outline_item=command)
 
     return parser
 
 
-def add_structural_output_args(parser: argparse.ArgumentParser, *, supports_cursor: bool = True) -> None:
+def add_scope_args(parser: argparse.ArgumentParser) -> None:
+    """Add repeatable contained paths and ast-grep glob filters."""
+    parser.add_argument("--path", dest="paths", action="append", help="Contained file/directory scope; repeatable.")
+    parser.add_argument("--glob", dest="globs", action="append", help="Ordered ast-grep glob filter; repeatable.")
+
+
+def add_structural_output_args(
+    parser: argparse.ArgumentParser,
+    *,
+    limit_help: str,
+    supports_cursor: bool = True,
+) -> None:
     parser.add_argument(
         "--detail",
         choices=("compact", "full"),
@@ -345,10 +433,10 @@ def add_structural_output_args(parser: argparse.ArgumentParser, *, supports_curs
         "--limit",
         type=int,
         default=DEFAULT_STRUCTURAL_LIMIT,
-        help=f"Maximum returned items (default: {DEFAULT_STRUCTURAL_LIMIT}); operations still inspect/fix all matches.",
+        help=limit_help,
     )
     if supports_cursor:
-        parser.add_argument("--cursor", help="Opaque continuation cursor from next_cursor.")
+        parser.add_argument("--cursor", help="next_cursor from the identical unchanged read.")
     else:
         parser.set_defaults(cursor=None)
     parser.add_argument("--format", choices=("json", "text"), default="json", help=OUTPUT_FORMAT_HELP)
@@ -372,6 +460,7 @@ def handle_explore(args: argparse.Namespace) -> int:
         max_symbols_per_file=args.max_symbols_per_file,
         symbol_types=symbol_types,
         max_entries=args.max_entries,
+        use_default_exclusions=args.use_default_exclusions,
     )
     if args.format == "json":
         data = dump_explore_data(data)
@@ -463,27 +552,72 @@ def handle_find(args: argparse.Namespace) -> int:
 
 def handle_interface(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
-    interface = indexer.read_interface(args.file_path)
-    is_error = interface.startswith("Error")
-    if args.format == "json":
+    try:
+        structured = dump_interface_data(indexer.read_interface_structured(args.file_path))
+    except InterfaceReadError as exc:
+        message = f"Error reading interface: {exc}"
+        if args.format == "text":
+            print(message)
+        elif args.detail == "full":
+            print_json(
+                dump_interface_envelope(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "ok": False,
+                        "command": "interface",
+                        "root_path": str(indexer.root_path),
+                        "file_path": args.file_path,
+                        "interface": None,
+                        "error": message,
+                        "warnings": [],
+                    }
+                ),
+                pretty=args.pretty,
+            )
+        else:
+            print_json(
+                {
+                    "schema_version": COMPACT_SCHEMA_VERSION,
+                    "ok": False,
+                    "command": "interface",
+                    "root_path": str(indexer.root_path),
+                    "error": {"code": exc.code, "message": str(exc)},
+                    "warnings": [],
+                },
+                pretty=args.pretty,
+            )
+        return 1
+
+    rendered = indexer.render_interface(structured)
+    if args.format == "text":
+        print(rendered)
+    elif args.detail == "full":
         print_json(
             dump_interface_envelope(
                 {
                     "schema_version": SCHEMA_VERSION,
-                    "ok": not is_error,
+                    "ok": True,
                     "command": "interface",
                     "root_path": str(indexer.root_path),
                     "file_path": args.file_path,
-                    "interface": None if is_error else interface,
-                    "error": interface if is_error else None,
-                    "warnings": [],
+                    "interface": rendered,
+                    "error": None,
+                    "warnings": structured["warnings"],
                 }
             ),
             pretty=args.pretty,
         )
     else:
-        print(interface)
-    return 1 if is_error else 0
+        print_json(
+            {
+                "schema_version": COMPACT_SCHEMA_VERSION,
+                "command": "interface",
+                "root_path": str(indexer.root_path),
+                "interface": structured,
+            },
+            pretty=args.pretty,
+        )
+    return 0
 
 
 def handle_impact(args: argparse.Namespace) -> int:
@@ -493,14 +627,59 @@ def handle_impact(args: argparse.Namespace) -> int:
         raise ValueError("--start-line must be 1 or greater.")
     if args.end_line is not None and args.end_line < 1:
         raise ValueError("--end-line must be 1 or greater.")
+    if args.limit < 0:
+        raise ValueError("--limit must be 0 or greater.")
 
     indexer = XRayIndexer(normalize_path(args.root_path))
     symbol = load_symbol(args, indexer.root_path)
-    result = indexer.what_breaks(symbol, context_lines=args.context_lines)
-    result = dump_impact_result(result)
+    identity, offset = _validate_page_args(
+        args,
+        "impact",
+        indexer.root_path,
+        {
+            "symbol": {key: symbol.get(key) for key in ("name", "path", "abs_path", "start_line", "end_line", "type")},
+            "context_lines": args.context_lines,
+            "detail": args.detail,
+        },
+        indexer.repository_snapshot_fingerprint(),
+    )
+    result = dump_impact_result(
+        indexer.what_breaks(
+            symbol,
+            context_lines=args.context_lines,
+            max_results=offset + args.limit + 1,
+        )
+    )
     is_error = isinstance(result, dict) and "error" in result
+    raw_references = result.get("references", []) if isinstance(result, dict) else []
+    references: Sequence[Mapping[str, Any]] = (
+        raw_references
+        if args.detail == "full"
+        else compact_impact_references(raw_references, indexer.root_path, str(symbol["name"]))
+    )
+    page, metadata = page_items(
+        references,
+        command="impact",
+        root_path=indexer.root_path,
+        identity=identity,
+        limit=args.limit,
+        cursor=args.cursor,
+        total_exact=bool(result.get("total_exact", True)),
+    )
+    presented = {**result, "references": [dict(reference) for reference in page], **metadata}
     if args.format == "text":
-        print(format_impact(result))
+        print(format_impact(presented))
+    elif args.detail == "compact":
+        print_json(
+            {
+                "schema_version": COMPACT_SCHEMA_VERSION,
+                "command": "impact",
+                "root_path": str(indexer.root_path),
+                "symbol": format_symbol_for_json(symbol, indexer.root_path),
+                "impact": presented,
+            },
+            pretty=args.pretty,
+        )
     else:
         print_json(
             dump_impact_envelope(
@@ -510,7 +689,7 @@ def handle_impact(args: argparse.Namespace) -> int:
                     "command": "impact",
                     "root_path": str(indexer.root_path),
                     "symbol": format_symbol_for_json(symbol, indexer.root_path),
-                    "impact": result,
+                    "impact": presented,
                     "error": result.get("error") if is_error else None,
                     "warnings": [],
                 }
@@ -531,61 +710,23 @@ def _command_envelope(command: str, root_path: Path, **payload: Any) -> dict[str
     }
 
 
-def _cursor_fingerprint(command: str, root_path: Path, identity: Mapping[str, Any]) -> str:
-    value = json.dumps([command, str(root_path), identity], separators=(",", ":"), sort_keys=True)
-    return hashlib.sha256(value.encode()).hexdigest()[:16]
-
-
-def _encode_cursor(offset: int, fingerprint: str) -> str:
-    raw = json.dumps({"o": offset, "q": fingerprint}, separators=(",", ":")).encode()
-    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
-
-
-def _decode_cursor(cursor: str | None, fingerprint: str) -> int:
-    if not cursor:
-        return 0
-    try:
-        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
-        value = json.loads(raw)
-        offset = value["o"]
-    except (ValueError, TypeError, KeyError, json.JSONDecodeError, binascii.Error) as exc:
-        raise ValueError("--cursor is invalid.") from exc
-    if not isinstance(offset, int) or offset < 0 or value.get("q") != fingerprint:
-        raise ValueError("--cursor does not match this command or query.")
-    return offset
-
-
-def _page_items(
-    items: Sequence[Mapping[str, Any]],
+def _validate_page_args(
     args: argparse.Namespace,
     command: str,
     root_path: Path,
     identity: Mapping[str, Any],
-) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
+    source_snapshot: str,
+) -> tuple[dict[str, Any], int]:
+    """Bind paging to a content snapshot and validate it before repository work."""
     if args.limit < 0:
         raise ValueError("--limit must be 0 or greater.")
-    fingerprint = _cursor_fingerprint(command, root_path, identity)
-    offset = _decode_cursor(args.cursor, fingerprint)
-    total = len(items)
-    if offset > total:
-        raise ValueError("--cursor is past the available results.")
-    end = min(offset + args.limit, total)
-    page = list(items[offset:end])
-    metadata: dict[str, Any] = {
-        "returned": len(page),
-        "total": total,
-        "truncated": end < total,
-    }
-    if end < total:
-        metadata["next_cursor"] = _encode_cursor(end, fingerprint)
-    return page, metadata
-
-
-def _validate_page_args(args: argparse.Namespace, command: str, root_path: Path, identity: Mapping[str, Any]) -> None:
-    """Validate paging before any operation that may mutate the worktree."""
-    if args.limit < 0:
-        raise ValueError("--limit must be 0 or greater.")
-    _decode_cursor(args.cursor, _cursor_fingerprint(command, root_path, identity))
+    bound_identity = {**identity, "source_snapshot": source_snapshot}
+    fingerprint = cursor_fingerprint(command, root_path, bound_identity)
+    try:
+        offset = decode_cursor(args.cursor, fingerprint)
+    except ValueError as exc:
+        raise ValueError(f"--{exc}") from exc
+    return bound_identity, offset
 
 
 def _structural_payload(
@@ -594,11 +735,23 @@ def _structural_payload(
     command: str,
     root_path: Path,
     identity: Mapping[str, Any],
+    *,
+    total_exact: bool = True,
+    continuable: bool = True,
 ) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
     projected: Sequence[Mapping[str, Any]] = (
         raw_items if args.detail == "full" else compact_structural_items(raw_items, root_path)
     )
-    return _page_items(projected, args, command, root_path, identity)
+    return page_items(
+        projected,
+        command=command,
+        root_path=root_path,
+        identity=identity,
+        limit=args.limit,
+        cursor=args.cursor,
+        continuable=continuable,
+        total_exact=total_exact,
+    )
 
 
 def _compact_envelope(command: str, **payload: Any) -> dict[str, Any]:
@@ -607,14 +760,31 @@ def _compact_envelope(command: str, **payload: Any) -> dict[str, Any]:
 
 def handle_search(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
-    _validate_page_args(args, "search", indexer.root_path, {"pattern": args.pattern, "lang": args.lang})
-    matches = indexer.search_pattern(args.pattern, args.lang)
+    identity, offset = _validate_page_args(
+        args,
+        "search",
+        indexer.root_path,
+        {"pattern": args.pattern, "lang": args.lang, "paths": args.paths or [], "globs": args.globs or []},
+        indexer.repository_snapshot_fingerprint(),
+    )
+    matches = indexer.search_pattern(
+        args.pattern,
+        args.lang,
+        paths=args.paths,
+        globs=args.globs,
+        max_results=offset + args.limit + 1,
+    )
     page, metadata = _structural_payload(
-        matches, args, "search", indexer.root_path, {"pattern": args.pattern, "lang": args.lang}
+        matches,
+        args,
+        "search",
+        indexer.root_path,
+        identity,
+        total_exact=indexer.last_result_total_exact,
     )
     if args.format == "text":
         print_structural_items(page)
-        if metadata["truncated"]:
+        if metadata["truncated"] and "next_cursor" in metadata:
             print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
         return 0
     if args.detail == "compact":
@@ -632,17 +802,23 @@ def handle_search(args: argparse.Namespace) -> int:
 def handle_rewrite(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
     identity = {"pattern": args.pattern, "replacement": args.replacement, "lang": args.lang}
-    _validate_page_args(args, "rewrite", indexer.root_path, identity)
+    identity, _offset = _validate_page_args(
+        args, "rewrite", indexer.root_path, identity, indexer.repository_snapshot_fingerprint()
+    )
     summary = indexer.rewrite_pattern(args.pattern, args.replacement, args.lang)
     if args.format == "text":
-        match_label = "match" if summary["match_count"] == 1 else "matches"
+        changed = summary.get("changed_match_count", summary["match_count"])
+        match_label = "match" if changed == 1 else "matches"
         file_label = "file" if summary["file_count"] == 1 else "files"
-        print(f"{summary['match_count']} {match_label} rewritten in {summary['file_count']} {file_label}")
+        print(
+            f"{changed} {match_label} changed in {summary['file_count']} {file_label}; "
+            f"{summary.get('no_op_count', 0)} no-op matches"
+        )
         for path in summary["files_modified"]:
             print(path)
         return 0
     matches = summary.pop("matches", [])
-    page, metadata = _structural_payload(matches, args, "rewrite", indexer.root_path, identity)
+    page, metadata = _structural_payload(matches, args, "rewrite", indexer.root_path, identity, continuable=False)
     metadata.pop("next_cursor", None)
     if args.detail == "compact":
         print_json(_compact_envelope("rewrite", **summary), pretty=args.pretty)
@@ -665,24 +841,62 @@ def handle_rewrite(args: argparse.Namespace) -> int:
 
 def handle_scan(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
-    identity = {"rule": args.rule, "fix": args.fix}
+    identity = {
+        "rule": args.rule,
+        "fix": args.fix,
+        "paths": args.paths or [],
+        "globs": args.globs or [],
+    }
     if args.fix and args.cursor:
         raise ValueError("--cursor cannot be used with scan --fix because fixes mutate the result set.")
-    _validate_page_args(args, "scan", indexer.root_path, identity)
-    matches = indexer.scan_rules(args.rule, args.fix)
-    page, metadata = _structural_payload(matches, args, "scan", indexer.root_path, identity)
+    identity, offset = _validate_page_args(
+        args, "scan", indexer.root_path, identity, indexer.repository_snapshot_fingerprint()
+    )
+    matches = indexer.scan_rules(
+        args.rule,
+        args.fix,
+        paths=args.paths,
+        globs=args.globs,
+        max_results=None if args.fix else offset + args.limit + 1,
+    )
+    mutation_summary = indexer.last_mutation_summary if args.fix else None
+    page, metadata = _structural_payload(
+        matches,
+        args,
+        "scan",
+        indexer.root_path,
+        identity,
+        total_exact=indexer.last_result_total_exact,
+        continuable=not args.fix,
+    )
     if args.fix:
         metadata.pop("next_cursor", None)
     if args.format == "text":
         print_structural_items(page)
+        if mutation_summary is not None:
+            print(
+                f"changed={mutation_summary['changed_count']} files={mutation_summary['file_count']} "
+                f"no_ops={mutation_summary['no_op_count']}"
+            )
         if metadata["truncated"] and "next_cursor" in metadata:
             print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
         return 0
     if args.detail == "compact":
-        print_json(_compact_envelope("scan", matches=page, fixed=args.fix, **metadata), pretty=args.pretty)
+        payload = _compact_envelope("scan", matches=page, fixed=args.fix, **metadata)
+        if mutation_summary is not None:
+            payload["mutation"] = mutation_summary
+        print_json(payload, pretty=args.pretty)
         return 0
     print_json(
-        _command_envelope("scan", indexer.root_path, rule=args.rule, fixed=args.fix, matches=page, **metadata),
+        _command_envelope(
+            "scan",
+            indexer.root_path,
+            rule=args.rule,
+            fixed=args.fix,
+            matches=page,
+            mutation=mutation_summary,
+            **metadata,
+        ),
         pretty=args.pretty,
     )
     return 0
@@ -691,12 +905,18 @@ def handle_scan(args: argparse.Namespace) -> int:
 def handle_outline_items(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
     identity = {"file_path": args.file_path}
-    _validate_page_args(args, args.outline_item, indexer.root_path, identity)
+    identity, _offset = _validate_page_args(
+        args,
+        args.outline_item,
+        indexer.root_path,
+        identity,
+        indexer.repository_snapshot_fingerprint(),
+    )
     items = indexer.file_outline_items(args.file_path, args.outline_item)
     page, metadata = _structural_payload(items, args, args.outline_item, indexer.root_path, identity)
     if args.format == "text":
         print_structural_items(page)
-        if metadata["truncated"]:
+        if metadata["truncated"] and "next_cursor" in metadata:
             print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
         return 0
     if args.detail == "compact":
@@ -706,6 +926,87 @@ def handle_outline_items(args: argparse.Namespace) -> int:
         _command_envelope(args.outline_item, indexer.root_path, file_path=args.file_path, items=page, **metadata),
         pretty=args.pretty,
     )
+    return 0
+
+
+def handle_skill_install(args: argparse.Namespace) -> int:
+    try:
+        result = install_cli_skill(project_root=args.project, force=args.force)
+    except OSError as exc:
+        raise SkillInstallError(f"skill installation failed: {exc}") from exc
+    print_json(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "ok": True,
+            "command": "skill",
+            "action": "install",
+            **result.as_dict(),
+            "warnings": [],
+        },
+        pretty=args.pretty,
+    )
+    return 0
+
+
+def handle_replace_plan(args: argparse.Namespace) -> int:
+    """Create and emit a complete, bounded, non-mutating replacement plan."""
+    pattern_source = args.pattern is not None or args.replacement is not None
+    rule_source = args.rule is not None
+    if pattern_source == rule_source:
+        raise ValueError("Provide exactly one replacement source: --pattern/--replacement or --rule.")
+    if pattern_source and (not args.pattern or args.replacement is None):
+        raise ValueError("--pattern and --replacement must be provided together.")
+    indexer = XRayIndexer(normalize_path(args.root_path))
+    plan = indexer.plan_replacement(
+        pattern=args.pattern,
+        replacement=args.replacement,
+        rule_path=args.rule,
+        lang=args.lang,
+        paths=args.paths,
+        globs=args.globs,
+        max_matches=args.max_matches,
+        max_files=args.max_files,
+        allow_noop=args.allow_noop,
+        preview_limit=args.preview_limit,
+    )
+    print_json(_compact_envelope("replace.plan", plan=plan), pretty=args.pretty)
+    return 0
+
+
+def _read_plan_json(path_value: str) -> dict[str, Any]:
+    """Read a bounded replacement plan from a file or standard input."""
+    if path_value == "-":
+        raw = sys.stdin.read(MAX_PLAN_JSON_CHARS + 1)
+        source = "stdin"
+    else:
+        path = Path(path_value).expanduser()
+        try:
+            if path.stat().st_size > MAX_PLAN_JSON_CHARS:
+                raise ValueError(f"Replacement plan exceeds {MAX_PLAN_JSON_CHARS} characters.")
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"Could not read replacement plan file '{path_value}': {exc}") from exc
+        source = str(path)
+    if len(raw) > MAX_PLAN_JSON_CHARS:
+        raise ValueError(f"Replacement plan from {source} exceeds {MAX_PLAN_JSON_CHARS} characters.")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Replacement plan from {source} is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("Replacement plan JSON must be an object.")
+    plan = value.get("plan", value)
+    if not isinstance(plan, dict):
+        raise ValueError("Replacement plan envelope must contain an object field named 'plan'.")
+    return plan
+
+
+def handle_replace_apply(args: argparse.Namespace) -> int:
+    """Apply one reviewed plan only after independent digest and source guards pass."""
+    indexer = XRayIndexer(normalize_path(args.root_path))
+    plan = _read_plan_json(args.plan_file)
+    result = indexer.apply_replacement(plan, expected_digest=args.expected_digest)
+    print_json(_compact_envelope("replace.apply", result=result), pretty=args.pretty)
     return 0
 
 
@@ -964,6 +1265,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print_error(str(exc), args)
         return 2
     except AstGrepError as exc:
+        print_error(str(exc), args)
+        return 1
+    except ReplacementApplyError as exc:
+        print_error(str(exc), args)
+        return 1
+    except SkillInstallError as exc:
         print_error(str(exc), args)
         return 1
     except BrokenPipeError:

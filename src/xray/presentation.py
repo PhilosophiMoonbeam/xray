@@ -6,6 +6,7 @@ import base64
 import binascii
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -113,6 +114,27 @@ def compact_explore(data: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def compact_impact_references(
+    items: Sequence[Mapping[str, Any]], root_path: Path, symbol_name: str
+) -> list[dict[str, Any]]:
+    """Project impact references to relative paths and one matched source line."""
+    word = re.compile(r"\b" + re.escape(symbol_name) + r"\b")
+    compact: list[dict[str, Any]] = []
+    for item in items:
+        text = str(item.get("text") or "")
+        matched_line = next((line.strip() for line in text.splitlines() if word.search(line)), text.strip())
+        compact.append(
+            {
+                "path": _relative_path(item.get("file"), root_path),
+                "line": int(item.get("line", 1)),
+                "type": str(item.get("type") or "text"),
+                "confidence": str(item.get("confidence") or "low"),
+                "text": matched_line,
+            }
+        )
+    return compact
+
+
 def cursor_fingerprint(command: str, root_path: Path, identity: Mapping[str, Any]) -> str:
     """Return a stable query binding for an opaque result cursor."""
     value = json.dumps([command, str(root_path.resolve()), identity], separators=(",", ":"), sort_keys=True)
@@ -126,7 +148,7 @@ def encode_cursor(offset: int, fingerprint: str) -> str:
 
 
 def decode_cursor(cursor: str | None, fingerprint: str) -> int:
-    """Decode and validate a query-bound cursor."""
+    """Decode and validate a query- and snapshot-bound cursor."""
     if not cursor:
         return 0
     try:
@@ -149,6 +171,7 @@ def page_items(
     limit: int = DEFAULT_RESULT_LIMIT,
     cursor: str | None = None,
     continuable: bool = True,
+    total_exact: bool = True,
 ) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
     """Page items and return truthful compact result metadata."""
     if limit < 0:
@@ -160,7 +183,13 @@ def page_items(
         raise ValueError("cursor is past the available results.")
     end = min(offset + limit, total)
     page = list(items[offset:end])
-    metadata: dict[str, Any] = {"returned": len(page), "total": total, "truncated": end < total}
-    if continuable and end < total:
+    truncated = end < total or (not total_exact and len(page) == limit and limit > 0)
+    metadata: dict[str, Any] = {
+        "returned": len(page),
+        "total": total,
+        "total_exact": total_exact,
+        "truncated": truncated,
+    }
+    if continuable and truncated and limit > 0:
         metadata["next_cursor"] = encode_cursor(end, fingerprint)
     return page, metadata

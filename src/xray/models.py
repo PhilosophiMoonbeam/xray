@@ -1,5 +1,7 @@
 """Validated data models for XRAY public JSON/MCP boundaries."""
 
+from __future__ import annotations
+
 from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -38,6 +40,15 @@ class SymbolOutput(PublicModel):
     end_line: int | None = None
     abs_path: str | None = None
     score: int | None = None
+    qualified_name: str | None = None
+    owner: str | None = None
+    language: str | None = None
+    match_reason: str | None = None
+    confidence: str | None = None
+    signature: str | None = None
+    role: str | None = None
+    visibility: str | None = None
+    doc: str | None = None
 
 
 class ExploreSymbol(PublicModel):
@@ -70,6 +81,7 @@ class ExploreOptions(PublicModel):
     max_symbols_per_file: int
     symbol_types: list[str] = Field(default_factory=list)
     max_entries: int = 5000
+    use_default_exclusions: bool = True
 
 
 class ExploreData(PublicModel):
@@ -120,13 +132,39 @@ class InterfaceEnvelope(PublicModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class InterfaceSymbol(PublicModel):
+    """One hierarchical interface definition without implementation bodies."""
+
+    name: str
+    type: str
+    signature: str
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    visibility: str
+    role: str
+    documentation: str | None = None
+    members: list[InterfaceSymbol] = cast("list[InterfaceSymbol]", Field(default_factory=list))
+
+
+class InterfaceData(PublicModel):
+    """Structured interface extraction result."""
+
+    path: str
+    language: str
+    symbols: list[InterfaceSymbol]
+    complete: bool
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ImpactReference(PublicModel):
     """One impact reference from structural or text search."""
 
-    file: str
+    file: str | None = None
+    path: str | None = None
     line: int
     text: str = ""
     type: str | None = None
+    confidence: str | None = None
 
 
 class ImpactResult(PublicModel):
@@ -138,6 +176,8 @@ class ImpactResult(PublicModel):
     filtered_count: int | None = None
     strategy: str
     note: str
+    total_exact: bool = True
+    degradation_reason: str | None = None
 
 
 class ImpactEnvelope(PublicModel):
@@ -205,6 +245,11 @@ def dump_interface_envelope(value: Any) -> dict[str, Any]:
     payload["interface"] = model.interface
     payload["error"] = model.error
     return payload
+
+
+def dump_interface_data(value: Any) -> dict[str, Any]:
+    """Validate and dump one structured interface contract."""
+    return InterfaceData.model_validate(value).to_payload()
 
 
 def dump_impact_result(value: Any) -> dict[str, Any]:

@@ -27,7 +27,8 @@ Progressive discovery starts with four operations:
 - **Impact** (`xray impact`, `what_breaks`) - find likely references to a symbol name.
 
 Structural search, rewrite, rule scanning, and import/export outlines complement
-that workflow when symbol-name analysis is not enough.
+that workflow when symbol-name analysis is not enough. For changes, prefer the
+guarded replacement plan/apply workflow over the explicit legacy all-match rewrite.
 
 ## Quick Start
 
@@ -55,8 +56,8 @@ uvx --from . xray impact . --symbol-json "$symbol"
 ## Install
 
 XRAY requires Python 3.10 or later. Its direct runtime dependencies are
-`fastmcp>=3.4.2,<4`, `ast-grep-cli>=0.44.1`, `thefuzz>=0.20.0`, and
-`pydantic>=2,<3`.
+`fastmcp>=3.4.7,<4`, `ast-grep-cli>=0.44.1`, `thefuzz>=0.20.0`, and
+`pydantic>=2,<3`, and `pathspec>=0.12,<1`.
 
 XRAY requires the `ast-grep` executable. The installation commands below provide
 it automatically through `ast-grep-cli`; no separate installation is normally
@@ -71,10 +72,28 @@ git clone https://github.com/PhilosophiMoonbeam/xray.git
 cd xray
 uv tool install .
 
+# Install XRAY's bundled agent skill for this user
+xray skill install --user
+
 # Run from anywhere after installation
 xray explore . --max-depth 2
 xray-mcp
 ```
+
+`uv tool install` accepts uv's own options, but it does not forward arbitrary
+XRAY flags or run a package-defined post-install hook. Skill placement is
+therefore an explicit second step. To keep the skill only in one repository,
+run:
+
+```bash
+xray skill install --project /path/to/project
+```
+
+Both scopes install `xray-cli` below `.agents/skills/`. Repeating the command
+is a no-op when the installed files already match. If that target contains
+different files, XRAY preserves it and exits with a validation error; inspect
+the target before explicitly replacing it with `--force`. Symlinked install
+paths are rejected.
 
 For local development:
 
@@ -91,7 +110,10 @@ The package exposes both console scripts:
 - `xray-mcp` -> `xray.mcp_server:main`
 
 The packaged MCP skill files under `src/xray/skills/` are included in package
-data so MCP clients can fetch the progressive-discovery skill resource.
+data so MCP clients can fetch the progressive-discovery skill resource. An
+exact distributable copy of the repository CLI skill is packaged under
+`src/xray/agent_skills/` for `xray skill install`; packaging tests keep the two
+copies byte-identical.
 
 ## CLI Reference
 
@@ -107,6 +129,7 @@ the alias is used.
 ```bash
 xray explore ROOT [--max-depth N] [--include-symbols | --symbols] \
   [--focus DIR]... [--max-symbols-per-file N] [--type TYPE[,TYPE...]] [--max-entries N] \
+  [--no-default-exclusions] \
   [--detail compact|full] [--format json|text] [--pretty]
 ```
 
@@ -124,7 +147,8 @@ Important options:
 
 Explore output excludes common dependency, cache, build, generated metadata, and
 agent/task state directories by default so maps stay focused on maintainable
-project files.
+project files. `--no-default-exclusions` disables only that named built-in policy;
+root and nested `.gitignore` rules, including anchoring and negation, remain active.
 
 Explore uses one traversal to produce both `tree_text` and `entries`. When the
 entry bound is reached, JSON and MCP payloads set `truncated: true` and include
@@ -145,7 +169,9 @@ xray find ROOT QUERY [--limit N] [--min-score 0-100] [--format json|text] [--pre
 
 JSON is the default because symbol objects are usually piped into impact
 analysis. JSON symbols include `name`, repository-relative `path`, absolute
-`abs_path`, one-based `start_line`/`end_line`, `type`, and `score`.
+`abs_path`, one-based `start_line`/`end_line`, `type`, `score`, `qualified_name`,
+`owner`, `language`, `match_reason`, and `confidence`. One expanded ast-grep
+outline supplies a snapshot-cached inventory; dirty source changes invalidate it.
 
 `--limit` must be zero or greater. `--min-score` must be between 0 and 100; use
 60 or higher when an agent should suppress weak fuzzy matches.
@@ -153,12 +179,16 @@ analysis. JSON symbols include `name`, repository-relative `path`, absolute
 ### `xray interface`
 
 ```bash
-xray interface ROOT FILE_PATH [--format json|text] [--pretty]
+xray interface ROOT FILE_PATH [--detail compact|full] [--format json|text] [--pretty]
 ```
 
 `FILE_PATH` may be absolute or relative to `ROOT`, but it must resolve inside the
 repository root. XRAY rejects parent traversal and symlink escapes rather than
-reading files outside the requested repository.
+reading files outside the requested repository. Compact JSON returns hierarchical
+symbols, direct members, signatures, one-based ranges, visibility, role,
+documentation, `complete`, and warnings. `--detail full` preserves the legacy v1
+string envelope. Typed compact errors distinguish missing, unsupported,
+containment, parse, upstream, and size failures.
 
 ### `xray impact`
 
@@ -168,6 +198,9 @@ xray impact ROOT --symbol-file symbol.json
 xray impact ROOT --symbol-file -
 xray impact ROOT --name target --path src/app.py --start-line 1 [--type function]
 ```
+
+Impact also accepts `--limit N`, `--cursor TOKEN`, `--detail compact|full`,
+`--context-lines N`, `--format json|text`, and `--pretty`.
 
 Provide exactly one symbol source:
 
@@ -180,7 +213,10 @@ Manual symbols require `--start-line` so XRAY can exclude the definition line
 from impact results. Symbol paths must resolve inside `ROOT`. Impact analysis
 is name-based; review results for same-name symbols because XRAY is not a
 type-aware caller or dependency graph. Use `--end-line` to supply the full
-definition range and `--context-lines N` to control reference context.
+definition range and `--context-lines N` to control reference context. Compact
+references use relative paths, one matched line, a `definition`, `import`, `call`,
+`read`, or `text` classification, and `high`, `medium`, or `low` confidence.
+Other same-name definitions are classified rather than described as dependents.
 
 ### Structural search, rewrite, rules, imports, and exports
 
@@ -192,16 +228,22 @@ xray imports ROOT src/package/module.py
 xray exports ROOT src/package/module.py
 ```
 
+`search` and `scan` accept repeatable `--path` scopes and ordered `--glob`
+filters. Every path must resolve inside `ROOT`.
+
 These commands also accept `--detail compact|full`, `--limit N`, `--cursor TOKEN`,
 `--format json|text`, and `--pretty`. Compact detail is the default and returns
 XRAY-owned fields such as relative `path`, one-based `line`/`column`, `text`, and
 `captures`. Full detail retains lossless upstream ast-grep JSON.
 
-The default limit is 50 returned items. Read-only responses include `returned`,
-`total`, and `truncated`; when more results exist, pass the opaque `next_cursor`
-back as `--cursor`. Cursors are bound to the command, root, and query. Limits
-only bound reported diagnostics: `rewrite` and `scan --fix` still apply every
-matching edit and do not advertise continuation after mutation.
+The default limit is 50 returned items. Repository-wide read-only search, scan,
+and impact stop upstream work after the page-derived candidate cap. Responses
+include `returned`, `total`, `total_exact`, and `truncated`; `total_exact: false`
+means `total` is a lower bound. When more results exist, pass the opaque
+`next_cursor` back as `--cursor`. Cursors bind command, root, query, scopes, and
+source content; continuation rejects a changed snapshot. Limits only bound
+reported diagnostics for legacy mutation: `rewrite` and `scan --fix` still apply
+every matching edit and do not advertise continuation after mutation.
 
 `search` returns ast-grep matches, including captured metavariables. `rewrite`
 applies every structural replacement in place and reports match and modified-file
@@ -219,11 +261,35 @@ For rewrites, pass `-l/--lang` whenever the target language is known. Inference
 can still produce an overly broad repository scan that matches pattern-like text
 inside configuration or documentation files.
 
+### Guarded replacement
+
+Use JSON-first plan/apply for new mutation workflows:
+
+```bash
+xray replace plan ROOT \
+  --pattern 'old_api($ARG)' --replacement 'new_api($ARG)' --lang python \
+  --path src --glob '*.py' > plan.json
+
+# Review .plan.preview, counts, paths, warnings, pre/post hashes, and .plan.plan_digest.
+xray replace apply ROOT --plan-file plan.json --expected-digest REVIEWED_DIGEST
+```
+
+Planning is non-mutating and defaults to at most 1000 candidates, 100 affected
+files, and 50 preview edits. A plan records the exact query/scopes, candidate and
+no-op counts, source/postimage hashes, root fingerprint, warnings, and semantic
+digest. Applying requires the complete plan plus an independently copied reviewed
+digest. XRAY recomputes the candidate set and rejects root, query, count, digest,
+or source drift before writing. It prepares same-directory staged files, preserves
+file modes, verifies postimages, and restores already replaced files if a later
+replacement fails. Use `--rule` instead of pattern/replacement to plan a fix-bearing
+ast-grep rule. `rewrite` remains available only as an explicit legacy all-match
+operation.
+
 ## JSON Output
 
-Compact explore and structural output use the sparse `schema_version:
+Compact explore, interface, impact, replacement, and structural output use the sparse `schema_version:
 "xray.cli.v2"` contract. `--detail full` preserves the verbose v1 envelope for
-compatibility. Find, interface, impact, and errors remain v1. JSON is one line by
+compatibility where supported. Find and legacy full interface/impact remain v1. JSON is one line by
 default for token efficiency. Pass `--pretty` for indented JSON,
 or `--format text` for lossy human-readable scans. Compact v2 responses retain
 `schema_version` and `command`, but omit `ok: true`, empty warnings, repeated root
@@ -238,8 +304,9 @@ Command-specific fields:
 
 - compact `explore`: `invoked_as`, `root_path`, `entries`, `options`, `truncated`, and warnings only when present.
 - `find`: `query`, `limit`, `min_score`, `symbols`, `error`, `warnings`.
-- `interface`: `file_path`, `interface`, `error`, `warnings`.
-- `impact`: `symbol`, `impact`, `error`, `warnings`. Impact payloads include `strategy`, `total_count`, `raw_count`, and `filtered_count` so callers can see when non-source, duplicate, or definition-range matches were removed.
+- compact `interface`: typed hierarchical `interface` with completeness/warnings; full v1 preserves the string projection.
+- compact `impact`: `symbol` plus classified relative-path references, strategy/degradation, counts, and exact paging metadata.
+- `replace.plan`: the complete applicable `xray.replace.v1` plan; `replace.apply`: truthful changed/no-op/file and rollback evidence.
 - compact `search` / `scan`: projected `matches` and page metadata.
 - compact `rewrite`: `match_count`, `files_modified`, and `file_count`.
 - compact `imports` / `exports`: projected `items` and page metadata.
@@ -278,6 +345,12 @@ Clients initially see only `search_tools` and `call_tool`. They discover the
 underlying XRAY operations through search, then execute them through `call_tool`
 with a `{name, arguments}` payload.
 
+`search_tools` accepts a regular expression and returns at most 10 matches. Use
+a focused literal or alternation such as `interface|signature`; a broad `.` can
+hide later operations. Descriptions contain common phrases such as `find symbol`,
+`structural search`, `replacement plan`, `apply replacement`, and `scan rules`
+so focused discovery does not require knowing Python function names.
+
 ```json
 {
   "name": "explore_repo",
@@ -295,11 +368,14 @@ The transformed MCP surface exposes compact metadata and tags for:
 - `explore_repo`: bounded compact map with relative-path `entries`, `options`, `truncated`, warnings when present, and optional symbol skeletons. Pass `detail: "full"` only when `tree_text` and absolute paths are needed. `symbol_types` filters top-level outline types, and `max_entries` overrides the 5000-entry default.
 - `find_symbol`: find code symbols by fuzzy name or behavior phrase.
 - `read_interface`: read a text file interface without implementation bodies.
-- `search_pattern`: compact structural matches, bounded to 50 by default, with `returned`, `total`, `truncated`, and query-bound `next_cursor` continuation. Set `detail: "full"` for raw ast-grep matches.
+- `read_interface_structured`: read typed hierarchy, documentation, ranges, visibility, completeness, and warnings.
+- `search_pattern`: compact structural matches, bounded to 50 by default, with `returned`, `total`, `truncated`, and snapshot-bound `next_cursor` continuation. Set `detail: "full"` for raw ast-grep matches.
 - `rewrite_pattern`: in-place replacement with a compact count/path summary by default. Full detail is bounded but never advertises continuation after mutation.
+- `plan_replacement`: read-only exact replacement preview with bounds, hashes, warnings, and digest.
+- `apply_replacement`: destructive guarded application requiring the complete plan and independently supplied digest.
 - `scan_rules`: compact ast-grep YAML diagnostics with the same paging contract when read-only. With `fix: true`, all fixes are applied and no continuation cursor is returned.
 - `file_imports` and `file_exports`: compact flattened dependency and public-API outlines with limits and continuation cursors.
-- `what_breaks`: assess likely symbol-name code references to a returned symbol object.
+- `what_breaks`: assess bounded classified symbol-name references with snapshot-bound continuation.
 
 Detailed guidance is available on demand:
 
@@ -311,6 +387,9 @@ Detailed guidance is available on demand:
 `what_breaks` requires an absolute `path` or `abs_path` when called through MCP.
 The CLI `find` JSON already includes `abs_path`, so CLI symbols can be passed to
 MCP impact analysis directly.
+
+`xray skill install` is intentionally CLI-only. It manages local agent guidance
+under `.agents/skills`; it is not a repository-analysis MCP capability.
 
 FastMCP's `generate-cli` can generate an ad hoc client from the MCP schema, but
 XRAY does not ship that generated script as its primary CLI. With the search-first
@@ -363,6 +442,8 @@ that run inside the repository environment, such as:
 ```
 
 For installed uv tools, configure clients to run the direct installed command.
+`xray-mcp` fixes the FastMCP transport to stdio; XRAY does not expose an HTTP or
+OAuth deployment surface through this entry point.
 For example:
 
 Codex `config.toml`:
@@ -426,6 +507,7 @@ For speed, symbol skeleton extraction can be cached under:
 
 ```text
 /tmp/.xray_cache/{root_hash}-{git_commit}/symbols.json
+/tmp/.xray_cache/{root_hash}-{git_commit}/inventory.json
 ```
 
 The root hash prevents repositories at the same commit from sharing cache files;
@@ -438,10 +520,10 @@ concurrent calls are supported.
 ## Performance Characteristics
 
 - Startup is lightweight; XRAY launches subprocesses on demand.
-- Directory maps use Python filesystem traversal and honor focus/depth options.
-- Symbol search runs multiple ast-grep patterns, so cost scales with repository size and language mix.
-- Interface reads use ast-grep's expanded outline for supported languages.
-- Impact analysis first tries ast-grep reference search, then falls back to text search when structural search returns no references.
+- Directory maps use Python traversal with Git-wildmatch repository ignores, named built-in exclusions, focus, and depth bounds.
+- Symbol search uses one expanded ast-grep outline per content-hashed supported-source snapshot, then scores the cached inventory in memory.
+- Python interface reads use the standard-library AST for complete signatures/docstrings; other supported languages preserve ast-grep's expanded hierarchy and report incompleteness.
+- Impact uses a page-derived execution cap for supported source files, then falls back to bounded text search when structural search returns no references.
 - Memory use is low; the only persistent runtime artifact is the optional temp cache.
 
 ## Limitations

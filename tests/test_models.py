@@ -4,6 +4,7 @@ from xray.models import (
     dump_error_envelope,
     dump_explore_envelope,
     dump_impact_result,
+    dump_interface_data,
     dump_symbol_output,
     validate_symbol_input,
 )
@@ -94,6 +95,43 @@ def test_impact_result_dump_preserves_reference_shape():
     assert payload["references"] == [{"file": "/repo/src/sample.py", "line": 5, "text": "target_function(41)"}]
     assert payload["raw_count"] == 2
     assert payload["filtered_count"] == 1
+    assert payload["total_exact"] is True
+
+
+def test_structured_interface_dump_validates_recursive_contract():
+    payload = dump_interface_data(
+        {
+            "path": "src/service.py",
+            "language": "python",
+            "complete": True,
+            "warnings": [],
+            "symbols": [
+                {
+                    "name": "Service",
+                    "type": "class",
+                    "signature": "class Service:",
+                    "start_line": 1,
+                    "end_line": 4,
+                    "visibility": "public",
+                    "role": "item",
+                    "members": [
+                        {
+                            "name": "run",
+                            "type": "method",
+                            "signature": "def run(self):",
+                            "start_line": 2,
+                            "end_line": 4,
+                            "visibility": "public",
+                            "role": "member",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert payload["symbols"][0]["members"][0]["name"] == "run"
+    assert payload["symbols"][0]["members"][0]["members"] == []
 
 
 def test_error_envelope_dump_omits_absent_command():
