@@ -13,7 +13,7 @@ from typing import Any, NoReturn
 
 from xray import __version__
 from xray.core.ast_grep import AstGrepError
-from xray.core.indexer import InterfaceReadError, ReplacementApplyError, XRayIndexer
+from xray.core.indexer import InterfaceReadError, ReplacementApplyError, ReplacementDriftError, XRayIndexer
 from xray.models import (
     dump_error_envelope,
     dump_explore_data,
@@ -56,15 +56,16 @@ Agent flow:
   xray impact ROOT --symbol-json "$symbol"
 
 Guarded change:
-  xray replace plan ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' -l python > plan.json
-  jq -r '(.plan // .).edit_manifest[].edit_id' plan.json
+  xray replace plan ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' -l python | jq '.plan' > plan.json
+  jq -r '.edit_manifest[].edit_id' plan.json
   xray replace verify ROOT --plan-file plan.json --expected-digest REVIEWED_DIGEST
   xray replace apply ROOT --plan-file plan.json --expected-digest REVIEWED_DIGEST
 
 Compact v3 JSON is default; where offered, use --detail full for legacy fields,
 --schema v2 for the previous compact projection, or --format text for lossy scans.
-Pages report total_exact; next_cursor requires the
-same query and snapshot. YAML output is unsupported. replace apply, rewrite, and
+Continuable pages require a positive limit and report total_exact. next_cursor
+binds the query, projection, and snapshot but permits a different positive page
+size. YAML output is unsupported. replace apply, rewrite, and
 scan --fix mutate files; --limit never bounds legacy edits. Exit codes: 0 success,
 1 command failure, 2 parse or validation error.
 """
@@ -255,7 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
     find.add_argument("root_path", help="Repository root to inspect.")
     find.add_argument("query", help="Symbol query, such as 'auth service' or 'parse_json'.")
     find.add_argument("--limit", type=int, default=10, help="Maximum number of matches to return.")
-    find.add_argument("--cursor", help="Opaque continuation cursor from an identical unchanged query.")
+    find.add_argument("--cursor", help="Continuation for the same query/projection/snapshot; page size may change.")
     find.add_argument(
         "--min-score",
         type=int,
@@ -303,7 +304,9 @@ def build_parser() -> argparse.ArgumentParser:
     interface.add_argument("--member-depth", type=int, default=1, help="Nested member depth (default: 1).")
     interface.add_argument("--max-members", type=int, default=20, help="Members per symbol (default: 20).")
     interface.add_argument("--limit", type=int, default=50, help="Top-level symbols per page (default: 50).")
-    interface.add_argument("--cursor", help="Opaque continuation cursor from an identical unchanged query.")
+    interface.add_argument(
+        "--cursor", help="Continuation for the same query/projection/snapshot; page size may change."
+    )
     interface.add_argument(
         "--detail",
         choices=("compact", "full"),
@@ -370,7 +373,7 @@ def build_parser() -> argparse.ArgumentParser:
     impact.add_argument("--end-line", type=int, default=None, help="Definition end line for manual symbols.")
     impact.add_argument("--context-lines", type=int, default=2, help="Context lines around each reference.")
     impact.add_argument("--limit", type=int, default=DEFAULT_STRUCTURAL_LIMIT, help="Maximum returned references.")
-    impact.add_argument("--cursor", help="Opaque continuation cursor from an identical unchanged query.")
+    impact.add_argument("--cursor", help="Continuation for the same query/projection/snapshot; page size may change.")
     impact.add_argument(
         "--detail",
         choices=("compact", "full"),
@@ -433,9 +436,11 @@ def build_parser() -> argparse.ArgumentParser:
     rules_check.add_argument("root_path")
     rules_check.add_argument("--rule", required=True)
     add_scope_args(rules_check)
-    rules_check.add_argument("--limit", type=int, default=DEFAULT_STRUCTURAL_LIMIT)
-    rules_check.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    rules_check.set_defaults(handler=handle_rules_check, format="json")
+    add_structural_output_args(
+        rules_check,
+        limit_help=f"Diagnostic page size (default: {DEFAULT_STRUCTURAL_LIMIT}).",
+    )
+    rules_check.set_defaults(handler=handle_rules_check)
     rules_explain = rules_subparsers.add_parser(
         "explain", help="Show bounded source and upstream inspection.", description="Inspect one rule without mutation."
     )
@@ -616,7 +621,9 @@ def add_structural_output_args(
         help=limit_help,
     )
     if supports_cursor:
-        parser.add_argument("--cursor", help="next_cursor from the identical unchanged read.")
+        parser.add_argument(
+            "--cursor", help="next_cursor for the same query/projection/snapshot; positive page size may change."
+        )
     else:
         parser.set_defaults(cursor=None)
     parser.add_argument("--format", choices=("json", "text"), default="json", help=OUTPUT_FORMAT_HELP)
@@ -692,8 +699,8 @@ def handle_explore(args: argparse.Namespace) -> int:
 
 
 def handle_find(args: argparse.Namespace) -> int:
-    if args.limit < 0:
-        raise ValueError("--limit must be 0 or greater.")
+    if args.limit < 1:
+        raise ValueError("--limit must be 1 or greater for a continuable read.")
     if args.min_score < 0 or args.min_score > MAX_SCORE:
         raise ValueError("--min-score must be between 0 and 100.")
 
@@ -920,8 +927,8 @@ def handle_impact(args: argparse.Namespace) -> int:
         raise ValueError("--start-line must be 1 or greater.")
     if args.end_line is not None and args.end_line < 1:
         raise ValueError("--end-line must be 1 or greater.")
-    if args.limit < 0:
-        raise ValueError("--limit must be 0 or greater.")
+    if args.limit < 1:
+        raise ValueError("--limit must be 1 or greater for a continuable read.")
 
     indexer = XRayIndexer(normalize_path(args.root_path))
     symbol = load_symbol(args, indexer.root_path)
@@ -1012,12 +1019,17 @@ def _validate_page_args(
     root_path: Path,
     identity: Mapping[str, Any],
     source_snapshot: str,
+    *,
+    continuable: bool = True,
 ) -> tuple[dict[str, Any], int]:
     """Bind paging to a content snapshot and validate it before repository work."""
-    if args.limit < 0:
+    if continuable and args.limit < 1:
+        raise ValueError("--limit must be 1 or greater for a continuable read.")
+    if not continuable and args.limit < 0:
         raise ValueError("--limit must be 0 or greater.")
     bound_identity = {
         **identity,
+        "projection": getattr(args, "detail", "compact"),
         **({"schema": "v3"} if getattr(args, "schema", "v3") == "v3" else {}),
         "source_snapshot": source_snapshot,
     }
@@ -1109,7 +1121,12 @@ def handle_rewrite(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
     identity = {"pattern": args.pattern, "replacement": args.replacement, "lang": args.lang}
     identity, _offset = _validate_page_args(
-        args, "rewrite", indexer.root_path, identity, indexer.repository_snapshot_fingerprint()
+        args,
+        "rewrite",
+        indexer.root_path,
+        identity,
+        indexer.repository_snapshot_fingerprint(),
+        continuable=False,
     )
     summary = indexer.rewrite_pattern(args.pattern, args.replacement, args.lang)
     if args.format == "text":
@@ -1156,7 +1173,12 @@ def handle_scan(args: argparse.Namespace) -> int:
     if args.fix and args.cursor:
         raise ValueError("--cursor cannot be used with scan --fix because fixes mutate the result set.")
     identity, offset = _validate_page_args(
-        args, "scan", indexer.root_path, identity, indexer.repository_snapshot_fingerprint()
+        args,
+        "scan",
+        indexer.root_path,
+        identity,
+        indexer.repository_snapshot_fingerprint(),
+        continuable=not args.fix,
     )
     matches = indexer.scan_rules(
         args.rule,
@@ -1210,12 +1232,33 @@ def handle_scan(args: argparse.Namespace) -> int:
 
 def handle_rules_check(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
+    identity, offset = _validate_page_args(
+        args,
+        "rules.check",
+        indexer.root_path,
+        {"rule": args.rule, "paths": args.paths or [], "globs": args.globs or []},
+        indexer.repository_snapshot_fingerprint(),
+    )
     result = indexer.check_rules(
         args.rule,
         paths=args.paths,
         globs=args.globs,
-        max_results=args.limit,
+        max_results=offset + args.limit + 1,
     )
+    matches, metadata = _structural_payload(
+        result.pop("matches"),
+        args,
+        "rules.check",
+        indexer.root_path,
+        identity,
+        total_exact=bool(result.pop("total_exact")),
+    )
+    result.update({"matches": matches, **metadata})
+    if args.format == "text":
+        print_structural_items(matches)
+        if metadata["truncated"] and "next_cursor" in metadata:
+            print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
+        return 0
     print_json(_compact_envelope("rules.check", root_path=str(indexer.root_path), result=result), pretty=args.pretty)
     return 0
 
@@ -1584,7 +1627,13 @@ def leaf_command(args: argparse.Namespace) -> str | None:
     return f"{command}.{nested}" if nested else command
 
 
-def print_error(message: str, args: argparse.Namespace, *, code: str = "command_failed") -> None:
+def print_error(
+    message: str,
+    args: argparse.Namespace,
+    *,
+    code: str = "command_failed",
+    details: Mapping[str, Any] | None = None,
+) -> None:
     if getattr(args, "format", None) == "json":
         compact = getattr(args, "detail", "compact") != "full"
         print_json(
@@ -1593,7 +1642,11 @@ def print_error(message: str, args: argparse.Namespace, *, code: str = "command_
                     "schema_version": compact_schema_version(args) if compact else SCHEMA_VERSION,
                     "ok": False,
                     "command": leaf_command(args),
-                    "error": {"code": code, "message": message} if compact else message,
+                    "error": (
+                        {"code": code, "message": message, **({"details": dict(details)} if details else {})}
+                        if compact
+                        else message
+                    ),
                     "warnings": [],
                 }
             ),
@@ -1719,8 +1772,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     except AstGrepError as exc:
         print_error(str(exc), args, code="ast_grep_error")
         return 1
+    except ReplacementDriftError as exc:
+        print_error(str(exc), args, code="replacement_source_drift", details=exc.details)
+        return 1
     except ReplacementApplyError as exc:
-        print_error(str(exc), args, code="replacement_apply_failed")
+        print_error(
+            str(exc),
+            args,
+            code="replacement_apply_failed",
+            details={
+                "rollback_attempted": exc.rollback_attempted,
+                "rollback_count": exc.rollback_count,
+                "rollback_succeeded": exc.rollback_succeeded,
+            },
+        )
         return 1
     except SkillInstallError as exc:
         print_error(str(exc), args, code="skill_install_failed")

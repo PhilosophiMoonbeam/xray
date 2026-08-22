@@ -34,9 +34,9 @@ skills, reports, tests, or harness. Presentation and public models may describe
 core values but do not perform repository analysis. Distribution and guidance
 wrap the adapters without becoming runtime dependencies of them.
 
-## XRAY 0.11.1 current contract
+## XRAY 0.11.2 current contract
 
-XRAY 0.11.1 preserves Python 3.10+, default compact `xray.cli.v3`, explicit
+XRAY 0.11.2 preserves Python 3.10+, default compact `xray.cli.v3`, explicit
 legacy v2 and full/v1 output, JSON and `jq` pipelines, stdio MCP, repository
 containment, snapshot-bound cursors, and direct legacy mutation. V3 standardizes
 success and paging fields; `--schema v2` exposes the previous projection only
@@ -51,8 +51,9 @@ impact retains page `total` and moves raw/filter/execution evidence under
 
 Repository focus depth is relative to each focus while entry `depth` remains
 root-relative. Default focus retains root context and ancestors; CLI
-`--strict-focus` and MCP `include_root_context=false` remove unrelated root
-context. Inventory visibility follows explicit Python underscore, Go
+`--strict-focus` and MCP `include_root_context=false` traverse ancestors without
+emitting them, so strict limits begin at each focus. Inventory visibility
+follows explicit Python underscore, Go
 capitalization, and JavaScript/TypeScript private/export conventions before
 public/private/unknown filtering.
 
@@ -69,8 +70,9 @@ acknowledgements are recorded before digest calculation. `replace verify` and
 MCP `verify_replacement` recompute digest, selection, source, syntax, dirtiness,
 and applicability without writes. Apply repeats these checks for staged and
 final postimages, preserves modes, and rolls back partial ordinary failures.
-Process termination can interrupt rollback; callers keep a recoverable worktree
-and inspect the resulting diff.
+Results distinguish whether rollback was attempted while retaining legacy count
+and success fields. Process termination can interrupt rollback; callers keep a
+recoverable worktree and inspect the resulting diff.
 
 Capabilities separate CLI and MCP operation names, defaults, maxima, schemas,
 resources, prompts, caches, and mutation classes. Optional disk cache files are
@@ -80,7 +82,7 @@ YAML remains only ast-grep rule/test input and is never XRAY product output.
 ## Historical frozen xray-s3b design
 
 This section preserves the implemented XRAY 0.10.0 contract as transformation
-evidence. XRAY 0.11.1 above supersedes it for current behavior.
+evidence. XRAY 0.11.2 above supersedes it for current behavior.
 
 ### Compatibility
 
@@ -152,6 +154,12 @@ one-based range, returned line and byte counts, and truncation metadata. CLI
 `symbol-at` and MCP `symbol_at` accept a contained path and one-based line and
 return the narrowest enclosing inventory symbol. They return an explicit empty
 result when no supported symbol contains the line.
+
+An exact-symbol read validates the supplied path, range, name, type, and any
+supplied qualified identity against the current symbol inventory before reading
+source. A mismatch fails with the typed `symbol_mismatch` code; XRAY does not
+claim whether an unverifiable handoff was forged or became stale. Context and
+output bounds affect only the returned source slice, not symbol identity.
 
 ### Impact continuation
 
@@ -500,12 +508,15 @@ escapes are rejected. The rule configuration for `scan` is also contained.
 
 - Repository maps default to at most 5,000 entries and expose `truncated` plus
   a warning when the bound is reached.
-- Structural, impact, and outline reads return at most 50 items by default. Compact
-  pages expose `returned`, `total`, `total_exact`, `truncated`, and `next_cursor` when another
+- Structural, impact, and outline reads return at most 50 items by default. A
+  continuable read requires a positive page limit. Compact pages expose
+  `returned`, `total`, `total_exact`, `truncated`, and `next_cursor` when another
   read-only page exists.
 - Cursors are opaque offsets bound by a fingerprint to command, normalized
-  root, query/scopes, and source content. Reusing one for a different operation,
-  query, or changed snapshot is invalid.
+  root, query/scopes, projection schema, and source content. Reusing one for a
+  different operation, query, projection, or changed snapshot is invalid. The
+  positive page size is not cursor identity and may change between pages; the
+  cursor offset still prevents overlap or omission.
 - Symbol JSON input is bounded to 1 MiB. Subprocess time and captured output,
   skeleton file size, in-memory symbol cache, MCP root cache, and cache disk
   usage are bounded in their owning components.

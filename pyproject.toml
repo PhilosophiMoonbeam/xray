@@ -1,6 +1,6 @@
 [project]
 name = "xray"
-version = "0.11.1"
+version = "0.11.2"
 description = "XRAY: Agent-centric code intelligence CLI with MCP compatibility - Map, Find, Interface, Impact"
 readme = "README.md"
 requires-python = ">=3.10"

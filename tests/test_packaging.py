@@ -25,7 +25,7 @@ def test_project_metadata_is_cli_first_with_mcp_compatibility():
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     project = data["project"]
 
-    assert project["version"] == "0.11.1"
+    assert project["version"] == "0.11.2"
     assert "CLI" in project["description"]
     assert "MCP compatibility" in project["description"]
     assert "cli" in project["keywords"]
@@ -146,7 +146,7 @@ def test_top_level_cli_skill_is_agent_skills_compliant():
     assert "xray replace refine ROOT" in body
     assert "xray replace verify ROOT" in body
     assert "xray replace apply ROOT" in body
-    assert "(.plan // .).edit_manifest[].edit_id" in body
+    assert ".edit_manifest[].edit_id" in body
     assert "xray.replace.v2" in body
     assert "REVIEWED_DIGEST" in body
     assert "Legacy `rewrite` and `scan --fix` remain destructive" in body
@@ -163,6 +163,10 @@ def test_top_level_cli_skill_is_agent_skills_compliant():
     assert "reporting, not edits" in body
     assert "`find` defaults to `min_score: 60`" in body
     assert "`--detail full` preserves v1" in body
+    assert "symbol_mismatch" in body
+    assert "page may use a different positive size" in body
+    assert "inspection_lines" in body
+    assert "rollback_attempted" in body
     assert len(content.split()) <= 500
     assert len(content.encode()) <= 3600
 
@@ -207,7 +211,7 @@ def test_readme_documents_generated_cli_decision():
     assert "does not forward arbitrary" in readme
     assert "`search_tools` ranks natural intent by default" in readme
     assert "xray replace verify ROOT" in readme
-    assert "(.plan // .).edit_manifest[].edit_id" in readme
+    assert ".edit_manifest[].edit_id" in readme
     assert "`symbol-at`/`symbol_at` resolves" in readme
     assert "`xray skill install` is intentionally CLI-only" in readme
     assert "`xray-mcp` fixes the FastMCP transport to stdio" in readme
@@ -236,7 +240,7 @@ def test_readme_documents_current_installation_and_cli_contract():
     assert "symbols.pkl" not in readme
     assert "Python interface reads use the standard-library AST" in readme
     assert "xray replace plan ROOT" in readme
-    assert "--expected-digest REVIEWED_DIGEST" in readme
+    assert '--expected-digest "$reviewed_digest"' in readme
     assert "plan_replacement" in readme
     assert "apply_replacement" in readme
 

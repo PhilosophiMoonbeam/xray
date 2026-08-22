@@ -9,7 +9,7 @@ import pytest
 from xray import cli
 from xray import mcp_server as cli_mcp_server
 from xray.core.ast_grep import AstGrepError, AstGrepResult, BoundedAstGrepResult
-from xray.core.indexer import ReplacementApplyError, XRayIndexer
+from xray.core.indexer import ReplacementApplyError, ReplacementDriftError, XRayIndexer
 
 
 def make_repo(tmp_path: Path) -> Path:
@@ -107,6 +107,7 @@ def test_scan_rules_uses_config_and_optional_fix(tmp_path: Path) -> None:
         "files_modified": [],
         "rollback_count": 0,
         "rollback_succeeded": True,
+        "rollback_attempted": False,
         "files": [],
     }
     assert run.call_args.args[0] == [
@@ -260,22 +261,21 @@ def test_search_compacts_raw_matches_and_pages_with_bound_cursor(tmp_path: Path,
         for value in range(3)
     ]
     with patch.object(XRayIndexer, "search_pattern", return_value=raw) as search:
-        assert cli.main(["search", str(repo), "-p", "old($A)", "--limit", "2"]) == 0
-    assert search.call_args.kwargs["max_results"] == 3
+        assert cli.main(["search", str(repo), "-p", "old($A)", "--limit", "1"]) == 0
+    assert search.call_args.kwargs["max_results"] == 2
     first = json.loads(capsys.readouterr().out)
     assert first["schema_version"] == "xray.cli.v3"
     assert first["matches"] == [
         {"path": "sample.py", "line": 1, "column": 5, "text": "old(0)", "captures": {"A": "0"}},
-        {"path": "sample.py", "line": 2, "column": 5, "text": "old(1)", "captures": {"A": "1"}},
     ]
-    assert (first["returned"], first["total"], first["truncated"]) == (2, 3, True)
+    assert (first["returned"], first["total"], first["truncated"]) == (1, 3, True)
     assert "range" not in json.dumps(first["matches"])
 
     with patch.object(XRayIndexer, "search_pattern", return_value=raw) as search:
         assert cli.main(["search", str(repo), "-p", "old($A)", "--limit", "2", "--cursor", first["next_cursor"]]) == 0
-    assert search.call_args.kwargs["max_results"] == 5
+    assert search.call_args.kwargs["max_results"] == 4
     second = json.loads(capsys.readouterr().out)
-    assert [match["text"] for match in second["matches"]] == ["old(2)"]
+    assert [match["text"] for match in second["matches"]] == ["old(1)", "old(2)"]
     assert second["truncated"] is False
     assert "next_cursor" not in second
 
@@ -522,11 +522,30 @@ def test_replacement_dirty_affected_file_requires_digested_acknowledgement(tmp_p
     )
 
     assert blocked["dirty_affected_paths"] == ["sample.py"]
+    assert not any("unrelated worktree changes" in warning for warning in blocked["warnings"])
     assert blocked["applicability_reason"] == "dirty_affected_files_not_acknowledged"
     assert acknowledged["allow_dirty_affected"] is True
     assert acknowledged["applicable"] is True
     indexer.apply_replacement(acknowledged, expected_digest=acknowledged["plan_digest"])
     assert "# local work" in sample.read_text(encoding="utf-8")
+
+
+def test_replacement_unrelated_dirt_is_precise_and_nonblocking(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "sample.py"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=XRAY Test", "-c", "user.email=xray@example.invalid", "commit", "-qm", "base"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "notes.txt").write_text("unrelated\n", encoding="utf-8")
+
+    plan = XRayIndexer(str(repo)).plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
+
+    assert plan["dirty_affected_paths"] == []
+    assert plan["applicable"] is True
+    assert any("unrelated worktree changes" in warning for warning in plan["warnings"])
 
 
 def test_replacement_apply_rejects_digest_mismatch_and_source_drift(tmp_path: Path) -> None:
@@ -547,7 +566,7 @@ def test_replacement_apply_rejects_digest_mismatch_and_source_drift(tmp_path: Pa
 
     sample.write_text(sample.read_text(encoding="utf-8").replace("old(1)", "old(2)"), encoding="utf-8")
     drifted = sample.read_bytes()
-    with pytest.raises(ReplacementApplyError, match="no longer matches"):
+    with pytest.raises(ReplacementApplyError, match="before candidate selection"):
         indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
     assert sample.read_bytes() == drifted
 
@@ -642,8 +661,17 @@ def test_replacement_verify_recomputes_all_guards_without_writing(tmp_path: Path
 
     sample.write_text(sample.read_text(encoding="utf-8").replace("old(1)", "old(2)"), encoding="utf-8")
     drifted = sample.read_bytes()
-    with pytest.raises(ReplacementApplyError, match="no longer matches"):
+    with pytest.raises(ReplacementDriftError, match="before candidate selection") as raised:
         indexer.verify_replacement(plan, expected_digest=plan["plan_digest"])
+    assert raised.value.details["changed_paths"] == [
+        {
+            "path": "sample.py",
+            "expected_sha256": plan["files"][0]["preimage_sha256"],
+            "current_sha256": indexer._sha256(drifted),
+        }
+    ]
+    with pytest.raises(ReplacementApplyError, match="before candidate selection"):
+        indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
     assert sample.read_bytes() == drifted
 
 
@@ -753,6 +781,7 @@ def test_replacement_apply_rolls_back_already_replaced_files(tmp_path: Path) -> 
 
     assert raised.value.rollback_count == 1
     assert raised.value.rollback_succeeded is True
+    assert raised.value.rollback_attempted is True
     assert {path: path.read_bytes() for path in originals} == originals
 
 
@@ -769,9 +798,10 @@ def test_replacement_rechecks_source_after_staging_before_first_write(tmp_path: 
         return staged
 
     with patch.object(indexer, "_write_staged_file", side_effect=stage_then_inject_drift):
-        with pytest.raises(ReplacementApplyError, match="after staging"):
+        with pytest.raises(ReplacementApplyError, match="after staging") as raised:
             indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
 
+    assert raised.value.rollback_attempted is False
     assert "return old(9)" in sample.read_text(encoding="utf-8")
     assert not list(repo.glob(".xray-stage-*"))
 
@@ -800,6 +830,7 @@ def test_replacement_final_syntax_evidence_drift_rolls_back(tmp_path: Path) -> N
 
     assert raised.value.rollback_count == 1
     assert raised.value.rollback_succeeded is True
+    assert raised.value.rollback_attempted is True
     assert sample.read_bytes() == original
 
 

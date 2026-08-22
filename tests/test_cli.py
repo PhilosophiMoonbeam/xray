@@ -691,14 +691,15 @@ def test_find_cli_rejects_invalid_min_score(tmp_path, capsys):
     assert error["error"]["message"] == "--min-score must be between 0 and 100."
 
 
-def test_find_cli_rejects_negative_limit(tmp_path, capsys):
+@pytest.mark.parametrize("limit", ["-1", "0"])
+def test_find_cli_rejects_nonpositive_limit(tmp_path, capsys, limit):
     repo = write_sample_repo(tmp_path)
 
-    exit_code = cli.main(["find", str(repo), "target", "--limit", "-1"])
+    exit_code = cli.main(["find", str(repo), "target", "--limit", limit])
 
     assert exit_code == 2
     error = json.loads(capsys.readouterr().err)
-    assert error["error"]["message"] == "--limit must be 0 or greater."
+    assert error["error"]["message"] == "--limit must be 1 or greater for a continuable read."
 
 
 def test_impact_cli_accepts_manual_symbol_json(tmp_path, capsys):
@@ -1171,9 +1172,9 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
         "file_imports",
         "file_exports",
     }
-    detail_tools = {"explore_repo", "search_pattern", "scan_rules"}
+    detail_tools = {"explore_repo", "search_pattern", "scan_rules", "check_rules"}
     limited_tools = {"search_pattern", "scan_rules"}
-    cursor_tools = {"search_pattern", "scan_rules"}
+    cursor_tools = {"search_pattern", "scan_rules", "check_rules"}
     for name in detail_tools:
         assert all_tools[name]["inputSchema"]["properties"]["detail"]["default"] == "compact"
     for name in limited_tools:
@@ -1182,7 +1183,7 @@ def test_mcp_search_first_transform_quality_and_structured_call_results(tmp_path
         assert "cursor" in all_tools[name]["inputSchema"]["properties"]
     assert "at most 50 compact matches" in all_tools["search_pattern"]["description"]
     assert "read-only" in all_tools["scan_rules"]["description"]
-    assert "identical root" in all_tools["search_pattern"]["inputSchema"]["properties"]["cursor"]["description"]
+    assert "page size may change" in all_tools["search_pattern"]["inputSchema"]["properties"]["cursor"]["description"]
 
     for match in inventory:
         properties = match["inputSchema"]["properties"]
@@ -1654,7 +1655,7 @@ def test_cli_version_returns_without_system_exit(capsys):
     exit_code = cli.main(["--version"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out.strip() == "xray 0.11.1"
+    assert capsys.readouterr().out.strip() == "xray 0.11.2"
 
 
 def test_cli_help_is_current_safe_and_token_bounded(capsys):
@@ -2098,6 +2099,26 @@ def test_interface_symbol_reads_and_symbol_at_are_bounded_and_contained(tmp_path
     with pytest.raises(ValueError, match="outside repository"):
         indexer.read_symbol({"path": "../outside.py", "start_line": 1, "end_line": 1})
 
+    for field, value in (
+        ("name", "forged"),
+        ("type", "class"),
+        ("start_line", int(found["start_line"]) + 1),
+        ("end_line", int(found["end_line"]) + 1),
+        ("qualified_name", "Service.helper"),
+        ("owner", "Service"),
+        ("language", "typescript"),
+    ):
+        tampered = {**found, field: value}
+        with pytest.raises(InterfaceReadError) as mismatch:
+            indexer.read_symbol(tampered)
+        assert mismatch.value.code == "symbol_mismatch"
+
+    other = repo / "other.py"
+    other.write_text("def other():\n    pass\n", encoding="utf-8")
+    with pytest.raises(InterfaceReadError) as path_mismatch:
+        indexer.read_symbol({**found, "abs_path": str(other)})
+    assert path_mismatch.value.code == "symbol_mismatch"
+
 
 def test_nested_map_focus_keeps_root_context_and_ancestor_chain(tmp_path):
     repo = tmp_path / "repo"
@@ -2115,6 +2136,18 @@ def test_nested_map_focus_keeps_root_context_and_ancestor_chain(tmp_path):
     assert "src/other.py" not in paths
     assert "docs" not in paths
     assert data["options"]["focus_dirs"] == ["src/pkg"]
+
+
+@pytest.mark.parametrize("focus", ["src/pkg", "src/pkg/selected.py"])
+def test_strict_focus_limit_one_emits_the_focus_before_internal_ancestors(tmp_path, focus):
+    repo = tmp_path / "repo"
+    (repo / "src" / "pkg").mkdir(parents=True)
+    (repo / "src" / "pkg" / "selected.py").write_text("def selected():\n    pass\n", encoding="utf-8")
+
+    data = XRayIndexer(str(repo)).explore_repo_data(focus_dirs=[focus], include_root_context=False, max_entries=1)
+
+    assert data["entries"][0]["path"] == focus
+    assert data["tree_text"].splitlines()[0].strip("├└─ ") == Path(focus).name
 
 
 def test_deep_map_focus_uses_focus_relative_depth_and_explicit_context_mode(tmp_path, capsys):
@@ -2177,6 +2210,7 @@ def test_mcp_deep_focus_defaults_are_relative_and_support_strict_mode(tmp_path):
                         "root_path": str(repo),
                         "focus_dirs": ["src/xray/core/indexer.py"],
                         "include_root_context": False,
+                        "max_entries": 1,
                     },
                 },
             )
@@ -2187,6 +2221,7 @@ def test_mcp_deep_focus_defaults_are_relative_and_support_strict_mode(tmp_path):
     assert "README.md" in {entry["path"] for entry in contextual["entries"]}
     assert contextual["options"]["max_depth"] == 2
     assert strict["options"]["focus_mode"] == "strict"
+    assert [entry["path"] for entry in strict["entries"]] == ["src/xray/core/indexer.py"]
     assert "README.md" not in {entry["path"] for entry in strict["entries"]}
 
 
@@ -2290,7 +2325,13 @@ def test_rule_explain_and_capabilities_are_read_only_and_bounded(tmp_path):
     assert explained["valid"] is True
     assert explained["source_truncated"] is True
     assert len(explained["source"]) == 16
+    assert explained["inspection_lines"] == explained["inspection"].splitlines()
     assert capabilities["replacement_plan_versions"] == ["xray.replace.v2"]
+    assert capabilities["paging"] == {
+        "continuable_min_limit": 1,
+        "adaptive_page_size": True,
+        "cursor_identity": ["command", "root", "query_scopes", "projection", "source_snapshot"],
+    }
     assert capabilities["mutation_classes"]["guarded"]["mcp"] == ["apply_replacement", "apply_rule_fixes"]
     assert capabilities["mutation_classes"]["direct_legacy"]["mcp"] == ["rewrite_pattern"]
     assert capabilities["product"]["version"]
@@ -2364,6 +2405,11 @@ def test_cli_bounded_interface_read_symbol_and_symbol_at(tmp_path, capsys):
     read = json.loads(capsys.readouterr().out)
     assert read["command"] == "read-symbol"
     assert read["result"]["returned_lines"] <= 1
+
+    tampered = {**symbol, "name": "forged_target"}
+    assert cli.main(["read-symbol", str(repo), "--symbol-json", json.dumps(tampered)]) == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == "symbol_mismatch"
     assert read["result"]["returned_bytes"] <= 24
 
     assert cli.main(["symbol-at", str(repo), "src/sample.py", str(symbol["start_line"])]) == 0
@@ -2516,6 +2562,14 @@ def test_cli_rules_and_replacement_refinement_are_non_mutating(tmp_path, capsys)
     checked = json.loads(capsys.readouterr().out)
     assert checked["command"] == "rules.check"
     assert checked["result"]["valid"] is True
+    assert checked["result"]["matches"]
+    assert checked["result"]["matches"][0]["path"] == "src/sample.py"
+    assert checked["result"]["matches"][0]["line"] >= 1
+    assert not Path(checked["result"]["matches"][0]["path"]).is_absolute()
+
+    assert cli.main(["rules", "check", str(repo), "--rule", "rule.yml", "--detail", "full"]) == 0
+    full_check = json.loads(capsys.readouterr().out)
+    assert "range" in full_check["result"]["matches"][0]
     assert cli.main(["rules", "explain", str(repo), "--rule", "rule.yml", "--source-limit", "8"]) == 0
     explained = json.loads(capsys.readouterr().out)
     assert explained["command"] == "rules.explain"

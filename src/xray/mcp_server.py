@@ -18,7 +18,7 @@ from fastmcp.server.transforms.search.base import BaseSearchTransform
 from fastmcp.tools import Tool, ToolResult
 from fastmcp.tools.tool_transform import ArgTransformConfig, ToolTransformConfig
 
-from xray.core.indexer import InterfaceReadError, XRayIndexer
+from xray.core.indexer import InterfaceReadError, ReplacementApplyError, ReplacementDriftError, XRayIndexer
 from xray.models import (
     dump_explore_data,
     dump_impact_result,
@@ -88,7 +88,8 @@ Use XRAY as map -> find -> interface -> impact:
 
 For structural discovery, `search_pattern`, read-only `scan_rules`, `file_imports`, and `file_exports`
 return at most 50 compact items by default. Check `returned`, `total`, `total_exact`, and `truncated`; pass
-`next_cursor` back as `cursor` only with the identical root, arguments, and unchanged source snapshot.
+`next_cursor` back as `cursor` with the same query/scopes, projection, and unchanged source snapshot;
+the later page may use a different positive page size.
 Request `detail="full"` only for raw ast-grep metadata. `scan_rules` is read-only. Build a reviewed rule plan with
 `plan_replacement`, then use `apply_rule_fixes` for guarded rule mutation. `rewrite_pattern` remains a legacy
 all-match mutation regardless of the reporting limit and never supports continuation after mutation.
@@ -358,7 +359,9 @@ class XRayToolSearchTransform(BaseSearchTransform):
             pattern: Annotated[str, "Natural-language intent, or a regex when mode='regex'"],
             mode: Annotated[Literal["intent", "regex"], "intent (default) or explicit regex compatibility"] = "intent",
             limit: Annotated[int, "Page size from 1 to 50"] = DEFAULT_TOOL_SEARCH_LIMIT,
-            cursor: Annotated[str | None, "next_cursor from the identical catalog and query"] = None,
+            cursor: Annotated[
+                str | None, "next_cursor for the same catalog/query/detail; positive page size may change"
+            ] = None,
             detail: Annotated[
                 Literal["summary", "full"], "summary metadata (default) or complete tool schemas"
             ] = "summary",
@@ -446,8 +449,9 @@ def xray_discovery_plan(goal: str = "understand a code change") -> str:
         "or read_interface for legacy text.\n"
         "4. Call what_breaks with the full symbol object before changing public code; "
         "treat results as name-based references, not a type-aware dependency graph.\n\n"
-        "For structural reads, inspect returned/total/total_exact/truncated and continue next_cursor only with "
-        "identical arguments and an unchanged source snapshot. For mutation, call plan_replacement, review the "
+        "For structural reads, use a positive limit, inspect returned/total/total_exact/truncated, and continue "
+        "next_cursor with the same query/projection and unchanged source; page size may change. For mutation, "
+        "call plan_replacement, review the "
         "edit_manifest, syntax/dirty evidence, and digest; call verify_replacement; then call apply_replacement "
         "with that plan and an independently copied digest. "
         "For pattern plans or rewrites, pass lang whenever the target language is known. "
@@ -686,6 +690,8 @@ def _prepare_page(
     identity: dict[str, Any],
     limit: int | str,
     cursor: str | None,
+    *,
+    continuable: bool = True,
 ) -> tuple[str, int, dict[str, Any], int]:
     """Bind paging to repository content before running read or mutation work."""
     normalized = normalize_path(root_path)
@@ -693,7 +699,9 @@ def _prepare_page(
         parsed_limit = int(limit)
     except (TypeError, ValueError) as exc:
         raise ValueError("limit must be an integer.") from exc
-    if parsed_limit < 0:
+    if continuable and parsed_limit < 1:
+        raise ValueError("limit must be 1 or greater for a continuable read.")
+    if not continuable and parsed_limit < 0:
         raise ValueError("limit must be 0 or greater.")
     snapshot = run_indexer_operation(normalized, lambda indexer: indexer.repository_snapshot_fingerprint())
     bound_identity = {**identity, "source_snapshot": snapshot}
@@ -857,6 +865,7 @@ def read_interface_structured(
             "symbol_types": symbol_types or [],
             "member_depth": member_depth,
             "max_members": max_members,
+            "projection": "compact" if schema == "v3" else "full",
             **({"schema": "v3"} if schema == "v3" else {}),
         }
         normalized, parsed_limit, identity, _offset = _prepare_page(root_path, "interface", identity, limit, cursor)
@@ -912,6 +921,8 @@ def read_symbol(
                 symbol, context_lines=context_lines, max_lines=max_lines, max_bytes=max_bytes
             ),
         )
+    except InterfaceReadError as exc:
+        return mcp_error(exc.code, str(exc))
     except Exception as exc:
         return mcp_error("invalid_request", str(exc))
 
@@ -1004,7 +1015,13 @@ def search_pattern(
     """Return bounded compact structural matches, with full detail available on request."""
     try:
         _validate_detail(detail)
-        identity = {"pattern": pattern, "lang": lang, "paths": paths or [], "globs": globs or []}
+        identity = {
+            "pattern": pattern,
+            "lang": lang,
+            "paths": paths or [],
+            "globs": globs or [],
+            "projection": detail,
+        }
         normalized, parsed_limit, identity, offset = _prepare_page(root_path, "search", identity, limit, cursor)
         matches, total_exact = run_indexer_operation(
             normalized,
@@ -1050,7 +1067,9 @@ def rewrite_pattern(
     try:
         _validate_detail(detail)
         identity = {"pattern": pattern, "replacement": replacement, "lang": lang}
-        normalized, parsed_limit, identity, _offset = _prepare_page(root_path, "rewrite", identity, limit, None)
+        normalized, parsed_limit, identity, _offset = _prepare_page(
+            root_path, "rewrite", identity, limit, None, continuable=False
+        )
         summary = run_indexer_operation(normalized, lambda indexer: indexer.rewrite_pattern(pattern, replacement, lang))
         matches = summary.pop("matches", [])
         if detail == "full":
@@ -1134,6 +1153,8 @@ def verify_replacement(root_path: str, plan: dict[str, Any], expected_digest: st
             root_path,
             lambda indexer: indexer.verify_replacement(plan, expected_digest=expected_digest),
         )
+    except ReplacementDriftError as exc:
+        return mcp_error("replacement_source_drift", str(exc), details=exc.details)
     except Exception as exc:
         return mcp_error("replacement_verification_failed", str(exc))
 
@@ -1145,6 +1166,18 @@ def apply_replacement(root_path: str, plan: dict[str, Any], expected_digest: str
         return run_indexer_operation(
             root_path,
             lambda indexer: indexer.apply_replacement(plan, expected_digest=expected_digest),
+        )
+    except ReplacementDriftError as exc:
+        return mcp_error("replacement_source_drift", str(exc), details=exc.details)
+    except ReplacementApplyError as exc:
+        return mcp_error(
+            "replacement_apply_failed",
+            str(exc),
+            details={
+                "rollback_attempted": exc.rollback_attempted,
+                "rollback_count": exc.rollback_count,
+                "rollback_succeeded": exc.rollback_succeeded,
+            },
         )
     except Exception as exc:
         return mcp_error("replacement_apply_failed", str(exc))
@@ -1163,7 +1196,7 @@ def scan_rules(
     """Return bounded read-only ast-grep rule diagnostics."""
     try:
         _validate_detail(detail)
-        identity = {"rule_path": rule_path, "paths": paths or [], "globs": globs or []}
+        identity = {"rule_path": rule_path, "paths": paths or [], "globs": globs or [], "projection": detail}
         normalized, parsed_limit, identity, offset = _prepare_page(root_path, "scan", identity, limit, cursor)
         matches, total_exact = run_indexer_operation(
             normalized,
@@ -1208,6 +1241,18 @@ def apply_rule_fixes(root_path: str, plan: dict[str, Any], expected_digest: str)
             root_path,
             lambda indexer: indexer.apply_replacement(plan, expected_digest=expected_digest),
         )
+    except ReplacementDriftError as exc:
+        return mcp_error("replacement_source_drift", str(exc), details=exc.details)
+    except ReplacementApplyError as exc:
+        return mcp_error(
+            "rule_apply_failed",
+            str(exc),
+            details={
+                "rollback_attempted": exc.rollback_attempted,
+                "rollback_count": exc.rollback_count,
+                "rollback_succeeded": exc.rollback_succeeded,
+            },
+        )
     except Exception as exc:
         return mcp_error("rule_apply_failed", str(exc))
 
@@ -1216,16 +1261,35 @@ def apply_rule_fixes(root_path: str, plan: dict[str, Any], expected_digest: str)
 def check_rules(
     root_path: str,
     rule_path: str,
-    limit: int = 100,
+    limit: int | str = 100,
+    cursor: str | None = None,
+    detail: str = "compact",
     paths: list[str] | None = None,
     globs: list[str] | None = None,
 ) -> dict[str, Any] | ToolResult:
     """Validate and scan a contained ast-grep rule without mutation."""
     try:
-        return run_indexer_operation(
-            root_path,
-            lambda indexer: indexer.check_rules(rule_path, paths=paths, globs=globs, max_results=limit),
+        _validate_detail(detail)
+        identity = {"rule_path": rule_path, "paths": paths or [], "globs": globs or [], "projection": detail}
+        normalized, parsed_limit, identity, offset = _prepare_page(root_path, "rules.check", identity, limit, cursor)
+        result = run_indexer_operation(
+            normalized,
+            lambda indexer: indexer.check_rules(
+                rule_path, paths=paths, globs=globs, max_results=offset + parsed_limit + 1
+            ),
         )
+        matches, metadata = _present_items(
+            result.pop("matches"),
+            root_path=normalized,
+            command="rules.check",
+            identity=identity,
+            detail=detail,
+            limit=parsed_limit,
+            cursor=cursor,
+            total_exact=bool(result.pop("total_exact")),
+        )
+        result.update({"matches": matches, **metadata})
+        return result
     except Exception as exc:
         return mcp_error("invalid_rule", str(exc))
 
@@ -1278,7 +1342,7 @@ def file_imports(
     """Return bounded compact imports, flattening ast-grep outline wrappers."""
     try:
         _validate_detail(detail)
-        identity = {"file_path": file_path}
+        identity = {"file_path": file_path, "projection": detail}
         normalized, parsed_limit, identity, _offset = _prepare_page(root_path, "imports", identity, limit, cursor)
         items = run_indexer_operation(normalized, lambda indexer: indexer.file_outline_items(file_path, "imports"))
         page, metadata = _present_items(
@@ -1309,7 +1373,7 @@ def file_exports(
     """Return bounded compact exports, flattening ast-grep outline wrappers."""
     try:
         _validate_detail(detail)
-        identity = {"file_path": file_path}
+        identity = {"file_path": file_path, "projection": detail}
         normalized, parsed_limit, identity, _offset = _prepare_page(root_path, "exports", identity, limit, cursor)
         items = run_indexer_operation(normalized, lambda indexer: indexer.file_outline_items(file_path, "exports"))
         page, metadata = _present_items(
@@ -1369,7 +1433,9 @@ mcp.add_transform(
                     "root_path": ArgTransformConfig(description="Absolute repository root path to search."),
                     "query": ArgTransformConfig(description="Symbol name or owner-qualified identity to find."),
                     "limit": ArgTransformConfig(description="Page size; defaults to 10."),
-                    "cursor": ArgTransformConfig(description="Snapshot- and filter-bound continuation cursor."),
+                    "cursor": ArgTransformConfig(
+                        description="Query/projection/snapshot-bound continuation; positive page size may change."
+                    ),
                     "min_score": ArgTransformConfig(description="Minimum calibrated score; defaults to 60."),
                     "paths": ArgTransformConfig(description="Optional contained file/directory scopes."),
                     "languages": ArgTransformConfig(description="Optional language filters."),
@@ -1403,7 +1469,9 @@ mcp.add_transform(
                     "member_depth": ArgTransformConfig(description="Nested member depth; defaults to 1."),
                     "max_members": ArgTransformConfig(description="Member cap per symbol; defaults to 20."),
                     "limit": ArgTransformConfig(description="Top-level symbol page size; defaults to 50."),
-                    "cursor": ArgTransformConfig(description="Snapshot- and filter-bound continuation cursor."),
+                    "cursor": ArgTransformConfig(
+                        description="Query/projection/snapshot-bound continuation; positive page size may change."
+                    ),
                 },
             ),
             "read_symbol": ToolTransformConfig(
@@ -1439,7 +1507,9 @@ mcp.add_transform(
                         description="Full symbol object from find_symbol, including absolute path and line data."
                     ),
                     "limit": ArgTransformConfig(description="Maximum returned references; defaults to 50."),
-                    "cursor": ArgTransformConfig(description="Snapshot-bound continuation cursor."),
+                    "cursor": ArgTransformConfig(
+                        description="Query/projection/snapshot-bound continuation; positive page size may change."
+                    ),
                     "detail": ArgTransformConfig(description="compact (default) or full reference context."),
                 },
             ),
@@ -1459,8 +1529,8 @@ mcp.add_transform(
                     "limit": ArgTransformConfig(description="Maximum returned matches; defaults to 50."),
                     "cursor": ArgTransformConfig(
                         description=(
-                            "Opaque next_cursor from the identical root, pattern, language, scopes, and unchanged "
-                            "source snapshot."
+                            "Opaque next_cursor for the same root, query/scopes, projection, and source snapshot; "
+                            "positive page size may change."
                         )
                     ),
                     "detail": ArgTransformConfig(description="compact (default) or full ast-grep match detail."),
@@ -1566,7 +1636,9 @@ mcp.add_transform(
                     "root_path": ArgTransformConfig(description="Absolute repository root path to scan."),
                     "rule_path": ArgTransformConfig(description="Rule file or config directory inside root_path."),
                     "limit": ArgTransformConfig(description="Maximum returned diagnostics; defaults to 50."),
-                    "cursor": ArgTransformConfig(description="Snapshot-bound continuation cursor."),
+                    "cursor": ArgTransformConfig(
+                        description="Query/projection/snapshot-bound continuation; positive page size may change."
+                    ),
                     "detail": ArgTransformConfig(description="compact (default) or full ast-grep diagnostic detail."),
                     "paths": ArgTransformConfig(description="Optional contained file/directory scopes."),
                     "globs": ArgTransformConfig(description="Optional ordered ast-grep glob filters."),
@@ -1587,7 +1659,11 @@ mcp.add_transform(
                 arguments={
                     "root_path": ArgTransformConfig(description="Absolute repository root path."),
                     "rule_path": ArgTransformConfig(description="Contained rule or configuration path."),
-                    "limit": ArgTransformConfig(description="Maximum returned matches."),
+                    "limit": ArgTransformConfig(description="Positive diagnostic page size; defaults to 100."),
+                    "cursor": ArgTransformConfig(
+                        description="Query/projection/snapshot-bound continuation; positive page size may change."
+                    ),
+                    "detail": ArgTransformConfig(description="compact (default) or full ast-grep diagnostic detail."),
                     "paths": ArgTransformConfig(description="Optional contained scan scopes."),
                     "globs": ArgTransformConfig(description="Optional ast-grep glob filters."),
                 },
@@ -1628,7 +1704,7 @@ mcp.add_transform(
                     "file_path": ArgTransformConfig(description="File path inside root_path."),
                     "limit": ArgTransformConfig(description="Maximum returned imports; defaults to 50."),
                     "cursor": ArgTransformConfig(
-                        description="Opaque next_cursor from the identical root and file query."
+                        description="Same file/projection/snapshot continuation; positive page size may change."
                     ),
                     "detail": ArgTransformConfig(description="compact (default) or full ast-grep outline detail."),
                 },
@@ -1644,7 +1720,7 @@ mcp.add_transform(
                     "file_path": ArgTransformConfig(description="File path inside root_path."),
                     "limit": ArgTransformConfig(description="Maximum returned exports; defaults to 50."),
                     "cursor": ArgTransformConfig(
-                        description="Opaque next_cursor from the identical root and file query."
+                        description="Same file/projection/snapshot continuation; positive page size may change."
                     ),
                     "detail": ArgTransformConfig(description="compact (default) or full ast-grep outline detail."),
                 },

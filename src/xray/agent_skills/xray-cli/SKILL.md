@@ -5,15 +5,13 @@ description: "Use XRAY to map, inspect, assess impact, search, validate rules, a
 
 # XRAY CLI
 
-Use installed `xray`; here use `uv run xray`. Pass `ROOT`. Compact
-`xray.cli.v3` JSON is the default, with consistent success/paging fields, typed
-completeness, and exact-symbol interfaces. Use `--schema v2` only to inspect the
-previous projection.
+Use installed `xray`; here use `uv run xray`. Pass `ROOT`. Compact v3 JSON is
+default; `--schema v2` only diagnoses the previous projection.
 
 ## Discover code
 
 ```bash
-xray explore ROOT                         # defaults to depth 2
+xray explore ROOT
 xray explore ROOT --focus src/pkg --all-depths --limit 500
 xray explore ROOT --focus src/pkg --strict-focus
 xray find ROOT "AuthService.validate_user" --limit 5
@@ -23,13 +21,13 @@ xray symbol-at ROOT src/package/module.py 42
 xray capabilities ROOT                    # doctor is an alias
 ```
 
-`map` aliases `explore`. Focus retains root context and ancestors unless
-`--strict-focus` is set.
+`map` aliases `explore`. Strict focus starts output at the focus; otherwise it
+retains root context and ancestors.
 
-`find` defaults to `min_score: 60` and 10 scored name/owner matches. Narrow with
-filters; `--min-score 0` includes weak candidates. `--detail full` preserves v1.
+`find` defaults to `min_score: 60` and 10 scored name/owner matches. Filters
+narrow it; `--min-score 0` includes weak candidates. `--detail full` preserves v1.
 
-Preserve a complete find symbol for reads and impact:
+Preserve the complete find symbol:
 
 ```bash
 symbol=$(xray find ROOT target_function --limit 1 | jq -c '.symbols[0]')
@@ -37,6 +35,9 @@ xray read-symbol ROOT --symbol-json "$symbol"
 xray impact ROOT --symbol-json "$symbol"
 xray interface ROOT --symbol-json "$symbol"
 ```
+
+`read-symbol` verifies current path/range/name/type/qualified identity and
+returns typed `symbol_mismatch` for stale or tampered handoffs.
 
 Impact returns classified name evidence, not a type-aware graph.
 
@@ -53,32 +54,33 @@ xray exports ROOT src/package/module.py
 
 YAML is ast-grep rule/test input, never XRAY output. `rules` are read-only;
 `xray scan ROOT --rule rule.yml --fix` is legacy all-match mutation.
+`rules check` defaults to compact relative one-based citations; use
+`--detail full` for raw diagnostics. `rules explain` includes
+`inspection_lines` alongside raw inspection.
 
 ## Page and change safely
 
-Inspect paging fields; `total_exact: false` makes `total` a lower bound. Reuse
-cursors only with identical arguments and source.
+Inspect paging fields; `total_exact: false` makes `total` a lower bound.
+Continuable limits are positive. A cursor binds query/scopes, projection, and
+source, but a later page may use a different positive size.
 
 ```bash
-xray replace plan ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' -l python > plan.json
-# Extract and review every edit, preview, diff, syntax result, dirty path, bound, and digest.
-jq -r '(.plan // .).edit_manifest[].edit_id' plan.json
-xray replace refine ROOT --plan-file plan.json --edit-id EDIT_ID > refined.json
-xray replace verify ROOT --plan-file refined.json --expected-digest REVIEWED_DIGEST
-xray replace apply ROOT --plan-file refined.json --expected-digest REVIEWED_DIGEST
+xray replace plan ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' -l python | jq '.plan' > plan.json
+jq -r '.edit_manifest[].edit_id' plan.json
+xray replace refine ROOT --plan-file plan.json --edit-id EDIT_ID | jq '.plan' > refined.json
+REVIEWED_DIGEST=$(jq -r '.plan_digest' refined.json)
+xray replace verify ROOT --plan-file refined.json --expected-digest "$REVIEWED_DIGEST"
+xray replace apply ROOT --plan-file refined.json --expected-digest "$REVIEWED_DIGEST"
 ```
 
-`xray.replace.v2` digests bind the review artifact. Exceptional truncated,
-no-op, parse-error, and dirty-file cases require their recorded flags.
-New parse errors block planning unless `--allow-new-parse-errors` is recorded.
-Dirty affected files block planning unless `--allow-dirty-affected` is recorded.
-`verify` repeats every apply guard without writes. Apply rejects v1, tampering,
-query/scope/source/syntax drift, stages all postimages, preserves modes, verifies
-writes, and rolls back partial replacement. A process crash cannot guarantee
-rollback; keep the worktree recoverable and inspect the final diff.
+`xray.replace.v2` binds the review. Truncation, no-op, parse-error, and dirty-file
+exceptions require recorded flags. `verify` repeats apply guards without writes.
+Apply rejects tampering/drift, stages postimages, preserves modes, verifies writes,
+and rolls back partial replacement. Inspect `rollback_attempted`; crashes cannot
+guarantee rollback.
 
 Legacy `rewrite` and `scan --fix` remain destructive. Their `--limit` limits
 reporting, not edits. Pass `-l/--lang` for pattern mutations when known.
 
-Paths stay inside `ROOT`. Compact errors are typed. Exit codes are `0` success,
-`1` command failure, and `2` validation failure. Text output is lossy.
+Paths stay inside `ROOT`. Errors are typed. Exit codes: `0` success, `1` command
+failure, `2` validation failure. Text is lossy.

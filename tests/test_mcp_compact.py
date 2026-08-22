@@ -67,6 +67,19 @@ def test_mcp_search_compacts_pages_and_preserves_full_detail(tmp_path: Path) -> 
     assert full["pattern"] == "old($A)"
 
 
+def test_mcp_read_symbol_rejects_tampered_exact_identity_with_typed_error(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    found = XRayIndexer(str(repo)).find_symbol("old", min_score=100)[0]
+
+    genuine = success_value(mcp_server.read_symbol(str(repo), dict(found)))
+    assert genuine["symbol"]["name"] == "old"
+
+    result = mcp_server.read_symbol(str(repo), {**found, "qualified_name": "forged.old"})
+    error = error_value(result)
+    assert error["code"] == "symbol_mismatch"
+    assert "current inventory" in error["message"]
+
+
 def test_mcp_cursor_validation_happens_before_search(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     with patch.object(XRayIndexer, "search_pattern", return_value=raw_matches(repo)):
@@ -169,7 +182,7 @@ def test_mcp_protocol_errors_natural_discovery_and_annotations(tmp_path: Path) -
     assert [tool.name for tool in visible] == ["search_tools", "call_tool"]
     assert invalid.is_error is True
     assert invalid.structured_content == {
-        "error": {"code": "invalid_request", "message": "limit must be 0 or greater."}
+        "error": {"code": "invalid_request", "message": "limit must be 1 or greater for a continuable read."}
     }
     assert json.loads(cast(Any, invalid.content[0]).text) == invalid.structured_content
     assert any(match["name"] == "find_symbol" for match in searches["lookup"])
@@ -209,10 +222,10 @@ def test_mcp_find_reads_capabilities_rules_and_replacement_refinement(tmp_path: 
     second = asyncio.run(
         call(
             "find_symbol",
-            {"root_path": str(repo), "query": "old", "limit": 1, "cursor": first["next_cursor"]},
+            {"root_path": str(repo), "query": "old", "limit": 3, "cursor": first["next_cursor"]},
         )
     )
-    assert second["symbols"][0]["qualified_name"] != first["symbols"][0]["qualified_name"]
+    assert first["symbols"][0]["qualified_name"] not in {symbol["qualified_name"] for symbol in second["symbols"]}
     nonsense = asyncio.run(call("find_symbol", {"root_path": str(repo), "query": "unrelated behavior phrase"}))
     assert nonsense["symbols"] == []
 
@@ -234,9 +247,13 @@ def test_mcp_find_reads_capabilities_rules_and_replacement_refinement(tmp_path: 
 
     capabilities = asyncio.run(call("xray_capabilities", {"root_path": str(repo)}))
     assert capabilities["replacement_plan_versions"] == ["xray.replace.v2"]
-    checked = asyncio.run(call("check_rules", {"root_path": str(repo), "rule_path": "rule.yml"}))
+    checked = asyncio.run(call("check_rules", {"root_path": str(repo), "rule_path": "rule.yml", "limit": 1}))
+    checked_full = asyncio.run(call("check_rules", {"root_path": str(repo), "rule_path": "rule.yml", "detail": "full"}))
     explained = asyncio.run(call("explain_rules", {"root_path": str(repo), "rule_path": "rule.yml", "source_limit": 8}))
     assert checked["valid"] is True
+    assert checked["matches"][0]["path"] in {"sample.py", "second.py"}
+    assert checked["matches"][0]["line"] >= 1
+    assert "range" in checked_full["matches"][0]
     assert explained["source_truncated"] is True
 
     plan = asyncio.run(

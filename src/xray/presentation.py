@@ -208,7 +208,9 @@ def page_items(
     total_exact: bool = True,
 ) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
     """Page items and return truthful compact result metadata."""
-    if limit < 0:
+    if continuable and limit < 1:
+        raise ValueError("limit must be 1 or greater for a continuable read.")
+    if not continuable and limit < 0:
         raise ValueError("limit must be 0 or greater.")
     fingerprint = cursor_fingerprint(command, root_path, identity)
     offset = decode_cursor(cursor, fingerprint)

@@ -1,15 +1,12 @@
 # XRAY Progressive Discovery
 
-Use this skill to inspect and safely change a repository through XRAY MCP while
-keeping context small.
+Inspect and safely change repositories through XRAY MCP with small context.
 
 ## Discover
 
-`search_tools` ranks natural intent and supports explicit `mode="regex"`. Use
-phrases such as `find usages`, `safe code replacement`, or `workflow`. Page
-with `next_cursor`; request `detail="full"` only for input schemas. Execute one result
-through `call_tool` with its exact name and arguments. Direct legacy mutation
-is hidden from ordinary intent results but remains callable by exact name.
+`search_tools` ranks natural intent and supports explicit `mode="regex"`. Page
+with `next_cursor`; request `detail="full"` only for schemas. Execute through
+`call_tool`. Legacy mutation is hidden from ordinary intent results.
 
 1. Map with `explore_repo`. Compact relative-path `entries` default to depth 2.
    Use contained nested `focus_dirs`; set `all_depths=true` only explicitly.
@@ -19,21 +16,20 @@ is hidden from ordinary intent results but remains callable by exact name.
 3. Inspect signature contracts with bounded `read_interface_structured`, exact source with
    `read_symbol`, or a location with `symbol_at`. Pass the full find result as
    `exact_symbol` to return only its owner/member interface in default v3.
-   `read_interface` is legacy text.
+   `read_symbol` verifies that identity against the current inventory and returns
+   `symbol_mismatch` for a stale or tampered handoff. `read_interface` is legacy text.
 4. Estimate blast radius with `what_breaks` and the full find symbol. Results
    are name-based references, not a type-aware caller or dependency graph.
 
-`xray_capabilities` reports help, workflow resources, schemas, operations,
-bounds, dependency versions, health, and optional repository checks.
+`xray_capabilities` reports contracts, bounds, versions, and health.
 
 ## Page and validate
 
 - Read results expose `returned`, `total`, `total_exact`, `truncated`, and
-  `next_cursor`. A false `total_exact` means a lower bound. Reuse a cursor only
-  with identical arguments and unchanged source. Impact paging stays under
-  `.impact` only in the CLI; MCP returns its result fields directly.
-- Narrow find with `paths`, `languages`, `symbol_types`, or `visibility`.
-  Request `min_score=0` only to inspect low-confidence candidates.
+  `next_cursor`. A false `total_exact` means a lower bound. Continuable limits
+  are positive. A cursor binds query/scopes, projection, and unchanged source,
+  while a later page may use a different positive size.
+- Narrow find with filters; use `min_score=0` only for weak candidates.
 - Use `search_pattern`, `file_imports`, and `file_exports` for bounded structural
   matches and outlines. Request `detail="full"` only for raw ast-grep metadata.
 - Protocol failures set `isError=true` and return structured
@@ -43,10 +39,10 @@ bounds, dependency versions, health, and optional repository checks.
 ## Rules and mutation
 
 YAML is ast-grep rule/test input, never XRAY output. `scan_rules`, `check_rules`,
-`explain_rules`, and `test_rules` are read-only. Tests never update snapshots or
-start interactive review. For fixes, create a rule plan with `plan_replacement`,
-review it, then call destructive `apply_rule_fixes` with the full plan and an
-independently copied digest.
+`explain_rules`, and `test_rules` are read-only. `check_rules` defaults to relative one-based
+citations; full detail preserves raw diagnostics. `explain_rules` adds lossless
+`inspection_lines`. For fixes, create a rule plan with `plan_replacement`,
+review it, then call `apply_rule_fixes` with the plan and copied digest.
 
 For pattern changes, call `plan_replacement`; review every `edit_manifest`
 entry, syntax result, dirty affected path, preview, deterministic diff, warning,
@@ -57,7 +53,7 @@ independently copied digest before `apply_replacement`. Plans are
 review, new parse errors, and dirty affected files require their explicit
 recorded acknowledgements. Apply rejects tampering or drift before staged
 writes and rolls back partial replacement. A process crash cannot guarantee
-rollback, so keep the worktree recoverable. Pass `lang` when known.
+rollback, so inspect `rollback_attempted` and keep the worktree recoverable. Pass `lang` when known.
 
 Keep `rewrite_pattern` only for explicit legacy all-match mutation. Its limit
 does not bound edits. Fetch `xray://workflow` for longer examples.

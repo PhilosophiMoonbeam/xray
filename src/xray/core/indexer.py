@@ -117,10 +117,26 @@ MAX_REPLACEMENT_TOTAL_BYTES = 50 * 1024 * 1024
 class ReplacementApplyError(RuntimeError):
     """Raised when guarded replacement fails, with rollback evidence."""
 
-    def __init__(self, message: str, *, rollback_count: int = 0, rollback_succeeded: bool = True):
+    def __init__(
+        self,
+        message: str,
+        *,
+        rollback_count: int = 0,
+        rollback_succeeded: bool = True,
+        rollback_attempted: bool = False,
+    ):
         super().__init__(message)
         self.rollback_count = rollback_count
         self.rollback_succeeded = rollback_succeeded
+        self.rollback_attempted = rollback_attempted
+
+
+class ReplacementDriftError(ReplacementApplyError):
+    """Raised when a reviewed replacement artifact no longer matches its source."""
+
+    def __init__(self, message: str, *, details: dict[str, Any]):
+        super().__init__(message)
+        self.details = details
 
 
 class InterfaceReadError(RuntimeError):
@@ -1066,8 +1082,10 @@ class XRayIndexer:
         warnings: list[str] = []
         if query["change"]["kind"] == "pattern" and not query["change"].get("language"):
             warnings.append("Language was inferred; review configuration and documentation matches before apply.")
-        if dirty:
-            warnings.append("Repository worktree is dirty; the plan digest still binds every affected preimage.")
+        if dirty and not dirty_affected_paths:
+            warnings.append(
+                "Repository has unrelated worktree changes; every affected preimage remains bound by the plan digest."
+            )
         if dirty_affected_paths and not allow_dirty_affected:
             warnings.append("Affected files already contain Git worktree changes; acknowledge them before apply.")
         if new_parse_error_count and not allow_new_parse_errors:
@@ -1141,7 +1159,7 @@ class XRayIndexer:
             "applicability_reason": applicability_reason,
             "warnings": warnings,
             "next_actions": {
-                "list_edit_ids": "jq -r '(.plan // .).edit_manifest[].edit_id' PLAN.json",
+                "list_edit_ids": "jq -r '.edit_manifest[].edit_id' PLAN.json",
                 "refine": "Repeat --edit-id EDIT_ID for every selected edit.",
                 "verify": "Run xray replace verify with this complete plan and an independently copied digest.",
                 "apply": "Apply only after verify reports ready_to_apply=true and external approval is satisfied.",
@@ -1288,6 +1306,7 @@ class XRayIndexer:
                 f"Replacement apply failed: {exc}",
                 rollback_count=rollback_count,
                 rollback_succeeded=rollback_succeeded,
+                rollback_attempted=bool(replaced),
             ) from exc
 
         return {
@@ -1301,6 +1320,7 @@ class XRayIndexer:
             "files_modified": [item.relative_path for item in changed_files],
             "rollback_count": 0,
             "rollback_succeeded": True,
+            "rollback_attempted": False,
             "files": [
                 {
                     "path": item.relative_path,
@@ -1402,6 +1422,7 @@ class XRayIndexer:
         if Path(str(plan.get("root_path", ""))).resolve() != self.root_path:
             raise ValueError("Replacement plan root does not match the requested repository root.")
         query, bounds, kwargs = self._replacement_plan_inputs(plan)
+        self._validate_replacement_source_snapshot(plan, query=query)
         prepared = self._build_replacement_plan(
             **kwargs,
             paths=query.get("paths"),
@@ -1425,6 +1446,58 @@ class XRayIndexer:
                 raise ValueError("Replacement plan contains no byte-changing edits; allow_noop was not recorded.")
             raise ValueError(f"Replacement plan is not applicable: {prepared.plan['applicability_reason']}.")
         return prepared, legacy_v2
+
+    def _validate_replacement_source_snapshot(self, plan: Mapping[str, Any], *, query: Mapping[str, Any]) -> None:
+        """Report affected-source drift before candidate or selection recomputation."""
+        files = plan.get("files")
+        if not isinstance(files, Sequence) or isinstance(files, (str, bytes)):
+            raise ValueError("Replacement plan files are invalid.")
+        changed: list[dict[str, str]] = []
+        current_files: list[dict[str, str]] = []
+        affected_paths: list[str] = []
+        for item in files:
+            if not isinstance(item, Mapping) or not isinstance(item.get("path"), str):
+                raise ValueError("Replacement plan file entry is invalid.")
+            relative = str(item["path"])
+            expected = item.get("preimage_sha256")
+            if not isinstance(expected, str):
+                raise ValueError(f"Replacement plan file '{relative}' is missing preimage_sha256.")
+            try:
+                target = self._resolve_repo_path(relative, require_file=True)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise ReplacementDriftError(
+                    "Replacement source snapshot changed before candidate selection was recomputed.",
+                    details={
+                        "changed_paths": [{"path": relative, "expected_sha256": expected, "state": "unavailable"}]
+                    },
+                ) from exc
+            normalized = target.relative_to(self.root_path).as_posix()
+            current = self._sha256(target.read_bytes())
+            affected_paths.append(normalized)
+            current_files.append({"path": normalized, "sha256": current})
+            if normalized != relative or current != expected:
+                changed.append({"path": relative, "expected_sha256": expected, "current_sha256": current})
+        commit, _dirty, _dirty_affected = self._git_state(affected_paths)
+        current_fingerprint = self._sha256(
+            self._canonical_json(
+                {
+                    "root_path": str(self.root_path),
+                    "git_commit": commit,
+                    "query": dict(query),
+                    "files": current_files,
+                }
+            )
+        )
+        expected_fingerprint = plan.get("root_fingerprint")
+        if changed or current_fingerprint != expected_fingerprint:
+            raise ReplacementDriftError(
+                "Replacement source snapshot changed before candidate selection was recomputed.",
+                details={
+                    "changed_paths": changed,
+                    "expected_root_fingerprint": expected_fingerprint,
+                    "current_root_fingerprint": current_fingerprint,
+                },
+            )
 
     def verify_replacement(self, plan: Mapping[str, Any], *, expected_digest: str) -> dict[str, Any]:
         """Perform every non-mutating apply guard and summarize readiness."""
@@ -1476,6 +1549,7 @@ class XRayIndexer:
             "file_count": applied["file_count"],
             "rollback_count": applied["rollback_count"],
             "rollback_succeeded": applied["rollback_succeeded"],
+            "rollback_attempted": applied["rollback_attempted"],
         }
 
     def scan_rules(
@@ -1551,6 +1625,7 @@ class XRayIndexer:
             "source_total_chars": len(source),
             "source_truncated": len(source) > source_limit,
             "inspection": result.stderr.strip(),
+            "inspection_lines": result.stderr.strip().splitlines(),
         }
 
     def test_rules(
@@ -1661,6 +1736,11 @@ class XRayIndexer:
                 "mcp_legacy": ["v2"],
             },
             "replacement_plan_versions": [REPLACEMENT_PLAN_VERSION],
+            "paging": {
+                "continuable_min_limit": 1,
+                "adaptive_page_size": True,
+                "cursor_identity": ["command", "root", "query_scopes", "projection", "source_snapshot"],
+            },
             "languages": sorted(set(LANGUAGE_MAP.values())),
             "extensions": dict(sorted(LANGUAGE_MAP.items())),
             "operations": {
@@ -1976,6 +2056,13 @@ class XRayIndexer:
             return True
         return include_root_context and "/" not in relative
 
+    def _should_emit_focused_path(self, path: Path, focus_dirs: list[str] | None, include_root_context: bool) -> bool:
+        """Emit strict-focus descendants while retaining ancestors only for traversal."""
+        if not focus_dirs or include_root_context:
+            return True
+        _ancestor, descendant_depth = self._focus_relationship(path, focus_dirs)
+        return descendant_depth is not None
+
     def _within_explore_depth(
         self,
         path: Path,
@@ -2064,8 +2151,6 @@ class XRayIndexer:
         max_entries: int = 5000,
     ) -> bool:
         """Recursively build the tree representation with enhanced features."""
-        if entries is not None and len(entries) >= max_entries:
-            return True
         if self._should_exclude(path, gitignore_patterns):
             return False
 
@@ -2084,7 +2169,11 @@ class XRayIndexer:
         if path.is_dir() and not self._should_include_dir(path, focus_dirs):
             return False
 
-        if entries is not None:
+        emit = self._should_emit_focused_path(path, focus_dirs, include_root_context)
+        if emit and entries is not None and len(entries) >= max_entries:
+            return True
+
+        if emit and entries is not None:
             relative_path = "." if path == self.root_path else path.relative_to(self.root_path).as_posix()
             entry: ExploreEntry = {
                 "path": relative_path,
@@ -2105,7 +2194,7 @@ class XRayIndexer:
         connector = "└── " if is_last else "├── "
 
         # For files, add skeleton if requested
-        if path.is_file() and include_symbols and path.suffix.lower() in LANGUAGE_MAP:
+        if emit and path.is_file() and include_symbols and path.suffix.lower() in LANGUAGE_MAP:
             skeleton = self._get_file_skeleton_enhanced(path, max_symbols_per_file, symbol_types)
             if skeleton:
                 # Format with indented skeleton
@@ -2126,9 +2215,9 @@ class XRayIndexer:
             else:
                 tree_lines.append(prefix + connector + name)
         # Directory or file without symbols
-        elif path == self.root_path:
+        elif emit and path == self.root_path:
             tree_lines.append(name)
-        else:
+        elif emit:
             tree_lines.append(prefix + connector + name)
 
         # Only recurse into directories
@@ -2142,7 +2231,7 @@ class XRayIndexer:
                 for i, child in enumerate(children):
                     is_last_child = i == len(children) - 1
                     extension = "    " if is_last else "│   "
-                    new_prefix = prefix + extension if path != self.root_path else ""
+                    new_prefix = prefix + extension if emit and path != self.root_path else prefix
 
                     truncated = self._build_tree_recursive_enhanced(
                         child,
@@ -2478,10 +2567,29 @@ class XRayIndexer:
         if not isinstance(path_value, str):
             raise ValueError("Symbol path is required.")
         target = self._resolve_repo_path(path_value, require_file=True)
+        abs_path_value = symbol.get("abs_path")
+        if isinstance(abs_path_value, str) and self._resolve_repo_path(abs_path_value, require_file=True) != target:
+            raise InterfaceReadError("symbol_mismatch", "Symbol path and abs_path identify different files.")
+        relative = target.relative_to(self.root_path).as_posix()
         start = int(symbol.get("start_line", 0))
         end = int(symbol.get("end_line", start))
         if start < 1 or end < start:
             raise ValueError("Symbol start_line/end_line are invalid.")
+        identity_fields = ("name", "type", "start_line", "end_line", "qualified_name", "owner", "language")
+        candidates = [item for item in self._get_symbol_inventory() if item.get("path") == relative]
+        matched = next(
+            (
+                item
+                for item in candidates
+                if all(field not in symbol or symbol.get(field) == item.get(field) for field in identity_fields)
+            ),
+            None,
+        )
+        if matched is None:
+            raise InterfaceReadError(
+                "symbol_mismatch",
+                f"Exact symbol identity does not match the current inventory for '{relative}'.",
+            )
         lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
         slice_start = max(1, start - context_lines)
         slice_end = min(len(lines), end + context_lines)
@@ -2495,9 +2603,9 @@ class XRayIndexer:
             source = encoded[:max_bytes].decode("utf-8", errors="ignore")
         returned_lines = source.count("\n") + (1 if source and not source.endswith("\n") else 0)
         return {
-            "path": target.relative_to(self.root_path).as_posix(),
+            "path": relative,
             "symbol": {
-                key: symbol.get(key) for key in ("name", "type", "qualified_name") if symbol.get(key) is not None
+                key: matched.get(key) for key in ("name", "type", "qualified_name") if matched.get(key) is not None
             },
             "start_line": slice_start,
             "end_line": slice_start + max(0, returned_lines - 1),

@@ -141,7 +141,8 @@ Important options:
 - `--focus PATH` accepts contained nested files or directories. Focus retains
   root-level context files and the complete ancestor chain, then traverses only
   selected descendant subtrees.
-- `--strict-focus` omits unrelated root context while retaining focus ancestors.
+- `--strict-focus` traverses focus ancestors internally but emits only each
+  focus and its descendants, so entry limits are spent on requested results.
 - `--max-symbols-per-file N` limits skeleton detail per file and must be zero or greater.
 - `--max-entries N` and its `--limit N` alias bound map entries (default: 5000).
 - Compact JSON is the default and returns structured `entries` without duplicated `tree_text`, absolute paths, names derivable from paths, or empty envelope fields.
@@ -208,6 +209,9 @@ A member symbol returns only its owner and selected member path.
 Use `xray read-symbol ROOT` with the same symbol JSON/file/manual inputs as
 impact to return a bounded exact source slice. `xray symbol-at ROOT FILE LINE`
 returns the narrowest enclosing symbol or an explicit `found: false` result.
+Exact reads verify the supplied path, range, name, type, and qualified identity
+against the current inventory; stale or tampered handoffs fail with
+`symbol_mismatch` instead of returning source under caller-supplied labels.
 
 ### `xray impact`
 
@@ -253,17 +257,21 @@ xray exports ROOT src/package/module.py
 `search` and `scan` accept repeatable `--path` scopes and ordered `--glob`
 filters. Every path must resolve inside `ROOT`.
 
-These commands also accept `--detail compact|full`, `--limit N`, `--cursor TOKEN`,
+Read-only `search`, `scan`, `rules check`, `imports`, and `exports` accept
+`--detail compact|full`, a positive `--limit N`, `--cursor TOKEN`,
 `--format json|text`, and `--pretty`. Compact detail is the default and returns
 XRAY-owned fields such as relative `path`, one-based `line`/`column`, `text`, and
 `captures`. Full detail retains lossless upstream ast-grep JSON.
 
-The default limit is 50 returned items. Repository-wide read-only search, scan,
-and impact stop upstream work after the page-derived candidate cap. Responses
+Continuable reads require a positive limit; the default is 50 returned items.
+Repository-wide read-only search, scan, and impact stop upstream work after the
+page-derived candidate cap. Responses
 include `returned`, `total`, `total_exact`, and `truncated`; `total_exact: false`
 means `total` is a lower bound. When more results exist, pass the opaque
-`next_cursor` back as `--cursor`. Cursors bind command, root, query, scopes, and
-source content; continuation rejects a changed snapshot. Limits only bound
+`next_cursor` back as `--cursor`. Cursors bind command, root, query, scopes,
+projection, and source content; continuation rejects a changed snapshot. Page
+size is not cursor identity, so a later page may use a different positive limit
+without overlap or omission. Limits only bound
 reported diagnostics for legacy mutation: `rewrite` and `scan --fix` still apply
 every matching edit and do not advertise continuation after mutation.
 
@@ -274,10 +282,12 @@ fixes without prompting. Import/export paths are confined to `ROOT` and use
 ast-grep outline for file dependency and public-API inspection.
 
 The `rules check`, `rules explain`, and `rules test` family is read-only.
-Explain returns bounded rule source, validation evidence, and ast-grep inspection
-without parsing YAML into an XRAY format. Test disables snapshot updates, color,
-and interactive review. Legacy CLI `scan --fix` remains the explicit all-match
-rule mutation path.
+Check returns compact relative-path, one-based citations by default and supports
+paging; `--detail full` retains raw ast-grep diagnostics. Explain returns bounded
+rule source, validation evidence, raw `inspection`, and lossless
+`inspection_lines` without parsing YAML into an XRAY format. Test disables
+snapshot updates, color, and interactive review. Legacy CLI `scan --fix` remains
+the explicit all-match rule mutation path.
 
 Compact `rewrite` output omits pre-rewrite matches and reports only counts and
 modified paths. Use `--detail full` when the match payload is required.
@@ -296,13 +306,14 @@ Use JSON-first plan/apply for new mutation workflows:
 ```bash
 xray replace plan ROOT \
   --pattern 'old_api($ARG)' --replacement 'new_api($ARG)' --lang python \
-  --path src --glob '*.py' > plan.json
+  --path src --glob '*.py' | jq '.plan' > plan.json
 
 # Review every edit_id, preview, diff, warning, bound, applicability value, hash, and digest.
-jq -r '(.plan // .).edit_manifest[].edit_id' plan.json
-xray replace refine ROOT --plan-file plan.json --edit-id EDIT_ID > refined.json
-xray replace verify ROOT --plan-file refined.json --expected-digest REVIEWED_DIGEST
-xray replace apply ROOT --plan-file refined.json --expected-digest REVIEWED_DIGEST
+jq -r '.edit_manifest[].edit_id' plan.json
+xray replace refine ROOT --plan-file plan.json --edit-id EDIT_ID | jq '.plan' > refined.json
+reviewed_digest=$(jq -r '.plan_digest' refined.json)
+xray replace verify ROOT --plan-file refined.json --expected-digest "$reviewed_digest"
+xray replace apply ROOT --plan-file refined.json --expected-digest "$reviewed_digest"
 ```
 
 Planning is non-mutating and defaults to at most 1000 candidates, 100 affected
@@ -321,6 +332,8 @@ source, syntax, or dirty-state drift before writing. It prepares same-directory
 staged files, preserves file modes, verifies postimages, and restores already
 replaced files if a later replacement fails. Process termination cannot
 guarantee rollback, so use a recoverable worktree and inspect the final diff.
+Results retain `rollback_succeeded` and add `rollback_attempted` so a successful
+apply or a pre-write failure cannot be mistaken for a restoration attempt.
 Use `--rule` instead of pattern/replacement to plan a fix-bearing
 ast-grep rule. `rewrite` remains available only as an explicit legacy all-match
 operation.
@@ -345,7 +358,7 @@ Command-specific fields:
 - compact `impact`: `symbol` plus classified relative-path references, strategy/degradation, counts, and exact paging metadata.
 - `replace.plan` / `replace.refine`: complete `xray.replace.v2` review artifacts;
   `replace.apply`: truthful changed/no-op/file and rollback evidence.
-- compact `search` / `scan`: projected `matches` and page metadata.
+- compact `search` / `scan` / `rules.check`: projected `matches` and page metadata.
 - compact `rewrite`: `match_count`, `files_modified`, and `file_count`.
 - compact `imports` / `exports`: projected `items` and page metadata.
 
