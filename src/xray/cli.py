@@ -67,7 +67,8 @@ Continuable pages require a positive limit and report total_exact. next_cursor
 binds the query, projection, and snapshot but permits a different positive page
 size. YAML output is unsupported. replace apply, rewrite, and
 scan --fix mutate files; --limit never bounds legacy edits. Exit codes: 0 success,
-1 command failure, 2 parse or validation error.
+1 command failure, 2 parse or validation error. On apply results, inspect
+rollback_attempted before rollback_succeeded.
 """
 
 EXPLORE_HELP = """\
@@ -1048,9 +1049,28 @@ def _structural_payload(
     root_path: Path,
     identity: Mapping[str, Any],
     *,
+    indexer: XRayIndexer | None = None,
     total_exact: bool = True,
     continuable: bool = True,
-) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
+) -> tuple[Sequence[Mapping[str, Any]], dict[str, Any]]:
+    has_multi = any(
+        isinstance(meta := item.get("metaVariables"), Mapping) and bool(meta.get("multi")) for item in raw_items
+    )
+    if args.detail == "compact" and has_multi and indexer is not None:
+        page, metadata = page_items(
+            raw_items,
+            command=command,
+            root_path=root_path,
+            identity=identity,
+            limit=args.limit,
+            cursor=args.cursor,
+            continuable=continuable,
+            total_exact=total_exact,
+        )
+        projected, warnings = indexer.project_semantic_captures(page)
+        if warnings:
+            metadata["warnings"] = warnings
+        return compact_structural_items(projected, root_path), metadata
     projected: Sequence[Mapping[str, Any]] = (
         raw_items if args.detail == "full" else compact_structural_items(raw_items, root_path)
     )
@@ -1098,6 +1118,7 @@ def handle_search(args: argparse.Namespace) -> int:
         "search",
         indexer.root_path,
         identity,
+        indexer=indexer,
         total_exact=indexer.last_result_total_exact,
     )
     if args.format == "text":
@@ -1194,6 +1215,7 @@ def handle_scan(args: argparse.Namespace) -> int:
         "scan",
         indexer.root_path,
         identity,
+        indexer=indexer,
         total_exact=indexer.last_result_total_exact,
         continuable=not args.fix,
     )
@@ -1251,6 +1273,7 @@ def handle_rules_check(args: argparse.Namespace) -> int:
         "rules.check",
         indexer.root_path,
         identity,
+        indexer=indexer,
         total_exact=bool(result.pop("total_exact")),
     )
     result.update({"matches": matches, **metadata})

@@ -71,8 +71,9 @@ MCP `verify_replacement` recompute digest, selection, source, syntax, dirtiness,
 and applicability without writes. Apply repeats these checks for staged and
 final postimages, preserves modes, and rolls back partial ordinary failures.
 Results distinguish whether rollback was attempted while retaining legacy count
-and success fields. Process termination can interrupt rollback; callers keep a
-recoverable worktree and inspect the resulting diff.
+and success fields. Callers branch on `rollback_attempted` first and interpret
+`rollback_succeeded` only after an attempt. Process termination can interrupt
+rollback; callers keep a recoverable worktree and inspect the resulting diff.
 
 Capabilities separate CLI and MCP operation names, defaults, maxima, schemas,
 resources, prompts, caches, and mutation classes. Optional disk cache files are
@@ -173,6 +174,23 @@ When the raw safety bound prevents exactness, the response reports
 `execution_limited: true`, retains `total_exact: false`, and emits a warning. It
 does not claim that omitted results are available through a cursor it cannot
 honor.
+
+### Semantic structural captures
+
+Compact structural results and replacement previews project multi-captures as
+semantic named syntax nodes. ast-grep intentionally includes unnamed separator
+nodes in multi-match results, while its CLI JSON exposes only text and ranges.
+XRAY therefore reparses only the returned compact page or bounded replacement
+files with the matching `ast-grep-py` runtime, correlates capture ranges with
+named nodes, and omits unnamed nodes. It does not filter literal punctuation.
+
+Projection supports Python, JavaScript, TypeScript, and Go under the existing
+10 MiB per-file and 50 MiB aggregate source bounds. Single and transformed
+captures remain the upstream text. Full detail retains raw ast-grep metadata,
+including separators, and ast-grep remains solely responsible for replacement
+rendering. If a multi-capture cannot be verified because its language, source,
+range, or bound is unavailable, compact output omits that multi-capture and
+returns a warning instead of presenting unverified nodes as semantic values.
 
 ### Repository mapping
 
@@ -283,8 +301,9 @@ The compact JSON plan uses `schema_version: "xray.cli.v2"` and
 - exact candidate, changed-candidate, no-op, and affected-file counts;
 - every affected relative path with its preimage SHA-256, proposed postimage
   SHA-256, edit count, changed edit count, and byte size;
-- a root fingerprint bound to the normalized root identity, Git commit when
-  available, query, and affected-file manifest;
+- a query-and-affected-source `root_fingerprint` bound to the normalized root
+  identity, Git commit when available, complete query including selection, and
+  affected-file manifest; selection-only refinement therefore changes it;
 - a plan digest over the canonical plan fields;
 - a bounded compact preview with before and after text, one-based location,
   captures, and truncation metadata; and

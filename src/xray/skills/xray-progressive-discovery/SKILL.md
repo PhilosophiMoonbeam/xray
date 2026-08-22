@@ -1,6 +1,6 @@
 # XRAY Progressive Discovery
 
-Inspect and safely change repositories through XRAY MCP with small context.
+Inspect and safely change repositories through XRAY MCP.
 
 ## Discover
 
@@ -30,8 +30,8 @@ with `next_cursor`; request `detail="full"` only for schemas. Execute through
   are positive. A cursor binds query/scopes, projection, and unchanged source,
   while a later page may use a different positive size.
 - Narrow find with filters; use `min_score=0` only for weak candidates.
-- Use `search_pattern`, `file_imports`, and `file_exports` for bounded structural
-  matches and outlines. Request `detail="full"` only for raw ast-grep metadata.
+- Use `search_pattern`, `file_imports`, and `file_exports` for structural reads.
+  Compact multi-captures are named nodes; full detail keeps raw separators.
 - Protocol failures set `isError=true` and return structured
   `error: {code, message, details?}` values; do not treat them as empty results.
 - Paths, rules, files, and symbols must remain inside the supplied root.
@@ -44,16 +44,18 @@ citations; full detail preserves raw diagnostics. `explain_rules` adds lossless
 `inspection_lines`. For fixes, create a rule plan with `plan_replacement`,
 review it, then call `apply_rule_fixes` with the plan and copied digest.
 
-For pattern changes, call `plan_replacement`; review every `edit_manifest`
-entry, syntax result, dirty affected path, preview, deterministic diff, warning,
-hash, bound, applicability value, and `plan_digest`. Optionally select edits
+For pattern changes, call `plan_replacement`; review each `edit_manifest` entry,
+syntax result, dirty path, preview, diff, warning, hash, bound, applicability,
+`next_actions`, and `plan_digest`. Blocked plans omit verify/apply. Optionally select edits
 with `refine_replacement`, then call non-mutating `verify_replacement` with the
 independently copied digest before `apply_replacement`. Plans are
 `xray.replace.v2`; their digest binds the complete review artifact. Truncated
 review, new parse errors, and dirty affected files require their explicit
 recorded acknowledgements. Apply rejects tampering or drift before staged
 writes and rolls back partial replacement. A process crash cannot guarantee
-rollback, so inspect `rollback_attempted` and keep the worktree recoverable. Pass `lang` when known.
+rollback. Check `rollback_attempted` first; `rollback_succeeded` matters only
+after an attempt. `root_fingerprint` binds selection and preimages, so refine may
+change it without drift. Keep work recoverable. Pass `lang` when known.
 
 Keep `rewrite_pattern` only for explicit legacy all-match mutation. Its limit
 does not bound edits. Fetch `xray://workflow` for longer examples.

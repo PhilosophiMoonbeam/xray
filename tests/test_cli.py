@@ -1655,7 +1655,7 @@ def test_cli_version_returns_without_system_exit(capsys):
     exit_code = cli.main(["--version"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out.strip() == "xray 0.11.2"
+    assert capsys.readouterr().out.strip() == "xray 0.11.3"
 
 
 def test_cli_help_is_current_safe_and_token_bounded(capsys):
@@ -2327,6 +2327,17 @@ def test_rule_explain_and_capabilities_are_read_only_and_bounded(tmp_path):
     assert len(explained["source"]) == 16
     assert explained["inspection_lines"] == explained["inspection"].splitlines()
     assert capabilities["replacement_plan_versions"] == ["xray.replace.v2"]
+    assert capabilities["replacement_semantics"] == {
+        "root_fingerprint_inputs": [
+            "normalized_root",
+            "git_commit_when_available",
+            "query_including_selection",
+            "affected_source_preimages",
+        ],
+        "selection_refinement_changes_root_fingerprint": True,
+        "rollback_interpretation_order": ["rollback_attempted", "rollback_succeeded", "rollback_count"],
+        "rollback_succeeded_requires_attempted": True,
+    }
     assert capabilities["paging"] == {
         "continuable_min_limit": 1,
         "adaptive_page_size": True,

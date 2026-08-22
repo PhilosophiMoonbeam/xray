@@ -7,7 +7,7 @@ import os
 import re
 import threading
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeVar
 
@@ -97,6 +97,8 @@ For replacement, call read-only `plan_replacement`, review every edit in `edit_m
 dirty-file acknowledgement, warning, hash, diff, and `plan_digest`, then call `verify_replacement`.
 Only then pass the complete plan plus an independently copied digest to destructive `apply_replacement`.
 Apply revalidates syntax and source state before writing and rolls back partial application.
+On results, branch on `rollback_attempted` before interpreting `rollback_succeeded`.
+The plan `root_fingerprint` binds query/selection and affected preimages, so refinement may change it without drift.
 Pass `lang` whenever known for pattern plans and rewrites. Keep `rewrite_pattern` only for explicit
 legacy all-match mutation.
 """
@@ -722,6 +724,24 @@ def _present_items(
     total_exact: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     _validate_detail(detail)
+    has_multi = any(
+        isinstance(meta := item.get("metaVariables"), Mapping) and bool(meta.get("multi")) for item in raw_items
+    )
+    if detail == "compact" and has_multi:
+        page, metadata = page_items(
+            raw_items,
+            command=command,
+            root_path=Path(root_path),
+            identity=identity,
+            limit=limit,
+            cursor=cursor,
+            continuable=continuable,
+            total_exact=total_exact,
+        )
+        projected, warnings = run_indexer_operation(root_path, lambda indexer: indexer.project_semantic_captures(page))
+        if warnings:
+            metadata["warnings"] = warnings
+        return compact_structural_items(projected, Path(root_path)), metadata
     items = raw_items if detail == "full" else compact_structural_items(raw_items, Path(root_path))
     page, metadata = page_items(
         items,
@@ -1617,7 +1637,8 @@ mcp.add_transform(
                     "Apply replacement safely from a complete reviewed safe code replacement plan only when its "
                     "independent digest and "
                     "every "
-                    "root, query, candidate, count, and source-hash guard still match."
+                    "root, query, candidate, count, and source-hash guard still match. Interpret results by "
+                    "checking rollback_attempted before rollback_succeeded."
                 ),
                 tags={"replace", "apply", "guarded", "rewrite", "destructive"},
                 arguments={

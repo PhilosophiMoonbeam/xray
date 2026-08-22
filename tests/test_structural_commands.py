@@ -10,6 +10,7 @@ from xray import cli
 from xray import mcp_server as cli_mcp_server
 from xray.core.ast_grep import AstGrepError, AstGrepResult, BoundedAstGrepResult
 from xray.core.indexer import ReplacementApplyError, ReplacementDriftError, XRayIndexer
+from xray.presentation import compact_structural_items
 
 
 def make_repo(tmp_path: Path) -> Path:
@@ -291,6 +292,89 @@ def test_search_full_preserves_raw_payload_and_v1_envelope(tmp_path: Path, capsy
     assert result["schema_version"] == "xray.cli.v1"
     assert result["ok"] is True
     assert result["matches"] == raw
+
+
+@pytest.mark.parametrize(
+    ("suffix", "language", "source", "expected"),
+    [
+        (".py", "python", "invoke(first, second, mode=True)\n", ["first", "second", "mode=True"]),
+        (".js", "javascript", "invoke(first, second, { mode: true });\n", ["first", "second", "{ mode: true }"]),
+        (".ts", "typescript", "invoke(first, second, { mode: true });\n", ["first", "second", "{ mode: true }"]),
+        (".go", "go", "package main\nfunc f() { invoke(first, second, mode) }\n", ["first", "second", "mode"]),
+    ],
+)
+def test_semantic_multi_capture_projection_uses_named_nodes(
+    tmp_path: Path, suffix: str, language: str, source: str, expected: list[str]
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / f"sample{suffix}").write_text(source, encoding="utf-8")
+    indexer = XRayIndexer(str(repo))
+
+    raw = indexer.search_pattern("invoke($$$ARGS)", language)
+    projected, warnings = indexer.project_semantic_captures(raw)
+    compact = compact_structural_items(projected, repo)
+
+    assert warnings == []
+    assert compact[0]["captures"]["ARGS"] == expected
+    assert any(value["text"] == "," for value in raw[0]["metaVariables"]["multi"]["ARGS"])
+
+
+def test_semantic_multi_capture_projection_warns_and_preserves_non_multi_values(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sample = repo / "sample.py"
+    sample.write_text("invoke(first)\n", encoding="utf-8")
+    raw = [
+        {
+            "file": str(sample),
+            "metaVariables": {
+                "single": {"ONE": {"text": "first"}},
+                "transformed": {"UPPER": {"text": "FIRST"}},
+                "multi": {"ARGS": [{"text": "first"}]},
+            },
+        }
+    ]
+
+    projected, warnings = XRayIndexer(str(repo)).project_semantic_captures(raw)
+    compact = compact_structural_items(projected, repo)
+
+    assert compact[0]["captures"] == {"ONE": "first", "UPPER": "FIRST"}
+    assert warnings == ["Omitted unverifiable multi-capture values for 'sample.py' because ranges were unavailable."]
+
+
+def test_cli_compact_semantic_captures_preserve_full_raw_evidence(tmp_path: Path, capsys) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "sample.py").write_text("invoke(first, second, mode=True)\n", encoding="utf-8")
+
+    assert cli.main(["search", str(repo), "-p", "invoke($$$ARGS)", "-l", "python"]) == 0
+    compact = json.loads(capsys.readouterr().out)
+    assert compact["matches"][0]["captures"]["ARGS"] == ["first", "second", "mode=True"]
+
+    assert cli.main(["search", str(repo), "-p", "invoke($$$ARGS)", "-l", "python", "--detail", "full"]) == 0
+    full = json.loads(capsys.readouterr().out)
+    assert [value["text"] for value in full["matches"][0]["metaVariables"]["multi"]["ARGS"]] == [
+        "first",
+        ",",
+        "second",
+        ",",
+        "mode=True",
+    ]
+
+
+def test_replacement_preview_projects_captures_but_apply_uses_native_postimage(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sample = repo / "sample.py"
+    sample.write_text("invoke(first, second, mode=True)\n", encoding="utf-8")
+    indexer = XRayIndexer(str(repo))
+
+    plan = indexer.plan_replacement(pattern="invoke($$$ARGS)", replacement="dispatch($$$ARGS)", lang="python")
+    assert plan["preview"][0]["captures"]["ARGS"] == ["first", "second", "mode=True"]
+
+    indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
+    assert sample.read_text(encoding="utf-8") == "dispatch(first, second, mode=True)\n"
 
 
 def test_rewrite_compact_omits_matches_and_invalid_paging_does_not_mutate(tmp_path: Path, capsys) -> None:
@@ -631,6 +715,7 @@ def test_replacement_diff_and_edit_ids_are_deterministic_and_refinable(tmp_path:
     first = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
     second = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
     assert first["diff"] == second["diff"]
+    assert first["root_fingerprint"] == second["root_fingerprint"]
     assert [edit["edit_id"] for file in first["files"] for edit in file["edits"]] == [
         edit["edit_id"] for file in second["files"] for edit in file["edits"]
     ]
@@ -638,10 +723,26 @@ def test_replacement_diff_and_edit_ids_are_deterministic_and_refinable(tmp_path:
     selected_id = first["files"][0]["edits"][0]["edit_id"]
     refined = indexer.refine_replacement(first, edit_ids=[selected_id])
     assert refined["candidate_count"] == 1
+    assert refined["root_fingerprint"] != first["root_fingerprint"]
+    assert refined["files"][0]["preimage_sha256"] == first["files"][0]["preimage_sha256"]
     assert refined["query"]["selected_edit_ids"] == [selected_id]
     assert [file["path"] for file in refined["files"]] == [first["files"][0]["path"]]
     result = indexer.apply_replacement(refined, expected_digest=refined["plan_digest"])
     assert result["changed_count"] == 1
+
+
+def test_replacement_root_fingerprint_changes_with_affected_source_preimage(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    sample = repo / "sample.py"
+    indexer = XRayIndexer(str(repo))
+    first = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
+
+    sample.write_text(sample.read_text(encoding="utf-8") + "# source drift\n", encoding="utf-8")
+    second = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
+
+    assert first["query"] == second["query"]
+    assert first["files"][0]["preimage_sha256"] != second["files"][0]["preimage_sha256"]
+    assert first["root_fingerprint"] != second["root_fingerprint"]
 
 
 def test_replacement_verify_recomputes_all_guards_without_writing(tmp_path: Path) -> None:
@@ -698,8 +799,32 @@ def test_replacement_zero_candidate_plan_is_not_applicable(tmp_path: Path) -> No
     assert plan["candidate_count"] == 0
     assert plan["applicable"] is False
     assert plan["applicability_reason"] == "no_candidates"
+    assert plan["next_actions"] == {
+        "revise_query": "Revise the pattern, language, paths, or globs and create a new plan."
+    }
     with pytest.raises(ValueError, match="no_candidates"):
         indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_keys"),
+    [
+        ("no_candidates", {"revise_query"}),
+        ("noop_not_allowed", {"review_noop", "replan"}),
+        ("truncated_review_not_acknowledged", {"complete_review", "acknowledge"}),
+        ("new_parse_errors", {"revise_replacement", "acknowledge"}),
+        ("dirty_affected_files_not_acknowledged", {"review_dirty_files", "acknowledge"}),
+    ],
+)
+def test_replacement_ineligible_next_actions_name_only_recovery_paths(reason: str, expected_keys: set[str]) -> None:
+    actions = XRayIndexer._replacement_next_actions(reason)
+    assert set(actions) == expected_keys
+    assert "verify" not in actions
+    assert "apply" not in actions
+
+
+def test_replacement_applicable_next_actions_retain_review_sequence() -> None:
+    assert set(XRayIndexer._replacement_next_actions(None)) == {"list_edit_ids", "refine", "verify", "apply"}
 
 
 def test_replacement_noop_is_truthful_and_requires_explicit_allowance(tmp_path: Path) -> None:
@@ -713,6 +838,8 @@ def test_replacement_noop_is_truthful_and_requires_explicit_allowance(tmp_path: 
     assert plan["changed_candidate_count"] == 0
     assert plan["no_op_count"] == 1
     assert plan["changed_file_count"] == 0
+    assert plan["applicability_reason"] == "noop_not_allowed"
+    assert set(plan["next_actions"]) == {"review_noop", "replan"}
     with pytest.raises(ValueError, match="no byte-changing edits"):
         indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
 
@@ -783,6 +910,38 @@ def test_replacement_apply_rolls_back_already_replaced_files(tmp_path: Path) -> 
     assert raised.value.rollback_succeeded is True
     assert raised.value.rollback_attempted is True
     assert {path: path.read_bytes() for path in originals} == originals
+
+
+def test_replacement_reports_attempted_failed_rollback(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    second = repo / "second.py"
+    second.write_text("def caller_two():\n    return old(2)\n", encoding="utf-8")
+    sample = repo / "sample.py"
+    indexer = XRayIndexer(str(repo))
+    plan = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
+    real_replace = os.replace
+    sample_writes = 0
+
+    def fail_apply_and_rollback(source: str | Path, destination: str | Path) -> None:
+        nonlocal sample_writes
+        target = Path(destination)
+        if target == sample:
+            sample_writes += 1
+            if sample_writes == 2:
+                raise OSError("injected rollback failure")
+        if target == second:
+            raise OSError("injected second-file failure")
+        real_replace(source, destination)
+
+    with patch("xray.core.indexer.os.replace", side_effect=fail_apply_and_rollback):
+        with pytest.raises(ReplacementApplyError) as raised:
+            indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
+
+    assert raised.value.rollback_attempted is True
+    assert raised.value.rollback_succeeded is False
+    assert raised.value.rollback_count == 0
+    assert "return new(1)" in sample.read_text(encoding="utf-8")
+    assert "return old(2)" in second.read_text(encoding="utf-8")
 
 
 def test_replacement_rechecks_source_after_staging_before_first_write(tmp_path: Path) -> None:

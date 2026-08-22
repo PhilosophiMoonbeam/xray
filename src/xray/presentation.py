@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_RESULT_LIMIT = 50
+SEMANTIC_CAPTURES_KEY = "_xray_semantic_captures"
 
 
 def _relative_path(value: Any, root_path: Path) -> str:
@@ -35,6 +36,9 @@ def _location(item: Mapping[str, Any]) -> tuple[int | None, int | None]:
 
 
 def _captures(item: Mapping[str, Any]) -> dict[str, Any]:
+    projected = item.get(SEMANTIC_CAPTURES_KEY)
+    if isinstance(projected, Mapping):
+        return {str(name): value for name, value in projected.items()}
     meta = item.get("metaVariables")
     if not isinstance(meta, Mapping):
         return {}

@@ -25,13 +25,15 @@ def test_project_metadata_is_cli_first_with_mcp_compatibility():
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     project = data["project"]
 
-    assert project["version"] == "0.11.2"
+    assert project["version"] == "0.11.3"
     assert "CLI" in project["description"]
     assert "MCP compatibility" in project["description"]
     assert "cli" in project["keywords"]
     assert "agents" in project["keywords"]
     assert project["scripts"]["xray"] == "xray.cli:main"
     assert project["scripts"]["xray-mcp"] == "xray.mcp_server:main"
+    assert "ast-grep-cli>=0.45.1,<0.46" in project["dependencies"]
+    assert "ast-grep-py>=0.45.1,<0.46" in project["dependencies"]
     assert "pydantic>=2.0,<3" in project["dependencies"]
     assert "pathspec>=0.12,<1" in project["dependencies"]
     assert "pyright>=1.1.407" in data["dependency-groups"]["dev"]
@@ -230,7 +232,8 @@ def test_readme_documents_current_installation_and_cli_contract():
 
     assert "https://github.com/PhilosophiMoonbeam/xray.git" in readme
     assert "`fastmcp>=3.4.7,<4`" in readme
-    assert "`ast-grep-cli>=0.44.1`" in readme
+    assert "`ast-grep-cli>=0.45.1,<0.46`" in readme
+    assert "`ast-grep-py>=0.45.1,<0.46`" in readme
     assert "`pathspec>=0.12,<1`" in readme
     assert "no separate installation is normally required" in normalized_readme
     assert "JSON symbols include `name`" in readme

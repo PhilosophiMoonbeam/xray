@@ -5,8 +5,8 @@ description: "Use XRAY to map, inspect, assess impact, search, validate rules, a
 
 # XRAY CLI
 
-Use installed `xray`; here use `uv run xray`. Pass `ROOT`. Compact v3 JSON is
-default; `--schema v2` only diagnoses the previous projection.
+Use installed `xray` (`uv run xray` here). Pass `ROOT`. Compact v3 is default;
+`--schema v2` diagnoses the prior projection.
 
 ## Discover code
 
@@ -39,7 +39,7 @@ xray interface ROOT --symbol-json "$symbol"
 `read-symbol` verifies current path/range/name/type/qualified identity and
 returns typed `symbol_mismatch` for stale or tampered handoffs.
 
-Impact returns classified name evidence, not a type-aware graph.
+Impact is name evidence, not a type-aware graph.
 
 ## Structural reads and rules
 
@@ -56,7 +56,7 @@ YAML is ast-grep rule/test input, never XRAY output. `rules` are read-only;
 `xray scan ROOT --rule rule.yml --fix` is legacy all-match mutation.
 `rules check` defaults to compact relative one-based citations; use
 `--detail full` for raw diagnostics. `rules explain` includes
-`inspection_lines` alongside raw inspection.
+`inspection_lines`. Compact multi-captures contain named nodes; full keeps raw separators.
 
 ## Page and change safely
 
@@ -73,14 +73,15 @@ xray replace verify ROOT --plan-file refined.json --expected-digest "$REVIEWED_D
 xray replace apply ROOT --plan-file refined.json --expected-digest "$REVIEWED_DIGEST"
 ```
 
-`xray.replace.v2` binds the review. Truncation, no-op, parse-error, and dirty-file
-exceptions require recorded flags. `verify` repeats apply guards without writes.
+`xray.replace.v2` binds the review. Follow `next_actions`; blocked plans omit
+verify/apply. Exceptions require recorded flags. `verify` repeats guards without writes.
 Apply rejects tampering/drift, stages postimages, preserves modes, verifies writes,
-and rolls back partial replacement. Inspect `rollback_attempted`; crashes cannot
-guarantee rollback.
+and rolls back partial replacement. Check `rollback_attempted` first;
+`rollback_succeeded` matters only after an attempt. Crashes can defeat rollback.
+`root_fingerprint` binds selection and preimages; refine may change it without drift.
 
 Legacy `rewrite` and `scan --fix` remain destructive. Their `--limit` limits
 reporting, not edits. Pass `-l/--lang` for pattern mutations when known.
 
-Paths stay inside `ROOT`. Errors are typed. Exit codes: `0` success, `1` command
+Paths stay inside `ROOT`. Exit codes: `0` success, `1` command
 failure, `2` validation failure. Text is lossy.

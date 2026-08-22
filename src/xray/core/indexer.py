@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
+from ast_grep_py import SgRoot
 from pathspec import GitIgnoreSpec
 from thefuzz import fuzz
 
@@ -112,6 +113,7 @@ DEFAULT_REPLACEMENT_DIFF_LIMIT = 100_000
 MAX_REPLACEMENT_SYNTAX_DIAGNOSTICS = 50
 MAX_REPLACEMENT_FILE_BYTES = 10 * 1024 * 1024
 MAX_REPLACEMENT_TOTAL_BYTES = 50 * 1024 * 1024
+SEMANTIC_CAPTURES_KEY = "_xray_semantic_captures"
 
 
 class ReplacementApplyError(RuntimeError):
@@ -601,6 +603,9 @@ class XRayIndexer:
 
     @staticmethod
     def _capture_values(match: Mapping[str, Any]) -> dict[str, Any]:
+        projected = match.get(SEMANTIC_CAPTURES_KEY)
+        if isinstance(projected, Mapping):
+            return {str(name): value for name, value in projected.items()}
         meta = match.get("metaVariables")
         if not isinstance(meta, Mapping):
             return {}
@@ -619,6 +624,140 @@ class XRayIndexer:
                     if texts:
                         captures[str(name)] = texts
         return captures
+
+    @staticmethod
+    def _capture_range(value: Any) -> tuple[int, int, int, int] | None:
+        if isinstance(value, Mapping):
+            range_data = value.get("range", value)
+            if not isinstance(range_data, Mapping):
+                return None
+            start = range_data.get("start")
+            end = range_data.get("end")
+            if not isinstance(start, Mapping) or not isinstance(end, Mapping):
+                return None
+            coordinates = (start.get("line"), start.get("column"), end.get("line"), end.get("column"))
+        else:
+            start = getattr(value, "start", None)
+            end = getattr(value, "end", None)
+            coordinates = (
+                getattr(start, "line", None),
+                getattr(start, "column", None),
+                getattr(end, "line", None),
+                getattr(end, "column", None),
+            )
+        if not all(isinstance(coordinate, int) for coordinate in coordinates):
+            return None
+        return cast(tuple[int, int, int, int], coordinates)
+
+    @staticmethod
+    def _non_multi_capture_values(match: Mapping[str, Any]) -> dict[str, Any]:
+        meta = match.get("metaVariables")
+        captures: dict[str, Any] = {}
+        if not isinstance(meta, Mapping):
+            return captures
+        for group in ("single", "transformed"):
+            values = meta.get(group)
+            if isinstance(values, Mapping):
+                for name, value in values.items():
+                    if isinstance(value, Mapping) and isinstance(value.get("text"), str):
+                        captures[str(name)] = value["text"]
+        return captures
+
+    @staticmethod
+    def _semantic_capture_language(match: Mapping[str, Any], path: Path) -> str | None:
+        language = match.get("language")
+        if isinstance(language, str) and language in set(LANGUAGE_MAP.values()):
+            return language
+        return LANGUAGE_MAP.get(path.suffix.casefold())
+
+    def project_semantic_captures(self, matches: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+        """Project multi-captures to verified named syntax nodes without changing raw evidence."""
+        projected = [dict(match) for match in matches]
+        by_path: dict[Path, list[dict[str, Any]]] = {}
+        warnings: list[str] = []
+        for match in projected:
+            meta = match.get("metaVariables")
+            multi = meta.get("multi") if isinstance(meta, Mapping) else None
+            if not isinstance(multi, Mapping) or not multi:
+                continue
+            file_value = match.get("file")
+            if not isinstance(file_value, str) or not file_value:
+                match[SEMANTIC_CAPTURES_KEY] = self._non_multi_capture_values(match)
+                warnings.append("Omitted unverifiable multi-captures because a result had no source path.")
+                continue
+            try:
+                path = self._resolve_repo_path(file_value, require_file=True)
+            except ValueError:
+                match[SEMANTIC_CAPTURES_KEY] = self._non_multi_capture_values(match)
+                warnings.append(
+                    f"Omitted unverifiable multi-captures for '{file_value}' because its source is unavailable."
+                )
+                continue
+            by_path.setdefault(path, []).append(match)
+
+        total_bytes = 0
+        for path in sorted(by_path, key=lambda value: value.as_posix()):
+            relative_path = path.relative_to(self.root_path).as_posix()
+            language = self._semantic_capture_language(by_path[path][0], path)
+            reason: str | None = None
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+                reason = "its source is unavailable"
+            if reason is None and language is None:
+                reason = "its language is unsupported"
+            elif reason is None and size > MAX_REPLACEMENT_FILE_BYTES:
+                reason = f"it exceeds {MAX_REPLACEMENT_FILE_BYTES} bytes"
+            elif reason is None and total_bytes + size > MAX_REPLACEMENT_TOTAL_BYTES:
+                reason = f"the projection exceeds {MAX_REPLACEMENT_TOTAL_BYTES} total bytes"
+
+            named_ranges: set[tuple[int, int, int, int]] = set()
+            if reason is None:
+                assert language is not None
+                try:
+                    source = path.read_text(encoding="utf-8")
+                    root = SgRoot(source, language).root()
+                    named_ranges = {
+                        capture_range
+                        for node in root.find_all(pattern="$A")
+                        if node.is_named()
+                        if (capture_range := self._capture_range(node.range())) is not None
+                    }
+                    total_bytes += size
+                except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+                    reason = f"the source could not be parsed ({type(exc).__name__})"
+
+            missing_ranges = False
+            for match in by_path[path]:
+                meta = match.get("metaVariables")
+                semantic = self._non_multi_capture_values(match)
+                if isinstance(meta, Mapping):
+                    multi = meta.get("multi")
+                    if reason is None and isinstance(multi, Mapping):
+                        for name, values in multi.items():
+                            if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+                                missing_ranges = missing_ranges or any(
+                                    isinstance(value, Mapping) and self._capture_range(value) is None
+                                    for value in values
+                                )
+                                texts = [
+                                    value["text"]
+                                    for value in values
+                                    if isinstance(value, Mapping)
+                                    and isinstance(value.get("text"), str)
+                                    and self._capture_range(value) in named_ranges
+                                ]
+                                if texts:
+                                    semantic[str(name)] = texts
+                match[SEMANTIC_CAPTURES_KEY] = semantic
+            if reason is not None:
+                warnings.append(f"Omitted unverifiable multi-captures for '{relative_path}' because {reason}.")
+            elif missing_ranges:
+                warnings.append(
+                    f"Omitted unverifiable multi-capture values for '{relative_path}' because ranges were unavailable."
+                )
+        return projected, list(dict.fromkeys(warnings))
 
     def _replacement_candidates(
         self,
@@ -970,6 +1109,38 @@ class XRayIndexer:
             )
         return "".join(chunks)
 
+    @staticmethod
+    def _replacement_next_actions(applicability_reason: str | None) -> dict[str, str]:
+        """Return only actions that can advance the current replacement-plan state."""
+        if applicability_reason == "no_candidates":
+            return {"revise_query": "Revise the pattern, language, paths, or globs and create a new plan."}
+        if applicability_reason == "noop_not_allowed":
+            return {
+                "review_noop": "Review why every candidate is unchanged.",
+                "replan": "Create a new plan with --allow-noop only when the no-op is intentional.",
+            }
+        if applicability_reason == "truncated_review_not_acknowledged":
+            return {
+                "complete_review": "Narrow the query or raise preview/diff limits until review is complete.",
+                "acknowledge": "Otherwise create a new plan with --allow-truncated-review after external review.",
+            }
+        if applicability_reason == "new_parse_errors":
+            return {
+                "revise_replacement": "Revise the replacement to remove new parse errors.",
+                "acknowledge": "Otherwise create a new plan with --allow-new-parse-errors after explicit review.",
+            }
+        if applicability_reason == "dirty_affected_files_not_acknowledged":
+            return {
+                "review_dirty_files": "Review the listed dirty_affected_paths before continuing.",
+                "acknowledge": "Create a new plan with --allow-dirty-affected only after preserving those edits.",
+            }
+        return {
+            "list_edit_ids": "jq -r '.edit_manifest[].edit_id' PLAN.json",
+            "refine": "Repeat --edit-id EDIT_ID for every selected edit.",
+            "verify": "Run xray replace verify with this complete plan and an independently copied digest.",
+            "apply": "Apply only after verify reports ready_to_apply=true and external approval is satisfied.",
+        }
+
     def _build_replacement_plan(
         self,
         *,
@@ -1010,6 +1181,7 @@ class XRayIndexer:
         )
         if max_matches is not None and len(matches) > max_matches:
             raise ValueError(f"Replacement has more than the allowed {max_matches} candidates.")
+        matches, capture_warnings = self.project_semantic_captures(matches)
         files, preview = self._prepare_replacement_files(matches)
         available_edit_ids = {str(edit["edit_id"]) for edit in preview}
         normalized_selection = sorted(set(selected_edit_ids or ()))
@@ -1079,7 +1251,7 @@ class XRayIndexer:
             }
             for edit in preview
         ]
-        warnings: list[str] = []
+        warnings = list(capture_warnings)
         if query["change"]["kind"] == "pattern" and not query["change"].get("language"):
             warnings.append("Language was inferred; review configuration and documentation matches before apply.")
         if dirty and not dirty_affected_paths:
@@ -1158,12 +1330,7 @@ class XRayIndexer:
             "applicable": applicable,
             "applicability_reason": applicability_reason,
             "warnings": warnings,
-            "next_actions": {
-                "list_edit_ids": "jq -r '.edit_manifest[].edit_id' PLAN.json",
-                "refine": "Repeat --edit-id EDIT_ID for every selected edit.",
-                "verify": "Run xray replace verify with this complete plan and an independently copied digest.",
-                "apply": "Apply only after verify reports ready_to_apply=true and external approval is satisfied.",
-            },
+            "next_actions": self._replacement_next_actions(applicability_reason),
         }
         plan["plan_digest"] = self._sha256(self._canonical_json(self._plan_digest_payload(plan)))
         return PreparedReplacement(plan=plan, files=files, matches=tuple(matches))
@@ -1736,6 +1903,17 @@ class XRayIndexer:
                 "mcp_legacy": ["v2"],
             },
             "replacement_plan_versions": [REPLACEMENT_PLAN_VERSION],
+            "replacement_semantics": {
+                "root_fingerprint_inputs": [
+                    "normalized_root",
+                    "git_commit_when_available",
+                    "query_including_selection",
+                    "affected_source_preimages",
+                ],
+                "selection_refinement_changes_root_fingerprint": True,
+                "rollback_interpretation_order": ["rollback_attempted", "rollback_succeeded", "rollback_count"],
+                "rollback_succeeded_requires_attempted": True,
+            },
             "paging": {
                 "continuable_min_limit": 1,
                 "adaptive_page_size": True,

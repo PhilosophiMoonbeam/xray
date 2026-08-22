@@ -67,6 +67,23 @@ def test_mcp_search_compacts_pages_and_preserves_full_detail(tmp_path: Path) -> 
     assert full["pattern"] == "old($A)"
 
 
+def test_mcp_search_projects_semantic_multi_captures(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    (repo / "sample.py").write_text("invoke(first, second, mode=True)\n", encoding="utf-8")
+
+    compact = success_value(mcp_server.search_pattern(str(repo), "invoke($$$ARGS)", "python"))
+    assert compact["matches"][0]["captures"]["ARGS"] == ["first", "second", "mode=True"]
+
+    full = success_value(mcp_server.search_pattern(str(repo), "invoke($$$ARGS)", "python", detail="full"))
+    assert [value["text"] for value in full["matches"][0]["metaVariables"]["multi"]["ARGS"]] == [
+        "first",
+        ",",
+        "second",
+        ",",
+        "mode=True",
+    ]
+
+
 def test_mcp_read_symbol_rejects_tampered_exact_identity_with_typed_error(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     found = XRayIndexer(str(repo)).find_symbol("old", min_score=100)[0]

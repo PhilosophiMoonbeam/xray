@@ -56,12 +56,14 @@ uvx --from . xray impact . --symbol-json "$symbol"
 ## Install
 
 XRAY requires Python 3.10 or later. Its direct runtime dependencies are
-`fastmcp>=3.4.7,<4`, `ast-grep-cli>=0.44.1`, `thefuzz>=0.20.0`, and
-`pydantic>=2,<3`, and `pathspec>=0.12,<1`.
+`fastmcp>=3.4.7,<4`, `ast-grep-cli>=0.45.1,<0.46`,
+`ast-grep-py>=0.45.1,<0.46`, `thefuzz>=0.20.0`, `pydantic>=2,<3`, and
+`pathspec>=0.12,<1`.
 
 XRAY requires the `ast-grep` executable. The installation commands below provide
-it automatically through `ast-grep-cli`; no separate installation is normally
-required.
+it automatically through `ast-grep-cli`; the aligned `ast-grep-py` runtime
+provides semantic compact-capture projection; no separate installation is
+normally required.
 
 ```bash
 # Install uv if needed
@@ -332,8 +334,12 @@ source, syntax, or dirty-state drift before writing. It prepares same-directory
 staged files, preserves file modes, verifies postimages, and restores already
 replaced files if a later replacement fails. Process termination cannot
 guarantee rollback, so use a recoverable worktree and inspect the final diff.
-Results retain `rollback_succeeded` and add `rollback_attempted` so a successful
-apply or a pre-write failure cannot be mistaken for a restoration attempt.
+Interpret rollback fields by checking `rollback_attempted` first;
+`rollback_succeeded` is meaningful only when an attempt occurred. A successful
+apply or pre-write failure therefore reports no restoration attempt.
+`root_fingerprint` binds the normalized root, Git commit when available, the
+complete query (including selected edit IDs), and affected source preimages.
+Selection-only refinement changes it even when source bytes do not drift.
 Use `--rule` instead of pattern/replacement to plan a fix-bearing
 ast-grep rule. `rewrite` remains available only as an explicit legacy all-match
 operation.
