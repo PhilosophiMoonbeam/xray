@@ -116,6 +116,13 @@ MAX_REPLACEMENT_TOTAL_BYTES = 50 * 1024 * 1024
 SEMANTIC_CAPTURES_KEY = "_xray_semantic_captures"
 
 
+def rollback_status(*, attempted: bool, succeeded: bool) -> str:
+    """Return the authoritative rollback state derived from legacy evidence."""
+    if not attempted:
+        return "not_attempted"
+    return "succeeded" if succeeded else "failed"
+
+
 class ReplacementApplyError(RuntimeError):
     """Raised when guarded replacement fails, with rollback evidence."""
 
@@ -131,6 +138,7 @@ class ReplacementApplyError(RuntimeError):
         self.rollback_count = rollback_count
         self.rollback_succeeded = rollback_succeeded
         self.rollback_attempted = rollback_attempted
+        self.rollback_status = rollback_status(attempted=rollback_attempted, succeeded=rollback_succeeded)
 
 
 class ReplacementDriftError(ReplacementApplyError):
@@ -290,6 +298,7 @@ class XRayIndexer:
         self.last_result_cap: int | None = None
         self.last_find_total = 0
         self.last_mutation_summary: dict[str, Any] | None = None
+        self.last_rule_selection: dict[str, Any] | None = None
         self._inventory_fingerprint: str | None = None
         self._inventory: list[dict[str, Any]] | None = None
         self._init_cache()
@@ -512,15 +521,35 @@ class XRayIndexer:
             result.append(value)
         return result
 
+    @staticmethod
+    def _contains_hidden_path(paths: Sequence[str]) -> bool:
+        """Return whether an explicit relative scope contains a hidden component."""
+        return any(part.startswith(".") for path in paths if path != "." for part in Path(path).parts)
+
+    @staticmethod
+    def _rule_selection(relative_paths: list[str], normalized_globs: list[str]) -> dict[str, Any]:
+        """Describe effective ast-grep rule input selection."""
+        return {
+            "paths": relative_paths,
+            "globs": normalized_globs,
+            "default_root": not relative_paths,
+            "ignore_policy": "ast_grep_defaults",
+            "explicit_hidden_paths": "included",
+        }
+
     def _append_operation_scope(
         self,
         args: list[str],
         paths: Sequence[str] | None,
         globs: Sequence[str] | None,
+        *,
+        include_explicit_hidden: bool = False,
     ) -> tuple[list[str], list[str]]:
         """Append filters and contained positional paths, returning stable identities."""
         resolved_paths, relative_paths = self._operation_scopes(paths)
         normalized_globs = self._validate_globs(globs)
+        if include_explicit_hidden and self._contains_hidden_path(relative_paths):
+            args.extend(["--no-ignore", "hidden"])
         for glob in normalized_globs:
             args.extend(["--globs", glob])
         args.extend(str(path) for path in (resolved_paths or [self.root_path]))
@@ -579,7 +608,7 @@ class XRayIndexer:
         paths: Sequence[str] | None = None,
         globs: Sequence[str] | None = None,
         max_results: int | None = None,
-    ) -> tuple[list[dict[str, Any]], str]:
+    ) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
         """Return rule matches and the normalized contained rule identity."""
         if max_results is not None and max_results < 1:
             raise ValueError("max_results must be 1 or greater.")
@@ -587,11 +616,15 @@ class XRayIndexer:
         args = ["scan", *rule_args, "--json=compact"]
         if max_results is not None:
             args.extend(["--max-results", str(max_results)])
-        self._append_operation_scope(args, paths, globs)
+        relative_paths, normalized_globs = self._append_operation_scope(
+            args, paths, globs, include_explicit_hidden=True
+        )
         matches = parse_json_array(run_ast_grep(args).stdout)
         self.last_result_total_exact = max_results is None or len(matches) < max_results
         self.last_result_cap = max_results
-        return matches, relative_rule
+        selection = self._rule_selection(relative_paths, normalized_globs)
+        self.last_rule_selection = selection
+        return matches, relative_rule, selection
 
     @staticmethod
     def _sha256(value: bytes) -> str:
@@ -802,6 +835,8 @@ class XRayIndexer:
             args = ["scan", *rule_args, "--json=compact"]
             if max_results is not None:
                 args.extend(["--max-results", str(max_results)])
+            if self._contains_hidden_path(relative_paths):
+                args.extend(["--no-ignore", "hidden"])
             for glob in normalized_globs:
                 args.extend(["--globs", glob])
             args.extend(str(path) for path in (resolved_paths or [self.root_path]))
@@ -1433,10 +1468,12 @@ class XRayIndexer:
                 staged_syntax, _signatures = self._syntax_snapshot(staged_bytes, language)
                 if staged_syntax != planned_syntax["postimage"]:
                     raise ReplacementApplyError(f"Staged syntax evidence drifted for '{item.relative_path}'.")
-        except Exception:
+        except Exception as exc:
             for temporary in staged.values():
                 temporary.unlink(missing_ok=True)
-            raise
+            if isinstance(exc, ReplacementApplyError):
+                raise
+            raise ReplacementApplyError(f"Replacement preparation failed: {exc}") from exc
 
         replaced: list[PreparedReplacementFile] = []
         try:
@@ -1488,6 +1525,7 @@ class XRayIndexer:
             "rollback_count": 0,
             "rollback_succeeded": True,
             "rollback_attempted": False,
+            "rollback_status": rollback_status(attempted=False, succeeded=True),
             "files": [
                 {
                     "path": item.relative_path,
@@ -1717,6 +1755,7 @@ class XRayIndexer:
             "rollback_count": applied["rollback_count"],
             "rollback_succeeded": applied["rollback_succeeded"],
             "rollback_attempted": applied["rollback_attempted"],
+            "rollback_status": applied["rollback_status"],
         }
 
     def scan_rules(
@@ -1730,13 +1769,16 @@ class XRayIndexer:
     ) -> list[dict[str, Any]]:
         """Run bounded rule diagnostics or legacy all-match staged fixes."""
         if not fix:
-            matches, _relative_rule = self._scan_rule_matches(
+            matches, _relative_rule, _selection = self._scan_rule_matches(
                 rule_path,
                 paths=paths,
                 globs=globs,
                 max_results=max_results,
             )
             return matches
+        _resolved_paths, relative_paths = self._operation_scopes(paths)
+        normalized_globs = self._validate_globs(globs)
+        self.last_rule_selection = self._rule_selection(relative_paths, normalized_globs)
         prepared = self._build_replacement_plan(
             rule_path=rule_path,
             paths=paths,
@@ -1758,7 +1800,9 @@ class XRayIndexer:
         max_results: int = 100,
     ) -> dict[str, Any]:
         """Validate and scan one contained ast-grep rule source without mutation."""
-        matches, relative_rule = self._scan_rule_matches(rule_path, paths=paths, globs=globs, max_results=max_results)
+        matches, relative_rule, selection = self._scan_rule_matches(
+            rule_path, paths=paths, globs=globs, max_results=max_results
+        )
         return {
             "rule_path": relative_rule,
             "valid": True,
@@ -1766,9 +1810,17 @@ class XRayIndexer:
             "returned": len(matches),
             "total_exact": self.last_result_total_exact,
             "truncated": not self.last_result_total_exact,
+            "selection": selection,
         }
 
-    def explain_rules(self, rule_path: str, *, source_limit: int = 32_000) -> dict[str, Any]:
+    def explain_rules(
+        self,
+        rule_path: str,
+        *,
+        source_limit: int = 32_000,
+        paths: Sequence[str] | None = None,
+        globs: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         """Return bounded source plus upstream validation and inspection evidence."""
         if source_limit < 1:
             raise ValueError("source_limit must be 1 or greater.")
@@ -1780,10 +1832,11 @@ class XRayIndexer:
                 path for path in (resolved / "sgconfig.yml", resolved / "sgconfig.yaml") if path.is_file()
             )
         source = source_path.read_text(encoding="utf-8")
-        result = run_ast_grep(
-            ["scan", *rule_args, "--inspect=summary", "--json=compact", "--max-results", "1", str(self.root_path)],
-            cwd=self.root_path,
+        args = ["scan", *rule_args, "--inspect=summary", "--json=compact", "--max-results", "1"]
+        relative_paths, normalized_globs = self._append_operation_scope(
+            args, paths, globs, include_explicit_hidden=True
         )
+        result = run_ast_grep(args, cwd=self.root_path)
         return {
             "rule_path": relative_rule,
             "valid": True,
@@ -1793,6 +1846,7 @@ class XRayIndexer:
             "source_truncated": len(source) > source_limit,
             "inspection": result.stderr.strip(),
             "inspection_lines": result.stderr.strip().splitlines(),
+            "selection": self._rule_selection(relative_paths, normalized_globs),
         }
 
     def test_rules(
@@ -1911,8 +1965,16 @@ class XRayIndexer:
                     "affected_source_preimages",
                 ],
                 "selection_refinement_changes_root_fingerprint": True,
-                "rollback_interpretation_order": ["rollback_attempted", "rollback_succeeded", "rollback_count"],
-                "rollback_succeeded_requires_attempted": True,
+                "rollback_status": {
+                    "primary": True,
+                    "values": ["not_attempted", "succeeded", "failed"],
+                    "legacy_fields": ["rollback_attempted", "rollback_succeeded", "rollback_count"],
+                },
+            },
+            "rule_selection": {
+                "default": "repository root with ast-grep ignore defaults",
+                "scopes": ["contained_paths", "ordered_globs"],
+                "explicit_hidden_paths": "included",
             },
             "paging": {
                 "continuable_min_limit": 1,
@@ -2613,6 +2675,9 @@ class XRayIndexer:
             symbols, warnings = self._python_interface(target_path)
         else:
             symbols, warnings = self._outline_interface(target_path)
+        warning_details: list[dict[str, Any]] = [
+            {"code": "source_incomplete", "message": warning} for warning in warnings
+        ]
         if exact_symbol is not None:
             target_name = str(exact_symbol.get("name") or "")
             owner_name = str(exact_symbol.get("owner") or "").split(".")[-1]
@@ -2620,15 +2685,15 @@ class XRayIndexer:
             if not target_name:
                 raise InterfaceReadError("invalid_symbol", "exact_symbol.name must be non-empty.")
 
-            def select_member(items: list[dict[str, Any]]) -> dict[str, Any] | None:
+            def select_member(items: list[dict[str, Any]], depth: int = 0) -> dict[str, Any] | None:
                 for item in items:
                     if str(item.get("name")) == target_name and (
                         not isinstance(target_line, int) or target_line < 1 or item.get("start_line") == target_line
                     ):
-                        return {**item, "members": []}
+                        return dict(item) if depth == 0 else {**item, "members": []}
                     members = item.get("members")
                     if isinstance(members, list):
-                        selected = select_member(members)
+                        selected = select_member(members, depth + 1)
                         if selected is not None:
                             return {**item, "members": [selected]}
                 return None
@@ -2659,11 +2724,14 @@ class XRayIndexer:
         if max_symbols is not None and len(symbols) > max_symbols:
             symbols = symbols[:max_symbols]
             complete = False
-            warnings.append(f"Interface symbols truncated at {max_symbols} of {total_symbols} top-level symbols.")
+            message = f"Interface symbols truncated at {max_symbols} of {total_symbols} top-level symbols."
+            warnings.append(message)
+            warning_details.append({"code": "symbol_truncated", "message": message})
 
-        def bound_members(items: list[dict[str, Any]], depth: int) -> None:
+        def bound_members(items: list[dict[str, Any]], depth: int, top_level: str | None = None) -> None:
             nonlocal complete
             for symbol in items:
+                current_top_level = top_level or str(symbol.get("name", ""))
                 members = symbol.get("members")
                 if not isinstance(members, list):
                     symbol["members"] = []
@@ -2671,17 +2739,33 @@ class XRayIndexer:
                 if member_depth is not None and depth >= member_depth:
                     if members:
                         complete = False
-                        warnings.append(f"Members for '{symbol.get('name', '')}' truncated at depth {member_depth}.")
+                        message = f"Members for '{symbol.get('name', '')}' truncated at depth {member_depth}."
+                        warnings.append(message)
+                        warning_details.append(
+                            {
+                                "code": "member_truncated",
+                                "message": message,
+                                "symbol": str(symbol.get("name", "")),
+                                "top_level": current_top_level,
+                            }
+                        )
                     symbol["members"] = []
                     continue
                 if max_members is not None and len(members) > max_members:
                     complete = False
-                    warnings.append(
-                        f"Members for '{symbol.get('name', '')}' truncated at {max_members} of {len(members)}."
+                    message = f"Members for '{symbol.get('name', '')}' truncated at {max_members} of {len(members)}."
+                    warnings.append(message)
+                    warning_details.append(
+                        {
+                            "code": "member_truncated",
+                            "message": message,
+                            "symbol": str(symbol.get("name", "")),
+                            "top_level": current_top_level,
+                        }
                     )
                     members = members[:max_members]
                     symbol["members"] = members
-                bound_members(members, depth + 1)
+                bound_members(members, depth + 1, current_top_level)
 
         bound_members(symbols, 0)
         return {
@@ -2693,6 +2777,7 @@ class XRayIndexer:
             "returned_symbols": len(symbols),
             "exact_symbol_selected": exact_symbol is not None,
             "warnings": warnings,
+            "warning_details": warning_details,
         }
 
     @staticmethod

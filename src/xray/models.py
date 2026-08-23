@@ -148,6 +148,15 @@ class InterfaceSymbol(PublicModel):
     members: list[InterfaceSymbol] = cast("list[InterfaceSymbol]", Field(default_factory=list))
 
 
+class InterfaceWarning(PublicModel):
+    """Typed interface warning retained until adapter page projection."""
+
+    code: str
+    message: str
+    symbol: str | None = None
+    top_level: str | None = None
+
+
 class InterfaceData(PublicModel):
     """Structured interface extraction result."""
 
@@ -156,6 +165,7 @@ class InterfaceData(PublicModel):
     symbols: list[InterfaceSymbol]
     complete: bool
     warnings: list[str] = Field(default_factory=list)
+    warning_details: list[InterfaceWarning] = cast("list[InterfaceWarning]", Field(default_factory=list))
 
 
 class ImpactReference(PublicModel):

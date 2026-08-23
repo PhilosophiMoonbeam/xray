@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from xray import mcp_server
+from xray.core.ast_grep import AstGrepCommandError, AstGrepValidationError
 from xray.core.indexer import XRayIndexer
 
 
@@ -317,6 +318,18 @@ def test_mcp_v3_exact_interface_and_named_impact_diagnostics(tmp_path: Path) -> 
     assert "returned_symbols" not in interface and interface["returned"] == 1
     assert interface["symbols"][0]["members"][0]["name"] == "second"
 
+    exact_class = {
+        **exact,
+        "name": "Service",
+        "owner": None,
+        "qualified_name": "Service",
+        "type": "class",
+        "start_line": 1,
+    }
+    container = success_value(mcp_server.read_interface_structured(str(repo), exact_symbol=exact_class, max_members=1))
+    assert [member["name"] for member in container["symbols"][0]["members"]] == ["first"]
+    assert container["completeness"] == {"complete": False, "reasons": ["member_truncated"]}
+
     result = {
         "references": [{"file": str(source), "line": 5, "text": "return 2", "type": "read"}],
         "total_count": 1,
@@ -336,3 +349,35 @@ def test_mcp_v3_exact_interface_and_named_impact_diagnostics(tmp_path: Path) -> 
 
     compatible_error = mcp_server.read_interface_structured(str(repo), exact_symbol=exact, schema="v2")
     assert error_value(compatible_error)["code"] == "invalid_request"
+
+
+def test_mcp_normalizes_ast_grep_validation_and_execution_failures(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    with patch.object(XRayIndexer, "search_pattern", side_effect=AstGrepValidationError("invalid pattern")):
+        assert error_value(mcp_server.search_pattern(str(repo), "bad"))["code"] == "invalid_request"
+    with patch.object(XRayIndexer, "search_pattern", side_effect=AstGrepCommandError("timeout")):
+        assert error_value(mcp_server.search_pattern(str(repo), "bad"))["code"] == "ast_grep_error"
+
+
+def test_mcp_interface_page_warnings_are_page_local(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    (repo / "sample.py").write_text(
+        "class Alpha:\n"
+        "    def one(self): pass\n"
+        "    def two(self): pass\n"
+        "class Beta:\n"
+        "    def one(self): pass\n"
+        "    def two(self): pass\n",
+        encoding="utf-8",
+    )
+    first = success_value(mcp_server.read_interface_structured(str(repo), "sample.py", max_members=1, limit=1))
+    assert any("Alpha" in warning for warning in first["warnings"])
+    assert all("Beta" not in warning for warning in first["warnings"])
+    assert first["global_warnings"]
+    second = success_value(
+        mcp_server.read_interface_structured(
+            str(repo), "sample.py", max_members=1, limit=1, cursor=first["next_cursor"]
+        )
+    )
+    assert any("Beta" in warning for warning in second["warnings"])
+    assert all("Alpha" not in warning for warning in second["warnings"])

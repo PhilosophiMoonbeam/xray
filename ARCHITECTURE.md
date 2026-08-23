@@ -34,9 +34,9 @@ skills, reports, tests, or harness. Presentation and public models may describe
 core values but do not perform repository analysis. Distribution and guidance
 wrap the adapters without becoming runtime dependencies of them.
 
-## XRAY 0.11.2 current contract
+## XRAY 0.11.4 current contract
 
-XRAY 0.11.2 preserves Python 3.10+, default compact `xray.cli.v3`, explicit
+XRAY 0.11.4 preserves Python 3.10+, default compact `xray.cli.v3`, explicit
 legacy v2 and full/v1 output, JSON and `jq` pipelines, stdio MCP, repository
 containment, snapshot-bound cursors, and direct legacy mutation. V3 standardizes
 success and paging fields; `--schema v2` exposes the previous projection only
@@ -45,7 +45,8 @@ for diagnosis and is not a compatibility commitment.
 V3 interface output uses only `returned`, `total`, `total_exact`, `truncated`,
 and `next_cursor` for paging. `completeness` contains a Boolean and typed reasons
 such as `member_truncated` and `page_truncated`. CLI symbol JSON/file input and
-MCP `exact_symbol` select only the found symbol's owner/member path. V3 compact
+MCP `exact_symbol` expand top-level containers with bounded members. Exact
+members select only their owner/member path without siblings. V3 compact
 impact retains page `total` and moves raw/filter/execution evidence under
 `diagnostics`; impact remains name-based rather than a semantic dependency graph.
 
@@ -70,10 +71,17 @@ acknowledgements are recorded before digest calculation. `replace verify` and
 MCP `verify_replacement` recompute digest, selection, source, syntax, dirtiness,
 and applicability without writes. Apply repeats these checks for staged and
 final postimages, preserves modes, and rolls back partial ordinary failures.
-Results distinguish whether rollback was attempted while retaining legacy count
-and success fields. Callers branch on `rollback_attempted` first and interpret
-`rollback_succeeded` only after an attempt. Process termination can interrupt
+Results use `rollback_status` with `not_attempted`, `succeeded`, and `failed` as
+the authoritative state while retaining derived legacy count and Boolean fields.
+Process termination can interrupt
 rollback; callers keep a recoverable worktree and inspect the resulting diff.
+
+ast-grep exit code 8 is a caller-validation failure at the subprocess boundary.
+CLI adapters return exit 2 and `invalid_request`; MCP returns the same category.
+Missing executables, timeouts, I/O, output bounds, and other execution failures
+remain operational errors. Rule check and explain report effective selection,
+use ast-grep ignore defaults for root scans, accept contained paths and ordered
+globs, and include explicitly selected hidden paths.
 
 Capabilities separate CLI and MCP operation names, defaults, maxima, schemas,
 resources, prompts, caches, and mutation classes. Optional disk cache files are
@@ -83,7 +91,7 @@ YAML remains only ast-grep rule/test input and is never XRAY product output.
 ## Historical frozen xray-s3b design
 
 This section preserves the implemented XRAY 0.10.0 contract as transformation
-evidence. XRAY 0.11.2 above supersedes it for current behavior.
+evidence. XRAY 0.11.4 above supersedes it for current behavior.
 
 ### Compatibility
 

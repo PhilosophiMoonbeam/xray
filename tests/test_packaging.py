@@ -25,7 +25,7 @@ def test_project_metadata_is_cli_first_with_mcp_compatibility():
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     project = data["project"]
 
-    assert project["version"] == "0.11.3"
+    assert project["version"] == "0.11.4"
     assert "CLI" in project["description"]
     assert "MCP compatibility" in project["description"]
     assert "cli" in project["keywords"]
@@ -169,6 +169,8 @@ def test_top_level_cli_skill_is_agent_skills_compliant():
     assert "page may use a different positive size" in body
     assert "inspection_lines" in body
     assert "rollback_attempted" in body
+    assert "rollback_status" in body
+    assert "explicitly selected hidden path" in body
     assert len(content.split()) <= 500
     assert len(content.encode()) <= 3600
 

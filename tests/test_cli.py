@@ -13,7 +13,12 @@ import pytest
 import tomllib
 
 from xray import cli, mcp_server
-from xray.core.ast_grep import AstGrepCommandError, AstGrepNotFoundError, AstGrepResult, BoundedAstGrepResult
+from xray.core.ast_grep import (
+    AstGrepCommandError,
+    AstGrepNotFoundError,
+    AstGrepResult,
+    BoundedAstGrepResult,
+)
 from xray.core.indexer import InterfaceReadError, XRayIndexer
 
 
@@ -1655,7 +1660,7 @@ def test_cli_version_returns_without_system_exit(capsys):
     exit_code = cli.main(["--version"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out.strip() == "xray 0.11.3"
+    assert capsys.readouterr().out.strip() == "xray 0.11.4"
 
 
 def test_cli_help_is_current_safe_and_token_bounded(capsys):
@@ -1701,7 +1706,7 @@ def test_cli_help_is_current_safe_and_token_bounded(capsys):
     assert "YAML output is unsupported" in root
     assert "replace apply, rewrite, and scan --fix mutate files" in root
     assert "--limit never bounds legacy edits" in root
-    assert "Exit codes: 0 success, 1 command failure, 2 parse or validation error" in root
+    assert "Exit codes: 0 success, 1 operational failure, 2 parse or validation error" in root
     assert "Install the bundled xray-cli agent skill." in root
 
     explore = normalized["explore"]
@@ -1976,6 +1981,60 @@ def test_structured_python_interface_preserves_hierarchy_docs_and_signatures(tmp
     assert member["documentation"] == "Fetch one value."
     assert "secret_implementation" not in rendered
     assert "    def fetch" in rendered
+
+
+@pytest.mark.parametrize(("suffix", "language"), [(".js", "javascript"), (".ts", "typescript"), (".go", "go")])
+def test_exact_non_python_container_preserves_bounded_members(tmp_path, suffix, language):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = repo / f"service{suffix}"
+    source.write_text("placeholder\n", encoding="utf-8")
+    symbols = [
+        {
+            "name": "Service",
+            "type": "class",
+            "signature": "Service",
+            "start_line": 1,
+            "end_line": 3,
+            "visibility": "public",
+            "role": "item",
+            "documentation": None,
+            "members": [
+                {
+                    "name": "first",
+                    "type": "method",
+                    "signature": "first",
+                    "start_line": 2,
+                    "end_line": 2,
+                    "visibility": "public",
+                    "role": "member",
+                    "documentation": None,
+                    "members": [],
+                },
+                {
+                    "name": "second",
+                    "type": "method",
+                    "signature": "second",
+                    "start_line": 3,
+                    "end_line": 3,
+                    "visibility": "public",
+                    "role": "member",
+                    "documentation": None,
+                    "members": [],
+                },
+            ],
+        }
+    ]
+    indexer = XRayIndexer(str(repo))
+    with patch.object(indexer, "_outline_interface", return_value=(symbols, [])):
+        result = indexer.read_interface_structured(
+            source.name,
+            exact_symbol={"name": "Service", "path": source.name, "start_line": 1},
+            max_members=1,
+        )
+    assert result["language"] == language
+    assert [member["name"] for member in result["symbols"][0]["members"]] == ["first"]
+    assert result["complete"] is False
 
 
 def test_structured_interface_surfaces_typed_errors_and_incompleteness(tmp_path):
@@ -2335,8 +2394,16 @@ def test_rule_explain_and_capabilities_are_read_only_and_bounded(tmp_path):
             "affected_source_preimages",
         ],
         "selection_refinement_changes_root_fingerprint": True,
-        "rollback_interpretation_order": ["rollback_attempted", "rollback_succeeded", "rollback_count"],
-        "rollback_succeeded_requires_attempted": True,
+        "rollback_status": {
+            "primary": True,
+            "values": ["not_attempted", "succeeded", "failed"],
+            "legacy_fields": ["rollback_attempted", "rollback_succeeded", "rollback_count"],
+        },
+    }
+    assert capabilities["rule_selection"] == {
+        "default": "repository root with ast-grep ignore defaults",
+        "scopes": ["contained_paths", "ordered_globs"],
+        "explicit_hidden_paths": "included",
     }
     assert capabilities["paging"] == {
         "continuable_min_limit": 1,
@@ -2503,6 +2570,29 @@ def test_compact_v3_defaults_and_explicit_v2_legacy_projection(tmp_path, capsys)
     assert [item["name"] for item in interface["symbols"]] == ["Service"]
     assert [item["name"] for item in interface["symbols"][0]["members"]] == ["second"]
 
+    exact_class = {
+        "name": "Service",
+        "qualified_name": "Service",
+        "type": "class",
+        "path": "service.py",
+        "start_line": 1,
+        "end_line": 5,
+    }
+    assert cli.main(["interface", str(repo), "--symbol-json", json.dumps(exact_class), "--max-members", "1"]) == 0
+    selected_class = json.loads(capsys.readouterr().out)["interface"]
+    assert [member["name"] for member in selected_class["symbols"][0]["members"]] == ["first"]
+    assert selected_class["completeness"] == {"complete": False, "reasons": ["member_truncated"]}
+
+    assert cli.main(["interface", str(repo), "--symbol-json", json.dumps(exact), "--detail", "full"]) == 2
+    assert "--detail full" in json.loads(capsys.readouterr().err)["error"]
+    assert cli.main(["interface", str(repo), "--symbol-json", json.dumps(exact), "--schema", "v2"]) == 2
+    assert "--schema v2" in json.loads(capsys.readouterr().err)["error"]["message"]
+    assert (
+        cli.main(["interface", str(repo), "--symbol-json", json.dumps(exact), "--detail", "full", "--schema", "v2"])
+        == 2
+    )
+    assert "--detail full" in json.loads(capsys.readouterr().err)["error"]
+
     impact_result = {
         "references": [
             {
@@ -2612,6 +2702,92 @@ def test_cli_rules_and_replacement_refinement_are_non_mutating(tmp_path, capsys)
     assert refined["command"] == "replace.refine"
     assert refined["plan"]["query"]["selected_edit_ids"] == [edit_id]
     assert (repo / "src" / "sample.py").read_bytes() == original
+
+
+def test_cli_ast_grep_validation_failures_use_exit_two_for_all_projections(tmp_path, capsys):
+    repo = write_sample_repo(tmp_path)
+    invalid_rule = repo / "not-a-rule.txt"
+    invalid_rule.write_text("not an ast-grep rule\n", encoding="utf-8")
+
+    for extra in ([], ["--schema", "v2"], ["--format", "text"]):
+        assert (
+            cli.main(
+                [
+                    "search",
+                    str(repo),
+                    "--pattern",
+                    "except Exception: pass",
+                    "--lang",
+                    "python",
+                    *extra,
+                ]
+            )
+            == 2
+        )
+        assert "Cannot parse query" in capsys.readouterr().err
+
+    for command in ("check", "explain"):
+        assert cli.main(["rules", command, str(repo), "--rule", invalid_rule.name]) == 2
+        error = json.loads(capsys.readouterr().err)
+        assert error["error"]["code"] == "invalid_request"
+
+
+def test_interface_page_warnings_are_local_with_global_off_page_signal(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "service.py").write_text(
+        "class Alpha:\n"
+        "    def one(self): pass\n"
+        "    def two(self): pass\n"
+        "class Beta:\n"
+        "    def one(self): pass\n"
+        "    def two(self): pass\n",
+        encoding="utf-8",
+    )
+    base = ["interface", str(repo), "service.py", "--limit", "1", "--max-members", "1"]
+    assert cli.main(base) == 0
+    first = json.loads(capsys.readouterr().out)["interface"]
+    assert any("Alpha" in warning for warning in first["warnings"])
+    assert all("Beta" not in warning for warning in first["warnings"])
+    assert first["global_warnings"] == ["Additional symbols have bounded members on other pages."]
+
+    assert cli.main([*base, "--cursor", first["next_cursor"]]) == 0
+    second = json.loads(capsys.readouterr().out)["interface"]
+    assert any("Beta" in warning for warning in second["warnings"])
+    assert all("Alpha" not in warning for warning in second["warnings"])
+    assert second["global_warnings"] == ["Additional symbols have bounded members on other pages."]
+
+
+@pytest.mark.parametrize("initialize_git", [False, True])
+def test_rule_selection_exposes_defaults_and_includes_explicit_hidden_paths(tmp_path, capsys, initialize_git):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    if initialize_git:
+        subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+    hidden = repo / ".fixtures"
+    hidden.mkdir()
+    (hidden / "sample.py").write_text("old(1)\n", encoding="utf-8")
+    (repo / "rule.yml").write_text(
+        "id: no-old\nlanguage: Python\nrule:\n  pattern: old($A)\nseverity: warning\n",
+        encoding="utf-8",
+    )
+
+    assert cli.main(["rules", "check", str(repo), "--rule", "rule.yml"]) == 0
+    default = json.loads(capsys.readouterr().out)["result"]
+    assert default["matches"] == []
+    assert default["selection"]["default_root"] is True
+    assert default["selection"]["ignore_policy"] == "ast_grep_defaults"
+
+    scoped = ["rules", "check", str(repo), "--rule", "rule.yml", "--path", ".fixtures"]
+    assert cli.main(scoped) == 0
+    selected = json.loads(capsys.readouterr().out)["result"]
+    assert selected["matches"][0]["path"] == ".fixtures/sample.py"
+    assert selected["selection"]["paths"] == [".fixtures"]
+    assert selected["selection"]["explicit_hidden_paths"] == "included"
+
+    assert cli.main(["rules", "explain", str(repo), "--rule", "rule.yml", "--path", ".fixtures"]) == 0
+    explained = json.loads(capsys.readouterr().out)["result"]
+    assert explained["selection"]["paths"] == [".fixtures"]
 
 
 @pytest.mark.parametrize("with_git_directory", [False, True])

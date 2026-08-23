@@ -249,8 +249,8 @@ Other same-name definitions are classified rather than described as dependents.
 xray search ROOT -p 'old_api($ARG)' [-l python]
 xray rewrite ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' -l python
 xray scan ROOT --rule sgconfig.yml [--fix]
-xray rules check ROOT --rule rule.yml
-xray rules explain ROOT --rule rule.yml
+xray rules check ROOT --rule rule.yml [--path src] [--glob '*.py']
+xray rules explain ROOT --rule rule.yml [--path src] [--glob '*.py']
 xray rules test ROOT --test-dir rule-tests [--config sgconfig.yml]
 xray imports ROOT src/package/module.py
 xray exports ROOT src/package/module.py
@@ -287,7 +287,10 @@ The `rules check`, `rules explain`, and `rules test` family is read-only.
 Check returns compact relative-path, one-based citations by default and supports
 paging; `--detail full` retains raw ast-grep diagnostics. Explain returns bounded
 rule source, validation evidence, raw `inspection`, and lossless
-`inspection_lines` without parsing YAML into an XRAY format. Test disables
+`inspection_lines` without parsing YAML into an XRAY format. Check and explain
+report their effective selection. Without scopes they scan the root with
+ast-grep's ignore defaults; repeatable contained paths and ordered globs narrow
+selection, and an explicitly selected hidden path is included. Test disables
 snapshot updates, color, and interactive review. Legacy CLI `scan --fix` remains
 the explicit all-match rule mutation path.
 
@@ -334,9 +337,10 @@ source, syntax, or dirty-state drift before writing. It prepares same-directory
 staged files, preserves file modes, verifies postimages, and restores already
 replaced files if a later replacement fails. Process termination cannot
 guarantee rollback, so use a recoverable worktree and inspect the final diff.
-Interpret rollback fields by checking `rollback_attempted` first;
-`rollback_succeeded` is meaningful only when an attempt occurred. A successful
-apply or pre-write failure therefore reports no restoration attempt.
+Use `rollback_status` as the authoritative state: `not_attempted`, `succeeded`,
+or `failed`. The legacy `rollback_attempted`, `rollback_succeeded`, and
+`rollback_count` fields remain derived compatibility evidence. A successful
+apply or pre-write failure reports `not_attempted`.
 `root_fingerprint` binds the normalized root, Git commit when available, the
 complete query (including selected edit IDs), and affected source preimages.
 Selection-only refinement changes it even when source bytes do not drift.
@@ -353,8 +357,10 @@ the previous compact projection for diagnosis; it is not a compatibility
 commitment. `--detail full` preserves v1 where supported. JSON is one line
 unless `--pretty` is requested; text is lossy.
 
-Exit codes are `0` for success, `1` for command failure, and `2` for parse or
-validation errors.
+Exit codes are `0` for success, `1` for operational command failure, and `2`
+for parse or validation errors. Invalid ast-grep patterns, rules, and test
+configuration use exit `2`; missing executables, timeouts, I/O, and output-bound
+failures use exit `1`.
 
 Command-specific fields:
 
@@ -436,7 +442,8 @@ The transformed MCP surface exposes compact metadata and tags for:
 - `find_symbol`: calibrated name/qualified-identity filters, scores, and paging.
 - `read_interface`: read a text file interface without implementation bodies.
 - `read_interface_structured`: bounded/filterable typed hierarchy with paging;
-  default v3 `exact_symbol` returns only the selected owner/member path.
+  default v3 expands an exact container with bounded members and isolates an
+  exact member to its owner path without siblings.
 - `read_symbol` and `symbol_at`: bounded exact source and line-to-symbol lookup.
 - `search_pattern`: compact structural matches, bounded to 50 by default, with `returned`, `total`, `truncated`, and snapshot-bound `next_cursor` continuation. Set `detail: "full"` for raw ast-grep matches.
 - `rewrite_pattern`: in-place replacement with a compact count/path summary by default. Full detail is bounded but never advertises continuation after mutation.

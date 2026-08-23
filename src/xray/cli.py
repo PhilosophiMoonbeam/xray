@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from xray import __version__
-from xray.core.ast_grep import AstGrepError
+from xray.core.ast_grep import AstGrepError, AstGrepValidationError
 from xray.core.indexer import InterfaceReadError, ReplacementApplyError, ReplacementDriftError, XRayIndexer
 from xray.models import (
     dump_error_envelope,
@@ -67,8 +67,8 @@ Continuable pages require a positive limit and report total_exact. next_cursor
 binds the query, projection, and snapshot but permits a different positive page
 size. YAML output is unsupported. replace apply, rewrite, and
 scan --fix mutate files; --limit never bounds legacy edits. Exit codes: 0 success,
-1 command failure, 2 parse or validation error. On apply results, inspect
-rollback_attempted before rollback_succeeded.
+1 operational failure, 2 parse or validation error. Invalid ast-grep input is
+validation. On apply results, inspect rollback_status first.
 """
 
 EXPLORE_HELP = """\
@@ -101,6 +101,7 @@ Exact handoff: xray interface ROOT --symbol-json "$symbol"
 
 FILE_PATH must resolve inside ROOT; parent traversal and symlink escapes fail.
 Compact v3 accepts an exact find symbol and reports typed completeness reasons.
+Exact containers return bounded members; exact members return one owner path without siblings.
 --detail full returns the legacy v1 string envelope.
 """
 
@@ -447,6 +448,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rules_explain.add_argument("root_path")
     rules_explain.add_argument("--rule", required=True)
+    add_scope_args(rules_explain)
     rules_explain.add_argument("--source-limit", type=int, default=32_000)
     rules_explain.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
     rules_explain.set_defaults(handler=handle_rules_explain, format="json")
@@ -791,8 +793,16 @@ def handle_interface(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
     exact_symbol = load_interface_symbol(args, indexer.root_path)
     if exact_symbol is not None:
-        if args.detail == "full" or args.schema != "v3":
-            raise ValueError("Exact-symbol interface selection is unavailable with --schema v2.")
+        if args.detail == "full":
+            raise ValueError(
+                "Exact-symbol interface selection is unavailable in the full/v1 projection selected by "
+                "--detail full; use compact v3 or select a file."
+            )
+        if args.schema != "v3":
+            raise ValueError(
+                "Exact-symbol interface selection is unavailable in compact v2 selected by --schema v2; "
+                "use compact v3 or select a file."
+            )
         file_path = str(exact_symbol["path"])
     elif args.file_path:
         file_path = args.file_path
@@ -868,6 +878,8 @@ def handle_interface(args: argparse.Namespace) -> int:
     rendered = indexer.render_interface(structured)
     if args.schema == "v3":
         structured = compact_v3_interface(structured)
+    else:
+        structured.pop("warning_details", None)
     if args.format == "text":
         print(rendered)
     else:
@@ -1232,7 +1244,14 @@ def handle_scan(args: argparse.Namespace) -> int:
             print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
         return 0
     if args.detail == "compact":
-        payload = _compact_envelope("scan", args=args, matches=page, fixed=args.fix, **metadata)
+        payload = _compact_envelope(
+            "scan",
+            args=args,
+            matches=page,
+            fixed=args.fix,
+            selection=indexer.last_rule_selection,
+            **metadata,
+        )
         if mutation_summary is not None:
             payload["mutation"] = mutation_summary
         print_json(payload, pretty=args.pretty)
@@ -1245,6 +1264,7 @@ def handle_scan(args: argparse.Namespace) -> int:
             fixed=args.fix,
             matches=page,
             mutation=mutation_summary,
+            selection=indexer.last_rule_selection,
             **metadata,
         ),
         pretty=args.pretty,
@@ -1288,7 +1308,12 @@ def handle_rules_check(args: argparse.Namespace) -> int:
 
 def handle_rules_explain(args: argparse.Namespace) -> int:
     indexer = XRayIndexer(normalize_path(args.root_path))
-    result = indexer.explain_rules(args.rule, source_limit=args.source_limit)
+    result = indexer.explain_rules(
+        args.rule,
+        source_limit=args.source_limit,
+        paths=args.paths,
+        globs=args.globs,
+    )
     print_json(_compact_envelope("rules.explain", root_path=str(indexer.root_path), result=result), pretty=args.pretty)
     return 0
 
@@ -1792,6 +1817,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except InterfaceReadError as exc:
         print_error(str(exc), args, code=exc.code)
         return 1
+    except AstGrepValidationError as exc:
+        print_error(str(exc), args, code="invalid_request")
+        return 2
     except AstGrepError as exc:
         print_error(str(exc), args, code="ast_grep_error")
         return 1
@@ -1807,6 +1835,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "rollback_attempted": exc.rollback_attempted,
                 "rollback_count": exc.rollback_count,
                 "rollback_succeeded": exc.rollback_succeeded,
+                "rollback_status": exc.rollback_status,
             },
         )
         return 1

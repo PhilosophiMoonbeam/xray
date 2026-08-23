@@ -18,6 +18,7 @@ from fastmcp.server.transforms.search.base import BaseSearchTransform
 from fastmcp.tools import Tool, ToolResult
 from fastmcp.tools.tool_transform import ArgTransformConfig, ToolTransformConfig
 
+from xray.core.ast_grep import AstGrepError, AstGrepValidationError
 from xray.core.indexer import InterfaceReadError, ReplacementApplyError, ReplacementDriftError, XRayIndexer
 from xray.models import (
     dump_explore_data,
@@ -80,7 +81,8 @@ Use XRAY as map -> find -> interface -> impact:
    Keep the returned symbol object, including path and line data.
 3. Inspect source contracts with `read_interface_structured` when typed hierarchy,
    documentation, and completeness matter. `read_interface` preserves the legacy text projection.
-   Pass the complete find symbol as `exact_symbol` to return only its owner/member path.
+   Pass the complete find symbol as `exact_symbol`. Containers expand bounded
+   members; members return only their owner path without siblings.
    Python uses enriched standard-library AST data; other supported languages expose ast-grep completeness warnings.
 4. Check likely symbol-name code references with `what_breaks`.
    Pass the entire symbol object from `find_symbol`.
@@ -97,7 +99,7 @@ For replacement, call read-only `plan_replacement`, review every edit in `edit_m
 dirty-file acknowledgement, warning, hash, diff, and `plan_digest`, then call `verify_replacement`.
 Only then pass the complete plan plus an independently copied digest to destructive `apply_replacement`.
 Apply revalidates syntax and source state before writing and rolls back partial application.
-On results, branch on `rollback_attempted` before interpreting `rollback_succeeded`.
+On results, use `rollback_status`: `not_attempted`, `succeeded`, or `failed`.
 The plan `root_fingerprint` binds query/selection and affected preimages, so refinement may change it without drift.
 Pass `lang` whenever known for pattern plans and rewrites. Keep `rewrite_pattern` only for explicit
 legacy all-match mutation.
@@ -447,7 +449,7 @@ def xray_discovery_plan(goal: str = "understand a code change") -> str:
         "Use XRAY progressively:\n"
         "1. Call explore_repo; use compact entries for file selection and request detail='full' only for tree_text.\n"
         "2. Call find_symbol with the most relevant symbol name or owner-qualified identity.\n"
-        "3. Call read_interface_structured with exact_symbol for its owner/member path, "
+        "3. Call read_interface_structured with exact_symbol to expand a container or isolate a member path, "
         "or read_interface for legacy text.\n"
         "4. Call what_breaks with the full symbol object before changing public code; "
         "treat results as name-based references, not a type-aware dependency graph.\n\n"
@@ -854,7 +856,7 @@ def read_interface_structured(
     root_path: str,
     file_path: Annotated[str | None, "Contained source file; omit when exact_symbol supplies its path"] = None,
     exact_symbol: Annotated[
-        dict[str, Any] | None, "Exact find_symbol object; selects only its owner/member path"
+        dict[str, Any] | None, "Exact find_symbol object; expands containers or selects only one member path"
     ] = None,
     symbol_names: list[str] | None = None,
     visibility: list[str] | None = None,
@@ -865,7 +867,7 @@ def read_interface_structured(
     cursor: str | None = None,
     schema: Annotated[str, "Response projection: compact v3 default or explicit legacy v2"] = "v3",
 ) -> dict[str, Any] | ToolResult:
-    """Return a typed interface; v3 exact_symbol selects only its owner/member path."""
+    """Return a typed interface; v3 expands exact containers and isolates exact members."""
     try:
         _validate_schema(schema)
         selected_symbol = validate_symbol_input(exact_symbol) if exact_symbol is not None else None
@@ -917,7 +919,10 @@ def read_interface_structured(
         if metadata["truncated"]:
             result["complete"] = False
             result["warnings"].append("Top-level interface symbols are paged; continue with next_cursor.")
-        return compact_v3_interface(result) if schema == "v3" else result
+        if schema == "v3":
+            return compact_v3_interface(result)
+        result.pop("warning_details", None)
+        return result
     except InterfaceReadError as exc:
         return mcp_error(exc.code, str(exc))
     except Exception as exc:
@@ -1017,6 +1022,10 @@ def what_breaks(
         )
         presented = dump_impact_result({**result, "references": page, **metadata})
         return compact_v3_impact(presented) if schema == "v3" and detail == "compact" else presented
+    except AstGrepValidationError as exc:
+        return mcp_error("invalid_request", str(exc))
+    except AstGrepError as exc:
+        return mcp_error("ast_grep_error", str(exc))
     except Exception as e:
         return mcp_error("invalid_request", str(e))
 
@@ -1070,6 +1079,10 @@ def search_pattern(
         if detail == "full":
             result.update({"match_count": len(matches), "pattern": pattern, "language": lang})
         return result
+    except AstGrepValidationError as exc:
+        return mcp_error("invalid_request", str(exc))
+    except AstGrepError as exc:
+        return mcp_error("ast_grep_error", str(exc))
     except Exception as e:
         return mcp_error("invalid_request", str(e))
 
@@ -1106,6 +1119,10 @@ def rewrite_pattern(
             )
             summary.update({"matches": page, **metadata})
         return summary
+    except AstGrepValidationError as exc:
+        return mcp_error("invalid_request", str(exc))
+    except AstGrepError as exc:
+        return mcp_error("ast_grep_error", str(exc))
     except Exception as e:
         return mcp_error("rewrite_failed", str(e))
 
@@ -1149,6 +1166,10 @@ def plan_replacement(
                 diff_limit=diff_limit,
             ),
         )
+    except AstGrepValidationError as exc:
+        return mcp_error("invalid_request", str(exc))
+    except AstGrepError as exc:
+        return mcp_error("ast_grep_error", str(exc))
     except Exception as exc:
         return mcp_error("invalid_request", str(exc))
 
@@ -1197,6 +1218,7 @@ def apply_replacement(root_path: str, plan: dict[str, Any], expected_digest: str
                 "rollback_attempted": exc.rollback_attempted,
                 "rollback_count": exc.rollback_count,
                 "rollback_succeeded": exc.rollback_succeeded,
+                "rollback_status": exc.rollback_status,
             },
         )
     except Exception as exc:
@@ -1218,7 +1240,7 @@ def scan_rules(
         _validate_detail(detail)
         identity = {"rule_path": rule_path, "paths": paths or [], "globs": globs or [], "projection": detail}
         normalized, parsed_limit, identity, offset = _prepare_page(root_path, "scan", identity, limit, cursor)
-        matches, total_exact = run_indexer_operation(
+        matches, total_exact, selection = run_indexer_operation(
             normalized,
             lambda indexer: (
                 indexer.scan_rules(
@@ -1229,6 +1251,7 @@ def scan_rules(
                     max_results=offset + parsed_limit + 1,
                 ),
                 indexer.last_result_total_exact,
+                indexer.last_rule_selection,
             ),
         )
         page, metadata = _present_items(
@@ -1242,10 +1265,14 @@ def scan_rules(
             continuable=True,
             total_exact=total_exact,
         )
-        result = {"matches": page, **metadata}
+        result = {"matches": page, "selection": selection, **metadata}
         if detail == "full":
             result["match_count"] = len(matches)
         return result
+    except AstGrepValidationError as exc:
+        return mcp_error("invalid_request", str(exc))
+    except AstGrepError as exc:
+        return mcp_error("ast_grep_error", str(exc))
     except Exception as e:
         return mcp_error("invalid_request", str(e))
 
@@ -1271,6 +1298,7 @@ def apply_rule_fixes(root_path: str, plan: dict[str, Any], expected_digest: str)
                 "rollback_attempted": exc.rollback_attempted,
                 "rollback_count": exc.rollback_count,
                 "rollback_succeeded": exc.rollback_succeeded,
+                "rollback_status": exc.rollback_status,
             },
         )
     except Exception as exc:
@@ -1310,18 +1338,32 @@ def check_rules(
         )
         result.update({"matches": matches, **metadata})
         return result
+    except AstGrepValidationError as exc:
+        return mcp_error("invalid_request", str(exc))
+    except AstGrepError as exc:
+        return mcp_error("ast_grep_error", str(exc))
     except Exception as exc:
         return mcp_error("invalid_rule", str(exc))
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
-def explain_rules(root_path: str, rule_path: str, source_limit: int = 32_000) -> dict[str, Any] | ToolResult:
+def explain_rules(
+    root_path: str,
+    rule_path: str,
+    source_limit: int = 32_000,
+    paths: list[str] | None = None,
+    globs: list[str] | None = None,
+) -> dict[str, Any] | ToolResult:
     """Return bounded rule source plus upstream validation and inspection evidence."""
     try:
         return run_indexer_operation(
             root_path,
-            lambda indexer: indexer.explain_rules(rule_path, source_limit=source_limit),
+            lambda indexer: indexer.explain_rules(rule_path, source_limit=source_limit, paths=paths, globs=globs),
         )
+    except AstGrepValidationError as exc:
+        return mcp_error("invalid_request", str(exc))
+    except AstGrepError as exc:
+        return mcp_error("ast_grep_error", str(exc))
     except Exception as exc:
         return mcp_error("invalid_rule", str(exc))
 
@@ -1334,6 +1376,10 @@ def test_rules(root_path: str, test_dir: str = ".", config_path: str | None = No
             root_path,
             lambda indexer: indexer.test_rules(test_dir=test_dir, config_path=config_path),
         )
+    except AstGrepValidationError as exc:
+        return mcp_error("invalid_request", str(exc))
+    except AstGrepError as exc:
+        return mcp_error("ast_grep_error", str(exc))
     except Exception as exc:
         return mcp_error("rule_test_failed", str(exc))
 
@@ -1638,7 +1684,7 @@ mcp.add_transform(
                     "independent digest and "
                     "every "
                     "root, query, candidate, count, and source-hash guard still match. Interpret results by "
-                    "checking rollback_attempted before rollback_succeeded."
+                    "using rollback_status as the authoritative restoration state."
                 ),
                 tags={"replace", "apply", "guarded", "rewrite", "destructive"},
                 arguments={
@@ -1696,6 +1742,8 @@ mcp.add_transform(
                     "root_path": ArgTransformConfig(description="Absolute repository root path."),
                     "rule_path": ArgTransformConfig(description="Contained rule or configuration path."),
                     "source_limit": ArgTransformConfig(description="Maximum returned rule-source characters."),
+                    "paths": ArgTransformConfig(description="Optional contained inspection scopes."),
+                    "globs": ArgTransformConfig(description="Optional ordered ast-grep glob filters."),
                 },
             ),
             "test_rules": ToolTransformConfig(

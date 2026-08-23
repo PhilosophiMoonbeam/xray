@@ -18,6 +18,7 @@ DEFAULT_AST_GREP_TIMEOUT_SECONDS = 30
 AST_GREP_TIMEOUT_ENV = "XRAY_AST_GREP_TIMEOUT_SECONDS"
 DEFAULT_AST_GREP_OUTPUT_LIMIT_CHARS = 10 * 1024 * 1024
 AST_GREP_OUTPUT_LIMIT_ENV = "XRAY_AST_GREP_OUTPUT_LIMIT_CHARS"
+AST_GREP_VALIDATION_EXIT_CODE = 8
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,10 @@ class AstGrepNotFoundError(AstGrepError):
 
 class AstGrepCommandError(AstGrepError):
     """Raised when ast-grep returns an actual command failure."""
+
+
+class AstGrepValidationError(AstGrepError):
+    """Raised when ast-grep rejects caller-provided syntax or configuration."""
 
 
 def get_ast_grep_timeout() -> float:
@@ -102,7 +107,10 @@ def run_ast_grep(args: Sequence[str], input_text: str | None = None, *, cwd: Pat
         return AstGrepResult(stdout, stderr, completed.returncode, no_matches=True)
 
     error_output = stderr.strip() if stderr else "(no error output)"
-    raise AstGrepCommandError(f"ast-grep failed with exit code {completed.returncode}: {error_output}")
+    error_type = (
+        AstGrepValidationError if completed.returncode == AST_GREP_VALIDATION_EXIT_CODE else AstGrepCommandError
+    )
+    raise error_type(f"ast-grep failed with exit code {completed.returncode}: {error_output}")
 
 
 def run_ast_grep_bounded(args: Sequence[str], max_results: int) -> BoundedAstGrepResult:
@@ -198,7 +206,10 @@ def run_ast_grep_bounded(args: Sequence[str], max_results: int) -> BoundedAstGre
     stderr = _limit_output("".join(stderr_chunks), "stderr")
     if not reached_cap and process.returncode not in (0, 1):
         error_output = stderr.strip() if stderr else "(no error output)"
-        raise AstGrepCommandError(f"ast-grep failed with exit code {process.returncode}: {error_output}")
+        error_type = (
+            AstGrepValidationError if process.returncode == AST_GREP_VALIDATION_EXIT_CODE else AstGrepCommandError
+        )
+        raise error_type(f"ast-grep failed with exit code {process.returncode}: {error_output}")
     return BoundedAstGrepResult(matches=matches, total_exact=not reached_cap)
 
 

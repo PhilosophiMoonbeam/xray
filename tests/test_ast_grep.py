@@ -7,6 +7,7 @@ import pytest
 from xray.core.ast_grep import (
     AstGrepCommandError,
     AstGrepNotFoundError,
+    AstGrepValidationError,
     parse_json_array,
     run_ast_grep,
     run_ast_grep_bounded,
@@ -69,6 +70,19 @@ def test_run_ast_grep_raises_for_real_command_failure():
     with patch("xray.core.ast_grep.subprocess.run", return_value=completed):
         with pytest.raises(AstGrepCommandError, match="parser failed"):
             run_ast_grep(["run", "--pattern", "bad", "--json", "."])
+
+
+def test_run_ast_grep_classifies_ast_grep_validation_exit_code():
+    completed = subprocess.CompletedProcess(
+        args=["ast-grep"],
+        returncode=8,
+        stdout="",
+        stderr="Cannot parse query as a valid pattern",
+    )
+
+    with patch("xray.core.ast_grep.subprocess.run", return_value=completed):
+        with pytest.raises(AstGrepValidationError, match="Cannot parse query"):
+            run_ast_grep(["run", "--pattern", "invalid", "--json", "."])
 
 
 def test_run_ast_grep_raises_when_executable_missing():

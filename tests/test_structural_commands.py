@@ -109,6 +109,7 @@ def test_scan_rules_uses_config_and_optional_fix(tmp_path: Path) -> None:
         "rollback_count": 0,
         "rollback_succeeded": True,
         "rollback_attempted": False,
+        "rollback_status": "not_attempted",
         "files": [],
     }
     assert run.call_args.args[0] == [
@@ -909,6 +910,7 @@ def test_replacement_apply_rolls_back_already_replaced_files(tmp_path: Path) -> 
     assert raised.value.rollback_count == 1
     assert raised.value.rollback_succeeded is True
     assert raised.value.rollback_attempted is True
+    assert raised.value.rollback_status == "succeeded"
     assert {path: path.read_bytes() for path in originals} == originals
 
 
@@ -940,6 +942,7 @@ def test_replacement_reports_attempted_failed_rollback(tmp_path: Path) -> None:
     assert raised.value.rollback_attempted is True
     assert raised.value.rollback_succeeded is False
     assert raised.value.rollback_count == 0
+    assert raised.value.rollback_status == "failed"
     assert "return new(1)" in sample.read_text(encoding="utf-8")
     assert "return old(2)" in second.read_text(encoding="utf-8")
 
@@ -961,8 +964,22 @@ def test_replacement_rechecks_source_after_staging_before_first_write(tmp_path: 
             indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
 
     assert raised.value.rollback_attempted is False
+    assert raised.value.rollback_status == "not_attempted"
     assert "return old(9)" in sample.read_text(encoding="utf-8")
     assert not list(repo.glob(".xray-stage-*"))
+
+
+def test_replacement_preparation_failure_reports_not_attempted(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    indexer = XRayIndexer(str(repo))
+    plan = indexer.plan_replacement(pattern="old($A)", replacement="new($A)", lang="python")
+
+    with patch.object(indexer, "_write_staged_file", side_effect=OSError("injected staging failure")):
+        with pytest.raises(ReplacementApplyError, match="preparation failed") as raised:
+            indexer.apply_replacement(plan, expected_digest=plan["plan_digest"])
+
+    assert raised.value.rollback_status == "not_attempted"
+    assert raised.value.rollback_attempted is False
 
 
 def test_replacement_final_syntax_evidence_drift_rolls_back(tmp_path: Path) -> None:
@@ -990,6 +1007,7 @@ def test_replacement_final_syntax_evidence_drift_rolls_back(tmp_path: Path) -> N
     assert raised.value.rollback_count == 1
     assert raised.value.rollback_succeeded is True
     assert raised.value.rollback_attempted is True
+    assert raised.value.rollback_status == "succeeded"
     assert sample.read_bytes() == original
 
 
@@ -1131,6 +1149,7 @@ def test_replace_cli_plan_file_and_guarded_apply_end_to_end(tmp_path: Path, caps
     applied = json.loads(capsys.readouterr().out)
     assert applied["command"] == "replace.apply"
     assert applied["result"]["changed_count"] == 1
+    assert applied["result"]["rollback_status"] == "not_attempted"
     assert sample.read_text(encoding="utf-8").endswith("return new(1)\n")
 
 
@@ -1270,4 +1289,5 @@ def test_mcp_replacement_tools_have_truthful_annotations_and_apply_reviewed_plan
     assert by_name["apply_replacement"]["annotations"]["destructiveHint"] is True
     assert verified["ready_to_apply"] is True
     assert applied["changed_count"] == 1
+    assert applied["rollback_status"] == "not_attempted"
     assert "return new(1)" in sample.read_text(encoding="utf-8")

@@ -147,14 +147,31 @@ def compact_v3_interface(data: Mapping[str, Any]) -> dict[str, Any]:
     result.pop("returned_symbols", None)
     result.pop("total_symbols", None)
     reasons: list[str] = []
-    warnings = [str(value) for value in result.get("warnings", [])]
-    if any("Members for" in warning for warning in warnings):
+    details = [value for value in result.pop("warning_details", []) if isinstance(value, Mapping)]
+    detail_messages = {str(value.get("message", "")) for value in details}
+    raw_warnings = [str(value) for value in result.get("warnings", [])]
+    warnings = [warning for warning in raw_warnings if warning not in detail_messages]
+    page_symbols = {str(value.get("name", "")) for value in result.get("symbols", []) if isinstance(value, Mapping)}
+    off_page_member_warning = False
+    for detail in details:
+        message = str(detail.get("message", ""))
+        top_level = detail.get("top_level")
+        if top_level is None or str(top_level) in page_symbols:
+            warnings.append(message)
+        elif detail.get("code") == "member_truncated":
+            off_page_member_warning = True
+    if any(detail.get("code") == "member_truncated" for detail in details) or any(
+        "Members for" in warning for warning in warnings
+    ):
         reasons.append("member_truncated")
     if bool(result.get("truncated")):
         reasons.append("page_truncated")
     if not bool(result.get("complete", True)) and not reasons:
         reasons.append("source_incomplete")
     result["completeness"] = {"complete": not reasons, "reasons": reasons}
+    result["warnings"] = warnings
+    if off_page_member_warning:
+        result["global_warnings"] = ["Additional symbols have bounded members on other pages."]
     result.pop("complete", None)
     return result
 
