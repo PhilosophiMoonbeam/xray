@@ -5,6 +5,10 @@ direction, public interfaces, compatibility, storage, and mutation behavior.
 The product is a Python 3.10+ code-intelligence CLI and FastMCP server. The
 multi-agent harness controls development of that product; it is not part of the
 product runtime.
+The [next-major design packet](docs/next-major-design-packet-v1.md) freezes
+future design only. XRAY 0.11.4 remains the current runtime contract;
+implementation requires separate authorization. Harness authority remains
+[adoption Design Packet v2](docs/adoption-design-packet-v2.md).
 
 ## System boundaries
 

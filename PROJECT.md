@@ -35,6 +35,10 @@ the intentional CLI/MCP surface differences, MCP's ranked search-first
 resource `xray://workflow`, prompt `xray_discovery_plan`, skill
 `skill://xray-progressive-discovery/SKILL.md`, and skill template
 `skill://xray-progressive-discovery/{path*}`.
+The [next-major design packet](docs/next-major-design-packet-v1.md) freezes
+future design only. XRAY 0.11.4 remains the current runtime contract;
+implementation requires separate authorization. Harness authority remains
+[adoption Design Packet v2](docs/adoption-design-packet-v2.md).
 
 ## Integration branch
 
