@@ -1,16 +1,11 @@
-# XRAY Enterprise/I5 continuation
+# XRAY next-major Enterprise/I5 qualification
 
 ## Next-session directive and authority
 
-No known Development Sprint product work remains. The user has selected the
-next named milestone: **XRAY next-major Enterprise/I5 qualification**. Its
-assurance objective is whole-product I5 acceptance against the preserved
-next-major v1-v4 contract, including G1-G8, on one unchanged candidate.
-
-`PROJECT.md` remains in Development Sprint for this handoff session. The next
-session must first activate the named milestone, assurance objective, and v1-v4
-acceptance contract in `PROJECT.md` and recover the applicable canonical Beads
-state. Only then may it repair or execute the Enterprise method. This directive
+No known Development Sprint product work remains. `PROJECT.md` now activates
+the named **XRAY next-major I5 qualification** milestone. Its assurance
+objective is whole-product I5 acceptance against the preserved next-major
+v1-v4 contract, including G1-G8, on one unchanged candidate. This activation
 does not claim I5 acceptance or retroactively turn historical evidence into
 current proof.
 
@@ -26,8 +21,9 @@ test counts as I5 evidence. Qualification must bind the exact candidate it
 accepts and run the applicable contract against that unchanged artifact.
 
 Parent Bead `xray-5e7` remains open because I5 acceptance is not complete.
-Recover only its applicable Enterprise leaves and dependencies; do not recreate
-completed planning or product-repair work.
+Method Bead `xray-5e7.34` is active for RQ-01 through RQ-12 repair and
+independent changed-findings review. Do not recreate completed planning or
+product-repair work.
 
 ## Qualification method state
 
@@ -89,24 +85,21 @@ Resolve the twelve rejected qualification families before W4 or W5:
 
 ## Next-session execution order
 
-1. Activate **XRAY next-major Enterprise/I5 qualification** in `PROJECT.md`
-   against the preserved v1-v4 contract and record the activation in canonical
-   Beads.
-2. Recover `xray-5e7` and only the applicable open Enterprise leaves,
-   dependencies, review findings, evidence identity, and method worktree state.
-3. Repair the method in dependency order: identity and producer trust; task,
+1. Recover the review findings, evidence identity, and method worktree state
+   for active Bead `xray-5e7.34`.
+2. Repair the method in dependency order: identity and producer trust; task,
    corpus, recipe, decoder, and gold correctness; population and resource
    accounting; durable orchestration and publication; aggregate and scorer.
-4. Run focused method tests and obtain independent changed-findings review. Do
+3. Run focused method tests and obtain independent changed-findings review. Do
    not advance while any applicable P0/P1 finding remains.
-5. Run W4 diagnostics, reconcile every result, and freeze the accepted candidate
+4. Run W4 diagnostics, reconcile every result, and freeze the accepted candidate
    and method only after prerequisites pass.
-6. Run W5 production populations in the contract's serialized order: 3,000
+5. Run W5 production populations in the contract's serialized order: 3,000
    candidate trials, 2,600 paired native-baseline trials, focused latency/RSS/
    source populations, C13 traversal, and G1-G8 evidence.
-7. Run W6 immutable aggregation, scoring, relocation/replay, independent
+6. Run W6 immutable aggregation, scoring, relocation/replay, independent
    acceptance review, and truthful local I5 adjudication.
-8. Update Beads and this file at each recoverable checkpoint. Remove completed
+7. Update Beads and this file at each recoverable checkpoint. Remove completed
    targets, add newly discovered work and blockers, record current evidence and
    exact next action, then add/commit/push the current branch while the user's
    delivery authority remains in force.

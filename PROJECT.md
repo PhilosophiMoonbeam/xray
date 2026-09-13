@@ -8,15 +8,13 @@ qualification or grant delivery authority.
 
 ## Operating mode
 
-Development Sprint is XRAY's default operating mode. Enterprise/Certification
-is inactive unless the user or an authorized maintainer explicitly activates it
-for a named milestone, assurance objective, and applicable acceptance contract.
-Activation applies only to that milestone and ends on completion, cancellation,
-or explicit deactivation. A feature, greenfield development, bug, security
-discovery, major-version label, broad command, old qualification Bead, or
-recovered handoff does not activate Enterprise/Certification. If activation is
-requested without a named milestone, clarify its scope before assurance work
-begins.
+Enterprise/Certification is active for the named **XRAY next-major I5
+qualification** milestone. Its assurance objective is whole-product I5
+acceptance, including G1-G8, on one unchanged candidate. The preserved
+next-major design packets v1-v4 and the adjudicated method requirements are the
+applicable acceptance contract. This activation ends on completion,
+cancellation, or explicit deactivation; new work then returns to Development
+Sprint by default.
 
 Within repository policy, this section selects the mode. It supersedes standing
 process obligations inherited from adoption packets, next-major instructions,
