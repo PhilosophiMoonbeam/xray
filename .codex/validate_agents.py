@@ -64,12 +64,14 @@ INDEX_TARGETS = {
     "docs/ADAPTATION.md",
     "TEMPLATE_MANIFEST.md",
     "README.md",
+    "CONTINUE.md",
 }
 REQUIRED_FILES = {
     Path("AGENTS.md"),
     Path("PROJECT.md"),
     Path("ARCHITECTURE.md"),
     Path("README.md"),
+    Path("CONTINUE.md"),
     Path("TEMPLATE_MANIFEST.md"),
     Path(".gitignore"),
     CONFIG,
@@ -120,6 +122,7 @@ MANIFEST_TARGETS = {
     "examples/nested-AGENTS.md",
     "Makefile",
     "README.md",
+    "CONTINUE.md",
     ".gitignore",
     ".claude/",
     ".xray/xray.db*",

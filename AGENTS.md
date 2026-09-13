@@ -20,7 +20,7 @@ and examples do not override an authoritative source.
 | Trigger | Read | Authority |
 |---|---|---|
 | Before planning or claiming work | [`PROJECT.md`](PROJECT.md), [`ARCHITECTURE.md`](ARCHITECTURE.md), and the applicable instruction chain | Mode, readiness, commands, components, interfaces, resources, and project authority |
-| After session start or context loss | Beads skill and current-work recovery when durable history is needed | Durable work, dependencies, blockers, and handoff |
+| After session start or context loss | Beads skill, [`CONTINUE.md`](CONTINUE.md), and current-work recovery when durable history is needed | Current handoff, durable work, dependencies, and blockers |
 | Before changing owned text | [`docs/repository-language-standard.md`](docs/repository-language-standard.md) | Vocabulary, strength, semantic density, and transformation evidence |
 | Before implementation | [`docs/implementation-standard.md`](docs/implementation-standard.md) | Supported behavior, implementation, verification, and completion |
 | Before routing or delegation | [`docs/agent-model-routing.md`](docs/agent-model-routing.md), then [`docs/agent-operations.md`](docs/agent-operations.md) | Routes, contracts, allocation, worktrees, evidence, adjudication, and delivery |
@@ -84,6 +84,22 @@ Root alone integrates locally. Without separate delivery authority, stop after
 local verification. Commit, push, merge, release, deployment, GitHub mutation,
 publication, credentials, production actions, and Beads Dolt push/pull remain
 unauthorized.
+
+## Progress checkpoints and handoff
+
+For authorized multi-session work, root keeps `CONTINUE.md` current when the
+file exists. At meaningful recoverable checkpoints and before session end or
+interruption, remove completed work from that file, retain only state and
+evidence needed for recovery, add newly planned work and blockers, and state the
+next dependency-ordered action. Git and Beads retain history; `CONTINUE.md` is
+not an archive and does not activate Enterprise/Certification by itself.
+
+Root updates the applicable Bead before closing a session. When the user or
+another controlling authority has separately authorized delivery, root stages
+the scoped changes, runs applicable checks, commits, and pushes the current
+branch at useful recoverable checkpoints. Checkpoint authority does not grant
+merge, release, deployment, publication, production, credential, or Beads Dolt
+remote authority.
 
 ## Project tool rules
 

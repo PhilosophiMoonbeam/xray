@@ -97,7 +97,7 @@ while harness paths may change under the scoped governance contract.
 | Beads topology and compact Beads skill | existing XRAY `.beads/`, dedicated planning checkout, `.agents/skills/beads/` | root only for tracker state; `luna_write` for skill files |
 | Root instruction index | `AGENTS.md` | `sol_design` |
 | Codex roles and root configuration | `.codex/config.toml`, `.codex/agents/` | `sol_write` |
-| Session recovery | `.codex/hooks.json`, `.codex/session_start.py` | `sol_write` |
+| Session recovery and handoff | `.codex/hooks.json`, `.codex/session_start.py`, `CONTINUE.md` | root for current handoff; `sol_write` for hook mechanics |
 | Validators and canonical runner | `.codex/validate_agents.py`, `.codex/validate_project_readiness.py`, `Makefile` | `sol_write` |
 | Generated XRAY SQLite cleanup and ignore policy | `.xray/xray.db`, `.xray/xray.db-shm`, `.xray/xray.db-wal`, `.gitignore` | `luna_write` |
 

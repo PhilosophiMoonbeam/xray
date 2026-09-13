@@ -8,6 +8,7 @@ packets and companions remain intact evidence, not routine Sprint instructions.
 | Path | Action | Result |
 |---|---|---|
 | `AGENTS.md` | Maintain | Compact authority index that points to the active mode and current standards |
+| `CONTINUE.md` | Maintain | Current multi-session state, blockers, evidence, and next dependency-ordered actions |
 | `PROJECT.md` | Maintain | Development Sprint default, explicit Enterprise activation, commands, resources, and delivery facts |
 | `ARCHITECTURE.md` | Maintain | Product components, interfaces, compatibility, storage, and mutation |
 | `docs/adoption-design-packet-v1.md` | Preserve frozen | Historical `xray-oep.1` adoption evidence |

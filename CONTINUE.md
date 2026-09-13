@@ -1,246 +1,138 @@
-# XRAY continuation and deferred assurance context
+# XRAY Enterprise/I5 continuation
 
-## Current mode and authority
+## Next-session directive and authority
 
-Current mode is selected by `PROJECT.md`: Development Sprint. The next-major
-Enterprise/I5 qualification program below is suspended, not completed or
-waived. It is historical recovery context and must not resume from this
-handoff, an old claim, or a generic “continue” instruction alone. Resume its
-exhaustive method and qualification stages only after explicit activation of a
-named Enterprise/Certification milestone. Current product defects remain real
-and are selected by affected behavior and risk. No protected delivery is
-authorized.
+No known Development Sprint product work remains. The user has selected the
+next named milestone: **XRAY next-major Enterprise/I5 qualification**. Its
+assurance objective is whole-product I5 acceptance against the preserved
+next-major v1-v4 contract, including G1-G8, on one unchanged candidate.
 
-No implementation commit, push, merge, release, deployment, GitHub mutation,
-Beads remote synchronization, or remote installer endpoint is authorized.
-Preserve historical evidence, frozen packet bytes, and unrelated dirty state.
+`PROJECT.md` remains in Development Sprint for this handoff session. The next
+session must first activate the named milestone, assurance objective, and v1-v4
+acceptance contract in `PROJECT.md` and recover the applicable canonical Beads
+state. Only then may it repair or execute the Enterprise method. This directive
+does not claim I5 acceptance or retroactively turn historical evidence into
+current proof.
 
-## Historical repository and tracker snapshot
+The user has authorized periodic add/commit/push checkpoints to the current
+branch for this work. Merge, release, deployment, publication, production
+access, credentials, and Beads Dolt push/pull remain unauthorized.
 
-- Repository: `/home/bbferko/repos/xray`
-- Branch/HEAD: `main`, `2b4844d0b7aa4a668048aa02da73fdace8c82b27`
-- HEAD tree: `51150251d9736b8e1112c340aa138192b9c4b2d6`
-- Working tree was intentionally dirty at this snapshot; preserve unrelated
-  user changes when recovering it.
-- Frozen v1/v2 packet commits were already pushed: `6f7197d` and
-  `2b4844d0b7aa4a668048aa02da73fdace8c82b27`.
-- V3/V4 packets were local and uncommitted. Their recorded SHAs remain
-  historical evidence, not current qualification proof.
-- Canonical Beads store: `bd -C ~/.beads-planning`; root-only mutation and no
-  Dolt push/pull without separate authority remain in force.
-- Parent `xray-5e7` and leaves `.30`, `.33`, `.34`, `.35`, and `.36` were open
-  or in progress at the snapshot. Their old status does not activate
-  Enterprise/Certification or make qualification a Sprint prerequisite.
+## Current candidate boundary
 
-When durable recovery is authorized, root may inspect only the relevant Beads
-entries and ready frontier. Do not recreate a passed planning phase or close
-the qualification objective as passed.
+The XRAY 1.0.0 Development Sprint candidate is implemented, reviewed, and
+pushed on `main`. Do not restart completed Sprint implementation or reuse its
+test counts as I5 evidence. Qualification must bind the exact candidate it
+accepts and run the applicable contract against that unchanged artifact.
 
-## Preserved product findings and historical observations
+Parent Bead `xray-5e7` remains open because I5 acceptance is not complete.
+Recover only its applicable Enterprise leaves and dependencies; do not recreate
+completed planning or product-repair work.
 
-Three broad read-only audits covered product, qualification, and integration
-state at the snapshot. Their findings are preserved observations, not a
-current command sequence or activation signal.
+## Qualification method state
 
-Key retained product decisions:
-
-- Preserve inclusive `LocationTarget.end_line`; include an existing LF/CRLF
-  terminator. Output `Range.end` remains exclusive.
-- Map continuations recapture fresh namespace state. Fix traversal below the
-  requested horizon; do not add persistent namespace state.
-- Standalone rules accept one or more YAML mapping documents; config remains a
-  single mapping. Fix aggregate node accounting and directory stability, not
-  standalone multiplicity.
-- Managed Git subroots discover the containing worktree while preserving
-  selected `ROOT`.
-
-The current local product repair pass completes the selected R01-R08
-correctness, safety, compatibility, and transport scope:
-
-1. **R01 — apply outcome preservation:** final worker results survive
-   post-worker cancellation and fitting. `change_apply` preflights its complete
-   success envelope before staging, and CLI pretty-output fallback preserves an
-   authoritative `applied` result rather than fabricating `not_applied`.
-2. **R02 — map frontier:** normalized horizons stop traversal before closed
-   descendants, and overlapping explicit directory roots are walked and charged
-   once while all requested focus paths remain in projection and identity.
-3. **R03 — cursor precedence:** cursor encoding and shape are validated before
-   operation/root, stale identity, semantic query, and checkpoint membership in
-   the defined order.
-4. **R04 — read accounting:** line, source-byte, and output accounting is shared
-   across targets with exact UTF-8/CRLF geometry and advancing continuation.
-5. **R05 — syntax/filter/citation truth:** parser-backed declaration,
-   import/export, search, and impact evidence now retains complete populations,
-   named re-export modules, and defining-token exclusions.
-6. **R06 — cache lifecycle:** normal and injected caches use one operation
-   instance, run bounded age eviction, fail closed on incomplete capacity scans,
-   and preserve cache-independent results.
-7. **R07 — budgets/disclosure:** `OperationBudget` reaches toolchain and cache
-   work, repository failures retain their typed meaning, transformed capture
-   clipping is disclosed, and incomplete syntax diagnostics fail with
-   `analysis_limit`.
-8. **R08 — installed runtime:** clean installed Python 3.10.20 and 3.13.13
-   environments both completed real CLI and standard-stdio MCP mutation
-   workflows and loaded packaged resources.
-
-The first focused product review returned `REPAIR` with ten counterexamples.
-Each was repaired and covered by a regression. The focused changed-findings
-re-review returned `GO` and found no new P0/P1 regression in those paths.
-
-## Current Sprint result
-
-The current working tree implements the next-major product contract locally.
-Current proof:
-
-- `uv run pytest -q`: **243 passed** on Python 3.13.13.
-- `uv run ruff format --check src tests`, `uv run ruff check src tests`,
-  `uv run pyright src tests`, and
-  `uv run vulture src tests --min-confidence 90`: passed; Pyright reported
-  **0 errors, 0 warnings**.
-- `uv build`: built `dist/xray-1.0.0.tar.gz` and
-  `dist/xray-1.0.0-py3-none-any.whl`.
-- A disposable current-source subprocess smoke completed map, read, impact, and
-  `change_apply` through `uv run xray` and an initialized standard-stdio
-  `uv run xray-mcp` child.
-- Clean installed Python 3.10.20 and 3.13.13 environments each completed
-  CLI/MCP `change_apply` and packaged-resource checks with the environment's own
-  `ast-grep` binary first on `PATH`.
-- `git diff --check`: passed before this handoff update and must be rerun after
-  any subsequent edit.
-
-No implementation commit, push, merge, release, deployment, GitHub mutation,
-or Beads remote synchronization is authorized. Frozen v1/v2 packet commits
-remain the only pushed part of this objective; v3/v4 and the implementation
-remain local.
-
-## Suspended Enterprise/I5 qualification context
-
-The following external-method state and findings are preserved historical
-context. They are not a Sprint command sequence and cannot activate
-Enterprise/Certification.
-
-Successor root:
+The preserved successor method is at:
 
 `/home/bbferko/.cache/xray-evidence/xray-5e7/qualification/v4-method-adjudicated`
 
-Prior stable manifest SHA before the latest partial repair was
-`fbeac7a1303c2b18c0bdba3d3427bea23bd5d9740bc3d059d1c99f0e61716766`. The
-initial compact method suite recorded three passed tests before later edits.
+The method was independently rejected and then partially repaired. It is not
+safe to execute as qualification evidence until its changed findings are fixed
+and independently reviewed. Preserve the evidence root and establish exact
+current identity before editing it.
 
-That method was independently reviewed and rejected. The twelve remaining
-families are retained as RQ-01 through RQ-12 qualification blockers for a
-future named Enterprise/I5 milestone:
+Known retained state:
 
-1. **RQ-01/P0:** Recompute and enforce a complete run binding at execute,
-   resume, merge, and score; bind child, launcher, dependency, tool,
-   tokenizer, corpus, Git, row, and seal identities; reject ambient
-   `PYTHONPATH` substitution.
-2. **RQ-02/P0:** Fix C07 task root and native C09/C14 templates and handoffs;
-   use distinct native/candidate decoders; extract native symbols and
-   `enclosing[i].result.ref` exactly.
-3. **RQ-03/P0:** Use a physical, inventoried 50,001-row C13 namespace rather
-   than metadata JSONL as the active filesystem corpus.
-4. **RQ-04/P0:** Reconstruct requests from frozen recipes and prior raw
-   responses; enforce reference/cursor equality and progress; use complete
-   independent gold; reject candidate MCP error envelopes.
-5. **RQ-05/P0:** Load a verified finite producer registry under the run
-   binding; arbitrary pass flags, commands, predicate hashes, or artifacts
-   cannot certify I5.
-6. **RQ-06/P0:** Connect distinct 42-row latency, RSS, and source populations
-   through controller, immutable aggregate, and scorer; enforce version
-   partitions and focused latency/source and full RSS predicates.
-7. **RQ-07/P1:** Count only positive source bytes within frozen roots with
-   PID/FD or inline-path attribution, rereads, and bounded trace/parser/assets;
-   keep outside-root bytes separate.
-8. **RQ-08/P0:** Isolate archived native `/tmp/.xray_cache` without modifying
-   archived bytes; establish applicability and state transitions, especially
-   Git C11, with no shared or home writes.
-9. **RQ-09/P1:** Durably stream attempt evidence before exposure; preserve
-   action-started or ambiguous attempts, block resampling, and preserve
-   classification evidence across publication failure.
-10. **RQ-10/P1:** Enforce diagnostic, focused, non-C13, and C13 prerequisites;
-    frozen balanced serial order; fail-fast behavior; nonzero blocked/failed
-    exits; immutable candidate seal; timeout forwarding; no continuation after
-    ambiguity.
-11. **RQ-11/P1:** Bound workflow, MCP streams, descendant-held pipes,
-    termination, drains, and trailing frames independent of parent liveness;
-    separate latency/RSS/source paths and timestamp final-result delivery
-    before post-result cleanup.
-12. **RQ-12/P1:** Reject missing, duplicate, unexpected, and cross-population
-    keys; publish one immutable five-population aggregate under the lock; have
-    the sole scorer consume it and support relocation/replay.
-
-The full review is the preceding result in `history://QualificationSystemQA`.
-If Enterprise/I5 is explicitly activated later, do not launch W4 diagnostics or
-W5 production until changed-findings review accepts the applicable blockers.
-
-## Known incomplete Enterprise method state
-
-The external method writer was interrupted while repairing RQ findings. Its
-state is known incomplete and must not be validated or executed unless a named
-Enterprise/I5 milestone is explicitly activated and its prerequisites pass.
-Preserve the following facts and artifacts:
-
-- `50,000` files were materialized under
-  `fixtures/namespace-50000/generated`, producing `50,001` projected rows.
-- Namespace provenance metadata and the physical manifest moved to
+- The physical C13 fixture contains 50,000 generated files and projects 50,001
+  namespace rows.
+- Namespace provenance and the physical manifest live under
   `inputs/namespace/`.
-- Recorded metadata SHA:
+- Recorded namespace metadata SHA-256:
   `585a414fa2a751918177ac09dff2ab3f7271dab030468d01185ab163fec07490`.
-- Recorded physical-manifest SHA:
+- Recorded physical-manifest SHA-256:
   `0f3f6b15712128cbf4a2be3ea1caaa86e395336413227d86d582e336a4c99729`.
-- `tools/common.py` contained a partial tokenizer/binding edit with an obsolete
-  trailing `token_record` fragment. Its manifest was stale after that edit.
+- `tools/common.py` had an incomplete tokenizer/binding repair with an obsolete
+  trailing `token_record` fragment, so its prior manifest is stale.
 
-Do not repair or execute the incomplete external method merely to unlock Sprint
-work. Its historical evidence roots and files remain preserved.
+## Required repair targets
 
-## Deferred Enterprise/I5 trajectory
+Resolve the twelve rejected qualification families before W4 or W5:
 
-The former W1-W6 sequence, RQ-01 through RQ-12, exact seals, qualification
-populations, attestation, replay, and broad reviews are suspended Enterprise
-work. They are not routine development prerequisites. Execute them only after
-explicit activation of a named milestone under `PROJECT.md`.
+1. **RQ-01:** Bind candidate, launcher, child, dependencies, tools, tokenizers,
+   corpus, Git, rows, and seals at execute, resume, merge, and score; reject
+   ambient substitution.
+2. **RQ-02:** Correct C07, C09, and C14 roots, recipes, native/candidate decoders,
+   symbols, and enclosing-reference handoffs.
+3. **RQ-03:** Make the inventoried physical 50,001-row namespace the active C13
+   corpus.
+4. **RQ-04:** Reconstruct requests from frozen recipes and raw responses,
+   enforce cursor/reference equality and progress, use independent complete
+   gold, and reject MCP error envelopes.
+5. **RQ-05:** Bind a finite verified producer registry; arbitrary flags,
+   commands, hashes, or artifacts cannot certify I5.
+6. **RQ-06:** Connect distinct latency, RSS, and source-read populations through
+   controller, immutable aggregate, and scorer with correct version partitions.
+7. **RQ-07:** Attribute positive source-read bytes to frozen roots and measured
+   processes, including rereads, while separating outside-root bytes.
+8. **RQ-08:** Isolate archived native cache state without modifying archived
+   bytes or writing shared/home state; prove each required state transition.
+9. **RQ-09:** Durably record attempts before exposure, preserve ambiguous
+   attempts, and prevent resampling after publication failure.
+10. **RQ-10:** Enforce prerequisites, balanced serial order, fail-fast exits,
+    immutable candidate sealing, timeout forwarding, and no continuation after
+    ambiguity.
+11. **RQ-11:** Bound workflows, MCP streams, descendant-held pipes, termination,
+    drains, trailing frames, and final-result timing independently of parent
+    liveness.
+12. **RQ-12:** Reject missing, duplicate, unexpected, and cross-population keys;
+    publish one relocatable immutable five-population aggregate for the sole
+    scorer.
 
-### Current Sprint closure
+## Next-session execution order
 
-The selected R01-R08 product work is locally implemented and verified. A future
-change affecting these surfaces should preserve the regressions and the
-adjudicated choices: inclusive input line endpoints, fresh map capture,
-standalone-rule versus config multiplicity, bounded complete syntax evidence,
-cache-independent truth, and authoritative mutation outcomes.
+1. Activate **XRAY next-major Enterprise/I5 qualification** in `PROJECT.md`
+   against the preserved v1-v4 contract and record the activation in canonical
+   Beads.
+2. Recover `xray-5e7` and only the applicable open Enterprise leaves,
+   dependencies, review findings, evidence identity, and method worktree state.
+3. Repair the method in dependency order: identity and producer trust; task,
+   corpus, recipe, decoder, and gold correctness; population and resource
+   accounting; durable orchestration and publication; aggregate and scorer.
+4. Run focused method tests and obtain independent changed-findings review. Do
+   not advance while any applicable P0/P1 finding remains.
+5. Run W4 diagnostics, reconcile every result, and freeze the accepted candidate
+   and method only after prerequisites pass.
+6. Run W5 production populations in the contract's serialized order: 3,000
+   candidate trials, 2,600 paired native-baseline trials, focused latency/RSS/
+   source populations, C13 traversal, and G1-G8 evidence.
+7. Run W6 immutable aggregation, scoring, relocation/replay, independent
+   acceptance review, and truthful local I5 adjudication.
+8. Update Beads and this file at each recoverable checkpoint. Remove completed
+   targets, add newly discovered work and blockers, record current evidence and
+   exact next action, then add/commit/push the current branch while the user's
+   delivery authority remains in force.
 
-### Deferred W3 control closure
+## Stop conditions
 
-The authority/recovery and instruction closure recorded in `.36` is historical
-qualification context. Current governance contradictions relevant to this
-cutover are fixed in the instruction pass; remaining runtime/recovery defects
-stay scoped backlog. D11 attestation completeness, fixed-candidate provenance,
-and independent acceptance review wait for named qualification.
+Stop the affected stage for an unbound candidate or method, stale manifest,
+missing or duplicate population key, incomplete gold, ambiguous attempt,
+unresolved P0/P1 review finding, changed frozen contract, unsafe mutation,
+contradictory evidence, or missing authority. Do not launch W4 diagnostics or
+W5 production before method repair and changed-findings acceptance. Do not
+claim I5 from Sprint tests, historical counts, partial populations, or a scorer
+whose inputs are not completely bound.
 
-### Deferred W4-W6
+## Handoff maintenance
 
-W4 diagnostics and freeze, W5 serialized production populations, and W6
-replay/local acceptance remain suspended. Do not run `make qualify`, broad
-qualification populations, exact candidate sealing, or the incomplete method
-under Development Sprint. A future activated milestone uses its preserved
-contract and records a truthful result.
+`CONTINUE.md` is the live recovery surface, not an archive. Git and Beads retain
+completed history. At meaningful verified checkpoints and before session end or
+interruption, root updates this file to contain only current authority, exact
+state needed for recovery, unresolved work and blockers, material evidence, and
+the next dependency-ordered actions.
 
-## Historical checks and pause status
+Authoritative contracts:
 
-Canonical commands remain in `PROJECT.md`; Python tooling uses `uv`. The
-latest full `make qualify` had not passed on the snapshot artifact. Earlier
-test counts are historical and not current proof:
-
-- Focused product invariant tests: **224 passed** on Python 3.13.13.
-- Initial method tests: **3 passed before the partial `common.py` edit** and
-  are currently invalidated.
-- Product fixed-artifact review: **REPAIR**.
-- Qualification fixed-artifact review: **REPAIR**.
-- Production qualification: **not started**.
-- Final candidate seal: **not created**.
-- Delivery: **unauthorized**.
-
-No current Sprint completion claim depends on these historical checks. If a
-named Enterprise milestone is activated, its existing contract determines
-which evidence must be rerun and which preserved failures remain blocking.
+- `PROJECT.md` and `ARCHITECTURE.md` for current mode and product boundaries.
+- `docs/next-major-design-packet-v1.md` through v4 and their companions for the
+  named I5 acceptance contract.
+- `docs/agent-operations.md` for activation, evidence, review, integration, and
+  delivery boundaries.
