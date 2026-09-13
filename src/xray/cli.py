@@ -1,1852 +1,1916 @@
-"""Command line interface for XRAY code intelligence."""
+"""Handwritten shell adapter for the enabled XRAY I2 operations.
+
+The CLI deliberately stays thin: it parses the natural shell grammar, normalizes
+only explicitly supplied shell paths, builds the canonical typed request, and
+serializes the result returned by :func:`xray.operations.execute`.  Repository
+capture, reference validation, paging, fitting, and all operation defaults live
+behind that shared application boundary.
+"""
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any
 
 from xray import __version__
-from xray.core.ast_grep import AstGrepError, AstGrepValidationError
-from xray.core.indexer import InterfaceReadError, ReplacementApplyError, ReplacementDriftError, XRayIndexer
-from xray.models import (
-    dump_error_envelope,
-    dump_explore_data,
-    dump_explore_envelope,
-    dump_find_envelope,
-    dump_impact_envelope,
-    dump_impact_result,
-    dump_interface_data,
-    dump_interface_envelope,
-    dump_symbol_output,
-    validate_symbol_input,
+from xray.models import AdministrativeData, AdministrativeSuccess, Error
+from xray.operations import Result, execute
+from xray.presentation import canonical_json
+from xray.skill_installer import install_cli_skill
+
+CLI_COMMANDS = frozenset(
+    {
+        "map",
+        "find",
+        "interface",
+        "read",
+        "impact",
+        "search",
+        "change",
+        "capabilities",
+        "skill",
+    }
 )
-from xray.presentation import (
-    compact_explore,
-    compact_impact_references,
-    compact_structural_items,
-    compact_v3_impact,
-    compact_v3_interface,
-    cursor_fingerprint,
-    decode_cursor,
-    page_items,
-)
-from xray.skill_installer import SkillInstallError, install_cli_skill
+MAX_REQUEST_JSON_BYTES = 1_048_576
+MAX_ERROR_MESSAGE_BYTES = 512
+MAX_READ_TARGETS = 8
+_CLI_ERROR_RESPONSE_BYTES = 4_096
 
-SCHEMA_VERSION = "xray.cli.v1"
-COMPACT_SCHEMA_VERSION = "xray.cli.v2"
-V3_SCHEMA_VERSION = "xray.cli.v3"
-DEFAULT_STRUCTURAL_LIMIT = 50
-MAX_SCORE = 100
-MAX_SYMBOL_JSON_CHARS = 1024 * 1024
-MAX_PLAN_JSON_CHARS = 10 * 1024 * 1024
-OUTPUT_FORMAT_HELP = "Output: compact JSON (default) or lossy text."
-PRETTY_HELP = "Indent JSON output."
-
-ROOT_HELP_EPILOG = """\
-Agent flow:
-  xray explore ROOT --max-depth 2
-  symbol=$(xray find ROOT "target symbol" --limit 1 | jq -c '.symbols[0]')
-  xray interface ROOT --symbol-json "$symbol"
-  xray impact ROOT --symbol-json "$symbol"
-
-Guarded change:
-  xray replace plan ROOT -p 'old_api($ARG)' -r 'new_api($ARG)' -l python | jq '.plan' > plan.json
-  jq -r '.edit_manifest[].edit_id' plan.json
-  xray replace verify ROOT --plan-file plan.json --expected-digest REVIEWED_DIGEST
-  xray replace apply ROOT --plan-file plan.json --expected-digest REVIEWED_DIGEST
-
-Compact v3 JSON is default; where offered, use --detail full for legacy fields,
---schema v2 for the previous compact projection, or --format text for lossy scans.
-Continuable pages require a positive limit and report total_exact. next_cursor
-binds the query, projection, and snapshot but permits a different positive page
-size. YAML output is unsupported. replace apply, rewrite, and
-scan --fix mutate files; --limit never bounds legacy edits. Exit codes: 0 success,
-1 operational failure, 2 parse or validation error. Invalid ast-grep input is
-validation. On apply results, inspect rollback_status first.
-"""
-
-EXPLORE_HELP = """\
-Map a repository. Start shallow; add --focus or --include-symbols as needed.
-"""
-
-EXPLORE_EPILOG = """\
-Examples:
-  xray explore ROOT --max-depth 2
-  xray explore ROOT --focus src --include-symbols --max-symbols-per-file 5
-
-Compact JSON contains relative-path entries. --detail full adds the v1 tree and
-absolute paths. map aliases explore and sets invoked_as to "map".
-"""
-
-FIND_EPILOG = """\
-Example: xray find ROOT "AuthService.validate_user" --limit 5 --min-score 60
-
-JSON symbols are complete impact inputs, including qualified identity, match
-reason, confidence, paths, lines, type, and score.
-"""
-
-INTERFACE_HELP = """\
-Show one file's typed hierarchy without implementation bodies.
-"""
-
-INTERFACE_EPILOG = """\
-Example: xray interface ROOT src/package/module.py
-Exact handoff: xray interface ROOT --symbol-json "$symbol"
-
-FILE_PATH must resolve inside ROOT; parent traversal and symlink escapes fail.
-Compact v3 accepts an exact find symbol and reports typed completeness reasons.
-Exact containers return bounded members; exact members return one owner path without siblings.
---detail full returns the legacy v1 string envelope.
-"""
-
-IMPACT_HELP = """\
-Find bounded symbol-name references; this is not a type-aware dependency graph.
-Provide exactly one symbol source:
---symbol-json, --symbol-file, or --name with --path and --start-line.
-"""
-
-IMPACT_EPILOG = """\
-Pipeline:
-  xray find ROOT "target_function" --limit 1 | jq -c '.symbols[0]' | xray impact ROOT --symbol-file -
-
-Symbol paths must resolve inside ROOT. Compact references classify
-definition/import/call/read/text with confidence and snapshot-bound paging.
-total_exact=false means a lower bound; review same-name definitions separately.
-"""
+_CLI_HARD_RESPONSE_BYTES = {
+    "capabilities": 65_536,
+    "map": 65_536,
+    "find": 65_536,
+    "interface": 65_536,
+    "read": 65_536,
+    "impact": 65_536,
+    "search": 65_536,
+    "change_plan": 262_144,
+    "change_refine": 262_144,
+    "change_verify": 65_536,
+    "change_apply": 65_536,
+}
 
 
-class ParserExit(Exception):
-    """Internal replacement for argparse's process-level exits."""
+class CliInputError(ValueError):
+    """A shell grammar or explicitly supplied shell-input failure."""
 
-    def __init__(self, status: int = 0, message: str = ""):
-        self.status = status
-        self.message = message
+    def __init__(self, message: str, *, code: str = "invalid_request") -> None:
+        self.code = code
         super().__init__(message)
 
 
-class XRayArgumentParser(argparse.ArgumentParser):
-    """ArgumentParser variant that lets cli.main return exit codes."""
-
-    def __init__(self, *args: Any, **kwargs: Any):
-        kwargs.setdefault("formatter_class", argparse.RawDescriptionHelpFormatter)
-        super().__init__(*args, **kwargs)
-
-    def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
-        raise ParserExit(status, message or "")
-
-    def error(self, message: str) -> NoReturn:
-        raise ParserExit(2, f"{self.prog}: error: {message}")
+@dataclass(frozen=True)
+class OutputOptions:
+    format: str = "json"
+    pretty: bool = False
 
 
-def normalize_path(path: str) -> str:
-    """Normalize a repository path to an existing absolute directory."""
-    expanded = os.path.expanduser(path)
-    resolved = str(Path(expanded).resolve())
-    if not os.path.exists(resolved):
-        raise ValueError(f"Path '{path}' does not exist")
-    if not os.path.isdir(resolved):
-        raise ValueError(f"Path '{path}' is not a directory")
-    return resolved
+@dataclass(frozen=True)
+class ParsedCommand:
+    operation: str
+    request: dict[str, Any] | None = None
+    output: OutputOptions = OutputOptions()
+    admin: bool = False
+    project_root: str | None = None
+    force: bool = False
+
+
+MAP_HELP = """Usage: xray map ROOT [options]
+
+Map the explicitly rooted repository namespace without reading source bodies.
+The default focus is ROOT and the default depth is two.
+
+Options:
+  --focus PATH            Include a contained focus path (repeatable).
+  --depth N|all           Descendant depth (0..64 or all).
+  --context none|ancestors
+                          Include focus ancestors when requested.
+  --exclusions default|none
+                          Apply or disable generated exclusions.
+  --cursor TOKEN          Continue a previous bounded map page.
+  --limit N               Maximum namespace entries (1..1000).
+  --max-bytes N           Maximum response bytes for the page.
+  --timeout-seconds N     Operation deadline in seconds.
+  --cache auto|off        Operation cache policy.
+  --format json|text      JSON (default) or lossy text.
+  --pretty                Indent JSON output.
+"""
+
+FIND_HELP = """Usage: xray find ROOT QUERY [options]
+
+Find declarations by their canonical name or qualified identity.
+
+Options:
+  --match name|exact|fuzzy
+                          Name matching policy (name is the default).
+  --path PATH             Restrict the selected repository path (repeatable).
+  --glob PATTERN          Restrict selection with an ordered glob (repeatable).
+  --language LANGUAGE     Restrict selection to python, javascript, typescript,
+                          or go (repeatable).
+  --exclusions default|none
+                          Apply or disable generated exclusions.
+  --kinds KIND            Restrict declaration kinds (repeatable).
+  --visibility VALUE      Restrict visibility: public, private, or unknown
+                          (repeatable).
+  --cursor TOKEN          Continue a previous bounded find page.
+  --limit N               Maximum matches (1..100).
+  --max-bytes N           Maximum response bytes for the page.
+  --timeout-seconds N     Operation deadline in seconds.
+  --cache auto|off        Operation cache policy.
+  --format json|text      JSON (default) or lossy text.
+  --pretty                Indent JSON output.
+"""
+
+INTERFACE_HELP = """Usage: xray interface ROOT FILE [options]
+       xray interface ROOT --ref-json JSON [options]
+       xray interface ROOT --ref-file FILE [options]
+
+Read a bounded interface from one contained file or one exact symbol
+reference. Use '-' as FILE for JSON on standard input.
+
+Options:
+  --sections SECTION      Include symbols, imports, or exports (repeatable).
+  --member-depth N        Direct member depth, zero or one.
+  --documentation         Include declaration documentation.
+  --kinds KIND            Filter file declarations by kind (repeatable).
+  --visibility VALUE      Filter file declarations by visibility (repeatable).
+  --cursor TOKEN          Continue a previous bounded interface page.
+  --limit N               Maximum interface items (1..200).
+  --max-bytes N           Maximum response bytes for the page.
+  --timeout-seconds N     Operation deadline in seconds.
+  --cache auto|off        Operation cache policy.
+  --format json|text      JSON (default) or lossy text.
+  --pretty                Indent JSON output.
+"""
+
+READ_HELP = """Usage: xray read ROOT TARGET [options]
+       xray read ROOT --ref-json JSON [options]
+       xray read ROOT --ref-file FILE [options]
+       xray read ROOT --targets-file FILE [options]
+
+Read one exact location or reference, or a JSON batch of one to eight targets.
+ROOT is required and is normalized by the shell before the typed request.
+
+Location form:
+  TARGET is a contained file path; --line is required, with optional
+  --end-line and --column. Reference forms are --ref-json, --ref-file, or
+  --targets-file (use '-' for stdin).
+
+Options:
+  --context-lines N       Include N surrounding lines (0..10).
+  --include-enclosing     Include enclosing-symbol results (default).
+  --no-enclosing          Omit enclosing-symbol results.
+  --cursor TOKEN          Continue a previous bounded read page.
+  --max-bytes N           Maximum response bytes for the page.
+  --max-lines N           Maximum source lines for the page.
+  --source-bytes N        Maximum source bytes for the page.
+  --timeout-seconds N     Operation deadline in seconds.
+  --cache auto|off        Operation cache policy.
+  --format json|text      JSON (default) or lossy text.
+  --pretty                Indent JSON output.
+"""
+
+SEARCH_HELP = """Usage: xray search ROOT [source] [options]
+
+Search captured repository text, syntax patterns, or one explicit rule/config
+input. Exactly one source is required: --literal, --pattern, --rule, or
+--config. Pattern searches require an explicit --lang.
+
+Sources:
+  --literal TEXT           Exact case-sensitive UTF-8 text.
+  --pattern PATTERN        Structural ast-grep pattern.
+  --lang LANGUAGE          Pattern language: python, javascript, typescript, go.
+  --rule FILE              One contained standalone rule file.
+  --config FILE            One contained ruleDirs-only configuration file.
+
+Selection and result options:
+  --path PATH              Restrict selection (repeatable).
+  --glob PATTERN           Restrict selection with an ordered glob (repeatable).
+  --language LANGUAGE      Restrict selection language (repeatable).
+  --exclusions default|none
+                           Apply or disable generated exclusions.
+  --detail summary|detail  Include verified captures in detail mode.
+  --cursor TOKEN           Continue a previous bounded search page.
+  --limit N                Maximum matches (1..1000).
+  --max-bytes N            Maximum response bytes for the page.
+  --timeout-seconds N      Operation deadline in seconds.
+  --cache auto|off         Operation cache policy.
+  --format json|text       JSON (default) or lossy text.
+  --pretty                 Indent JSON output.
+"""
+
+IMPACT_HELP = """Usage: xray impact ROOT --ref-json JSON [options]
+       xray impact ROOT --ref-file FILE [options]
+
+Report unresolved occurrences for one exact captured symbol reference. Use
+--ref-file - to read the reference JSON from standard input.
+
+Options:
+  --mode syntax|lexical     Choose syntax evidence or explicit lexical evidence.
+  --path PATH               Restrict selection (repeatable).
+  --glob PATTERN            Restrict selection with an ordered glob (repeatable).
+  --language LANGUAGE       Restrict selection language (repeatable).
+  --exclusions default|none
+                            Apply or disable generated exclusions.
+  --cursor TOKEN            Continue a previous bounded impact page.
+  --limit N                 Maximum matches (1..1000).
+  --max-bytes N             Maximum response bytes for the page.
+  --timeout-seconds N       Operation deadline in seconds.
+  --cache auto|off          Operation cache policy.
+  --format json|text        JSON (default) or lossy text.
+  --pretty                  Indent JSON output.
+"""
+
+CHANGE_HELP = """Usage: xray change plan|refine|verify|apply ROOT [options]
+
+Plan, refine, verify, or apply one complete guarded structural change.
+Only the apply leaf can write repository source files.
+
+Leaves:
+  plan                  Build a complete non-mutating change plan.
+  refine                Select reviewed edit IDs and emit a new plan.
+  verify                Recheck a complete plan without writing.
+  apply                 Recheck and apply a complete reviewed plan.
+"""
+
+CHANGE_PLAN_HELP = """Usage: xray change plan ROOT [options]
+
+Build a complete non-mutating pattern or rule/config change plan.
+
+Sources (exactly one):
+  --pattern PATTERN        Structural ast-grep pattern.
+  --replacement TEXT       Replacement template paired with --pattern.
+  --lang LANGUAGE          Pattern language: python, javascript, typescript, go.
+  --rule FILE               One contained standalone rule file.
+  --config FILE             One contained ruleDirs-only configuration file.
+
+Selection:
+  --path PATH               Restrict selection (repeatable).
+  --glob PATTERN            Restrict selection with an ordered glob (repeatable).
+  --language LANGUAGE       Restrict selection language (repeatable).
+  --exclusions default|none
+                            Apply or disable generated exclusions.
+
+Plan bounds and acknowledgements:
+  --max-candidates N        Candidate cap (1..1000).
+  --max-files N             Affected-file cap (1..100).
+  --max-bytes N             Complete-plan response cap (4096..262144).
+  --allow-dirty-affected    Acknowledge affected files dirty in Git.
+  --allow-new-parse-errors  Acknowledge newly introduced parse errors.
+
+  --timeout-seconds N       Operation deadline in seconds.
+  --cache auto|off          Operation cache policy.
+  --format json|text        JSON (default) or lossy text.
+  --pretty                  Indent JSON output.
+"""
+
+CHANGE_REFINE_HELP = """Usage: xray change refine ROOT --plan-file FILE [options]
+
+Select sorted edit IDs from a complete plan and emit a new complete plan.
+FILE is a complete xray.change.v1 plan or '-' for standard input. Repeating
+--edit-id selects the corresponding edits; omitting it selects none.
+
+Options:
+  --edit-id DIGEST          Reviewed edit ID (repeatable, sorted).
+  --timeout-seconds N       Operation deadline in seconds.
+  --cache auto|off          Operation cache policy.
+  --format json|text        JSON (default) or lossy text.
+  --pretty                  Indent JSON output.
+"""
+
+CHANGE_VERIFY_HELP = """Usage: xray change verify ROOT --plan-file FILE --expected-digest DIGEST [options]
+
+Verify a complete reviewed plan without writing repository source files.
+FILE is a complete xray.change.v1 plan or '-' for standard input.
+
+Options:
+  --timeout-seconds N       Operation deadline in seconds.
+  --cache auto|off          Operation cache policy.
+  --format json|text        JSON (default) or lossy text.
+  --pretty                  Indent JSON output.
+"""
+
+CHANGE_APPLY_HELP = """Usage: xray change apply ROOT --plan-file FILE --expected-digest DIGEST [options]
+
+Verify and apply a complete reviewed plan. Apply is the only change leaf that
+can write repository source files. FILE is a complete xray.change.v1 plan or
+'-' for standard input.
+
+Options:
+  --timeout-seconds N       Operation deadline in seconds.
+  --cache auto|off          Operation cache policy.
+  --format json|text        JSON (default) or lossy text.
+  --pretty                  Indent JSON output.
+"""
+
+CAPABILITIES_HELP = """Usage: xray capabilities [ROOT] [options]
+
+Report enabled-operation capabilities. Without ROOT this is a rootless catalog
+check; ROOT is never inferred from the current directory.
+
+Options:
+  --detail summary|detail  Include enabled operation summaries in detail mode.
+  --timeout-seconds N      Operation deadline in seconds.
+  --format json|text       JSON (default) or lossy text.
+  --pretty                 Indent JSON output.
+"""
+
+SKILL_HELP = """Usage: xray skill install [--user | --project ROOT] [--force] [--pretty]
+
+Install the bundled xray-cli skill. The default scope is the current user's
+home. A divergent existing target is refused unless --force is supplied.
+"""
+
+ROOT_HELP = """Usage: xray COMMAND [options]
+
+Enabled commands:
+  map              Map the explicitly rooted repository namespace.
+  find             Find declarations by name or qualified identity.
+  interface        Read one bounded file or symbol interface.
+  read             Read exact captured source targets.
+  impact           Report unresolved syntax or lexical symbol occurrences.
+  search           Search literal text, syntax patterns, or selected rules.
+  change             Plan, refine, verify, or apply a guarded structural change.
+  capabilities     Report the enabled operation catalog and health.
+  skill install    Install the bundled shell-agent skill.
+Global options:
+  --version        Print the XRAY version.
+  --help           Show this help.
+"""
 
 
 def get_version() -> str:
+    """Return the installed distribution version, with source fallback."""
     try:
         return metadata.version("xray")
     except metadata.PackageNotFoundError:
         return __version__
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = XRayArgumentParser(
-        prog="xray",
-        description="Code intelligence for LLM agents: inspect, assess impact, and make structural changes.",
-        epilog=ROOT_HELP_EPILOG,
-    )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {get_version()}")
-
-    subparsers = parser.add_subparsers(dest="command", required=True, parser_class=XRayArgumentParser)
-
-    explore = subparsers.add_parser(
-        "explore",
-        aliases=["map"],
-        help="Map repository structure, optionally with symbols.",
-        description=EXPLORE_HELP,
-        epilog=EXPLORE_EPILOG,
-    )
-    explore.add_argument("root_path", help="Repository root to inspect.")
-    depth = explore.add_mutually_exclusive_group()
-    depth.add_argument("--max-depth", type=int, default=2, help="Maximum directory depth to traverse (default: 2).")
-    depth.add_argument(
-        "--all-depths",
-        action="store_const",
-        const=None,
-        default=argparse.SUPPRESS,
-        dest="max_depth",
-        help="Traverse without a depth limit.",
-    )
-    explore.add_argument(
-        "--include-symbols",
-        "--symbols",
-        action="store_true",
-        help="Include function/class/type skeletons for supported source files.",
-    )
-    explore.add_argument(
-        "--focus",
-        dest="focus_dirs",
-        action="append",
-        default=None,
-        help="Contained file or directory focus. Repeat for multiple nested scopes.",
-    )
-    explore.add_argument(
-        "--strict-focus",
-        action="store_false",
-        dest="include_root_context",
-        help="Return only each focus, its ancestors, and focus-relative descendants; omit unrelated root files.",
-    )
-    explore.add_argument(
-        "--max-symbols-per-file",
-        type=int,
-        default=5,
-        help="Maximum skeleton symbols shown per file when symbols are included.",
-    )
-    explore.add_argument(
-        "--type",
-        dest="symbol_types",
-        help="Comma-separated ast-grep outline symbol types, such as class,interface.",
-    )
-    explore.add_argument(
-        "--max-entries",
-        "--limit",
-        type=int,
-        default=5000,
-        help="Maximum files and directories returned (default: 5000); truncation is reported.",
-    )
-    explore.add_argument(
-        "--no-default-exclusions",
-        action="store_false",
-        dest="use_default_exclusions",
-        help="Include generated/agent-state paths while still honoring repository .gitignore rules.",
-    )
-    explore.add_argument(
-        "--format",
-        choices=("json", "text"),
-        default="json",
-        help=OUTPUT_FORMAT_HELP,
-    )
-    explore.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    add_schema_arg(explore)
-    explore.add_argument(
-        "--detail",
-        choices=("compact", "full"),
-        default="compact",
-        help="JSON detail level; full preserves the v1 payload.",
-    )
-    explore.set_defaults(handler=handle_explore)
-
-    find = subparsers.add_parser(
-        "find",
-        help="Find symbols by calibrated name match.",
-        description="Find definitions by name or owner-qualified identity.",
-        epilog=FIND_EPILOG,
-    )
-    find.add_argument("root_path", help="Repository root to inspect.")
-    find.add_argument("query", help="Symbol query, such as 'auth service' or 'parse_json'.")
-    find.add_argument("--limit", type=int, default=10, help="Maximum number of matches to return.")
-    find.add_argument("--cursor", help="Continuation for the same query/projection/snapshot; page size may change.")
-    find.add_argument(
-        "--min-score",
-        type=int,
-        default=60,
-        help="Minimum calibrated name-match score, from 0 to 100 (default: 60).",
-    )
-    find.add_argument("--path", dest="paths", action="append", help="Contained file/directory scope; repeatable.")
-    find.add_argument("--language", dest="languages", action="append", help="Language filter; repeatable.")
-    find.add_argument("--type", dest="symbol_types", action="append", help="Symbol-type filter; repeatable.")
-    find.add_argument(
-        "--visibility", action="append", choices=("public", "private", "unknown"), help="Visibility filter; repeatable."
-    )
-    find.add_argument(
-        "--detail", choices=("compact", "full"), default="compact", help="Compact v3 (default) or v1 envelope."
-    )
-    find.add_argument(
-        "--format",
-        choices=("json", "text"),
-        default="json",
-        help=OUTPUT_FORMAT_HELP,
-    )
-    find.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    add_schema_arg(find)
-    find.set_defaults(handler=handle_find)
-
-    interface = subparsers.add_parser(
-        "interface",
-        help="Show a file interface without implementation bodies.",
-        description=INTERFACE_HELP,
-        epilog=INTERFACE_EPILOG,
-    )
-    interface.add_argument("root_path", help="Repository root to inspect.")
-    interface.add_argument(
-        "file_path", nargs="?", help="File path that must resolve inside the root; optional with exact-symbol input."
-    )
-    interface.add_argument(
-        "--symbol-json", help="Exact symbol JSON from find; v3 returns its owner and selected member."
-    )
-    interface.add_argument("--symbol-file", help="Exact symbol JSON file, or '-' for stdin.")
-    interface.add_argument("--name", dest="symbol_names", action="append", help="Top-level symbol name; repeatable.")
-    interface.add_argument("--type", dest="symbol_types", action="append", help="Top-level symbol type; repeatable.")
-    interface.add_argument(
-        "--visibility", action="append", choices=("public", "private", "unknown"), help="Visibility; repeatable."
-    )
-    interface.add_argument("--member-depth", type=int, default=1, help="Nested member depth (default: 1).")
-    interface.add_argument("--max-members", type=int, default=20, help="Members per symbol (default: 20).")
-    interface.add_argument("--limit", type=int, default=50, help="Top-level symbols per page (default: 50).")
-    interface.add_argument(
-        "--cursor", help="Continuation for the same query/projection/snapshot; page size may change."
-    )
-    interface.add_argument(
-        "--detail",
-        choices=("compact", "full"),
-        default="compact",
-        help="Structured compact v3 contract (default) or legacy v1 string envelope.",
-    )
-    interface.add_argument(
-        "--format",
-        choices=("json", "text"),
-        default="json",
-        help=OUTPUT_FORMAT_HELP,
-    )
-    interface.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    add_schema_arg(interface)
-    interface.set_defaults(handler=handle_interface)
-
-    read_symbol = subparsers.add_parser(
-        "read-symbol",
-        help="Read one exact symbol source slice with bounds.",
-        description="Read one exact contained symbol source slice with explicit line and byte bounds.",
-    )
-    read_symbol.add_argument("root_path", help="Repository root containing the symbol.")
-    add_symbol_input_args(read_symbol)
-    read_symbol.add_argument("--context-lines", type=int, default=0, help="Context lines around the symbol.")
-    read_symbol.add_argument("--max-lines", type=int, default=200, help="Maximum returned lines (default: 200).")
-    read_symbol.add_argument("--max-bytes", type=int, default=64 * 1024, help="Maximum returned UTF-8 bytes.")
-    read_symbol.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    add_schema_arg(read_symbol)
-    read_symbol.set_defaults(handler=handle_read_symbol, format="json")
-
-    symbol_at = subparsers.add_parser(
-        "symbol-at",
-        help="Find the narrowest symbol enclosing a source line.",
-        description="Find the narrowest symbol enclosing one contained source line.",
-    )
-    symbol_at.add_argument("root_path", help="Repository root containing the file.")
-    symbol_at.add_argument("file_path", help="Contained source file.")
-    symbol_at.add_argument("line", type=int, help="One-based source line.")
-    symbol_at.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    add_schema_arg(symbol_at)
-    symbol_at.set_defaults(handler=handle_symbol_at, format="json")
-
-    impact = subparsers.add_parser(
-        "impact",
-        help="Find likely symbol-name code references for impact review.",
-        description=IMPACT_HELP,
-        epilog=IMPACT_EPILOG,
-    )
-    impact.add_argument("root_path", help="Repository root to inspect.")
-    impact.add_argument("--symbol-json", help="Exact symbol object as JSON, usually from `xray find`.")
-    impact.add_argument(
-        "--symbol-file",
-        help="Path to a JSON file containing the exact symbol object. Use '-' to read stdin.",
-    )
-    impact.add_argument("--name", help="Symbol name when not passing a full symbol JSON object.")
-    impact.add_argument("--path", help="Symbol definition path when not passing a full symbol JSON object.")
-    impact.add_argument("--type", default="symbol", help="Symbol type for manually specified symbols.")
-    impact.add_argument(
-        "--start-line",
-        type=int,
-        default=None,
-        help="Definition start line for manual symbols; required with --name and --path.",
-    )
-    impact.add_argument("--end-line", type=int, default=None, help="Definition end line for manual symbols.")
-    impact.add_argument("--context-lines", type=int, default=2, help="Context lines around each reference.")
-    impact.add_argument("--limit", type=int, default=DEFAULT_STRUCTURAL_LIMIT, help="Maximum returned references.")
-    impact.add_argument("--cursor", help="Continuation for the same query/projection/snapshot; page size may change.")
-    impact.add_argument(
-        "--detail",
-        choices=("compact", "full"),
-        default="compact",
-        help="Compact relative-path v2 results (default) or full v1-compatible context.",
-    )
-    impact.add_argument(
-        "--format",
-        choices=("json", "text"),
-        default="json",
-        help=OUTPUT_FORMAT_HELP,
-    )
-    impact.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    add_schema_arg(impact)
-    impact.set_defaults(handler=handle_impact)
-
-    search = subparsers.add_parser("search", help="Search with an ast-grep pattern.")
-    search.add_argument("root_path", help="Repository root to search.")
-    search.add_argument("-p", "--pattern", required=True, help="ast-grep structural pattern.")
-    search.add_argument("-l", "--lang", help="Pattern language when it cannot be inferred.")
-    add_scope_args(search)
-    add_structural_output_args(
-        search,
-        limit_help=f"Result cap (default: {DEFAULT_STRUCTURAL_LIMIT}); also bounds upstream search.",
-    )
-    search.set_defaults(handler=handle_search)
-
-    rewrite = subparsers.add_parser("rewrite", help="Apply an ast-grep structural rewrite in place.")
-    rewrite.add_argument("root_path", help="Repository root to rewrite.")
-    rewrite.add_argument("-p", "--pattern", required=True, help="ast-grep structural pattern.")
-    rewrite.add_argument("-r", "--replacement", required=True, help="Replacement template.")
-    rewrite.add_argument(
-        "-l",
-        "--lang",
-        help="Target language; specify it when known to keep mutations from matching pattern-like non-code text.",
-    )
-    add_structural_output_args(
-        rewrite,
-        supports_cursor=False,
-        limit_help=f"Reported-match cap (default: {DEFAULT_STRUCTURAL_LIMIT}); edits still cover every match.",
-    )
-    rewrite.set_defaults(handler=handle_rewrite)
-
-    scan = subparsers.add_parser("scan", help="Scan code with ast-grep YAML rules.")
-    scan.add_argument("root_path", help="Repository root to scan.")
-    scan.add_argument("--rule", required=True, help="Rule configuration file or directory inside the root.")
-    scan.add_argument("--fix", action="store_true", help="Apply every rule fix without prompting.")
-    add_scope_args(scan)
-    add_structural_output_args(
-        scan,
-        limit_help=f"Diagnostic cap (default: {DEFAULT_STRUCTURAL_LIMIT}); --fix still applies every fix.",
-    )
-    scan.set_defaults(handler=handle_scan)
-
-    rules = subparsers.add_parser("rules", help="Validate, explain, or test ast-grep rules without mutation.")
-    rules_subparsers = rules.add_subparsers(dest="rules_command", required=True, parser_class=XRayArgumentParser)
-    rules_check = rules_subparsers.add_parser(
-        "check", help="Validate and scan one contained rule source.", description="Validate and scan without fixes."
-    )
-    rules_check.add_argument("root_path")
-    rules_check.add_argument("--rule", required=True)
-    add_scope_args(rules_check)
-    add_structural_output_args(
-        rules_check,
-        limit_help=f"Diagnostic page size (default: {DEFAULT_STRUCTURAL_LIMIT}).",
-    )
-    rules_check.set_defaults(handler=handle_rules_check)
-    rules_explain = rules_subparsers.add_parser(
-        "explain", help="Show bounded source and upstream inspection.", description="Inspect one rule without mutation."
-    )
-    rules_explain.add_argument("root_path")
-    rules_explain.add_argument("--rule", required=True)
-    add_scope_args(rules_explain)
-    rules_explain.add_argument("--source-limit", type=int, default=32_000)
-    rules_explain.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    rules_explain.set_defaults(handler=handle_rules_explain, format="json")
-    rules_test = rules_subparsers.add_parser(
-        "test",
-        help="Run contained rule tests without snapshot updates.",
-        description="Run contained tests non-interactively without updating snapshots.",
-    )
-    rules_test.add_argument("root_path")
-    rules_test.add_argument("--test-dir", default=".")
-    rules_test.add_argument("--config")
-    rules_test.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    rules_test.set_defaults(handler=handle_rules_test, format="json")
-
-    replace = subparsers.add_parser(
-        "replace",
-        help="Plan or guardedly apply a bounded structural replacement.",
-        description="Plan without writes; apply only a reviewed unchanged plan.",
-    )
-    replace_subparsers = replace.add_subparsers(dest="replace_command", required=True, parser_class=XRayArgumentParser)
-    replace_plan = replace_subparsers.add_parser(
-        "plan",
-        help="Create a non-mutating exact replacement plan.",
-        description="Emit an exact JSON plan without writing files.",
-    )
-    replace_plan.add_argument("root_path", help="Repository root to inspect without mutation.")
-    replace_plan.add_argument("-p", "--pattern", help="ast-grep structural pattern.")
-    replace_plan.add_argument("-r", "--replacement", help="Replacement template paired with --pattern.")
-    replace_plan.add_argument("--rule", help="Fix-bearing ast-grep rule/config path inside the root.")
-    replace_plan.add_argument("-l", "--lang", help="Pattern language when using --pattern.")
-    add_scope_args(replace_plan)
-    replace_plan.add_argument("--max-matches", type=int, default=1000, help="Candidate cap (default: 1000).")
-    replace_plan.add_argument("--max-files", type=int, default=100, help="Affected-file cap (default: 100).")
-    replace_plan.add_argument("--preview-limit", type=int, default=50, help="Preview cap (default: 50).")
-    replace_plan.add_argument("--diff-limit", type=int, default=100_000, help="Unified-diff character cap.")
-    replace_plan.add_argument("--allow-noop", action="store_true", help="Record permission to apply an all-no-op plan.")
-    replace_plan.add_argument(
-        "--allow-truncated-review", action="store_true", help="Acknowledge applying from bounded review content."
-    )
-    replace_plan.add_argument(
-        "--allow-dirty-affected",
-        action="store_true",
-        help="Acknowledge that affected files already contain Git worktree changes.",
-    )
-    replace_plan.add_argument(
-        "--allow-new-parse-errors",
-        action="store_true",
-        help="Explicitly record permission for newly introduced ast-grep parse errors.",
-    )
-    replace_plan.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    replace_plan.set_defaults(handler=handle_replace_plan, format="json")
-
-    replace_refine = replace_subparsers.add_parser(
-        "refine",
-        help="Re-plan a reviewed subset by stable edit ID.",
-        description="Re-plan repeated stable edit IDs without writing files.",
-    )
-    replace_refine.add_argument("root_path", help="Repository root bound by the plan.")
-    replace_refine.add_argument("--plan-file", required=True, help="Full v2 plan JSON file, or '-' for stdin.")
-    replace_refine.add_argument("--edit-id", dest="edit_ids", action="append", required=True)
-    replace_refine.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    replace_refine.set_defaults(handler=handle_replace_refine, format="json")
-
-    replace_verify = replace_subparsers.add_parser(
-        "verify",
-        help="Recompute every apply guard without writing.",
-        description=(
-            "Verify digest, source, selection, syntax, dirtiness, completeness, and applicability without writes."
-        ),
-    )
-    replace_verify.add_argument("root_path", help="Repository root bound by the plan.")
-    replace_verify.add_argument(
-        "--plan-file", required=True, help="Full v2 plan JSON file, or '-' for standard input (bounded to 10 MiB)."
-    )
-    replace_verify.add_argument("--expected-digest", required=True, help="Independently copied reviewed plan digest.")
-    replace_verify.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    replace_verify.set_defaults(handler=handle_replace_verify, format="json")
-
-    replace_apply = replace_subparsers.add_parser(
-        "apply",
-        help="Apply a reviewed plan after all guards pass.",
-        description="Validate plan, digest, and source; then stage, replace, and verify.",
-    )
-    replace_apply.add_argument("root_path", help="Repository root bound by the plan.")
-    replace_apply.add_argument(
-        "--plan-file", required=True, help="Full plan JSON file, or '-' for standard input (bounded to 10 MiB)."
-    )
-    replace_apply.add_argument("--expected-digest", required=True, help="Independently copied reviewed plan digest.")
-    replace_apply.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    replace_apply.set_defaults(handler=handle_replace_apply, format="json")
-
-    skill = subparsers.add_parser(
-        "skill",
-        help="Install the bundled xray-cli agent skill.",
-        description="Install for this user or one project.",
-    )
-    skill_subparsers = skill.add_subparsers(dest="skill_command", required=True, parser_class=XRayArgumentParser)
-    skill_install = skill_subparsers.add_parser(
-        "install",
-        help="Install; divergent content requires --force.",
-    )
-    scope = skill_install.add_mutually_exclusive_group()
-    scope.add_argument("--user", action="store_true", help="Use ~/.agents/skills (default).")
-    scope.add_argument("--project", metavar="ROOT", help="Use ROOT/.agents/skills.")
-    skill_install.add_argument("--force", action="store_true", help="Replace divergent content.")
-    skill_install.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    skill_install.set_defaults(handler=handle_skill_install, format="json")
-
-    capabilities = subparsers.add_parser(
-        "capabilities",
-        aliases=["doctor"],
-        help="Report schemas, operations, bounds, and dependency health.",
-        description="Report schemas, operations, bounds, caches, dependencies, and health.",
-    )
-    capabilities.add_argument("root_path", nargs="?", help="Optional repository root for repository checks.")
-    capabilities.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    add_schema_arg(capabilities)
-    capabilities.set_defaults(handler=handle_capabilities, format="json")
-
-    for command in ("imports", "exports"):
-        outline = subparsers.add_parser(command, help=f"List file {command} using ast-grep outline.")
-        outline.add_argument("root_path", help="Repository root containing the file.")
-        outline.add_argument("file_path", help="File path, absolute or relative; must stay inside the root.")
-        add_structural_output_args(outline, limit_help=f"Page size (default: {DEFAULT_STRUCTURAL_LIMIT}).")
-        outline.set_defaults(handler=handle_outline_items, outline_item=command)
-
-    return parser
-
-
-def add_scope_args(parser: argparse.ArgumentParser) -> None:
-    """Add repeatable contained paths and ast-grep glob filters."""
-    parser.add_argument("--path", dest="paths", action="append", help="Contained file/directory scope; repeatable.")
-    parser.add_argument("--glob", dest="globs", action="append", help="Ordered ast-grep glob filter; repeatable.")
-
-
-def add_symbol_input_args(parser: argparse.ArgumentParser) -> None:
-    """Add the established exact-symbol input alternatives."""
-    parser.add_argument("--symbol-json", help="Exact symbol object as JSON, usually from `xray find`.")
-    parser.add_argument("--symbol-file", help="JSON file containing the exact symbol, or '-' for stdin.")
-    parser.add_argument("--name", help="Symbol name for a manually specified symbol.")
-    parser.add_argument("--path", help="Contained definition path for a manually specified symbol.")
-    parser.add_argument("--type", default="symbol", help="Symbol type for a manually specified symbol.")
-    parser.add_argument("--start-line", type=int, default=None, help="One-based symbol start line.")
-    parser.add_argument("--end-line", type=int, default=None, help="One-based symbol end line.")
-
-
-def add_schema_arg(parser: argparse.ArgumentParser, *, visible: bool = True) -> None:
-    """Add the compact response projection selector."""
-    parser.add_argument(
-        "--schema",
-        choices=("v2", "v3"),
-        default="v3",
-        help="Compact schema (default: v3)." if visible else argparse.SUPPRESS,
-    )
-
-
-def add_structural_output_args(
-    parser: argparse.ArgumentParser,
-    *,
-    limit_help: str,
-    supports_cursor: bool = True,
-) -> None:
-    parser.add_argument(
-        "--detail",
-        choices=("compact", "full"),
-        default="compact",
-        help="Compact stable fields (default) or lossless upstream JSON.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=DEFAULT_STRUCTURAL_LIMIT,
-        help=limit_help,
-    )
-    if supports_cursor:
-        parser.add_argument(
-            "--cursor", help="next_cursor for the same query/projection/snapshot; positive page size may change."
-        )
-    else:
-        parser.set_defaults(cursor=None)
-    parser.add_argument("--format", choices=("json", "text"), default="json", help=OUTPUT_FORMAT_HELP)
-    parser.add_argument("--pretty", action="store_true", help=PRETTY_HELP)
-    add_schema_arg(parser, visible=False)
-
-
-def handle_explore(args: argparse.Namespace) -> int:
-    if args.max_depth is not None and args.max_depth < 0:
-        raise ValueError("--max-depth must be 0 or greater.")
-    if args.max_symbols_per_file < 0:
-        raise ValueError("--max-symbols-per-file must be 0 or greater.")
-    if args.max_entries < 1:
-        raise ValueError("--max-entries must be 1 or greater.")
-    symbol_types = [value.strip() for value in (args.symbol_types or "").split(",") if value.strip()]
-
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    data = indexer.explore_repo_data(
-        max_depth=args.max_depth,
-        include_symbols=args.include_symbols,
-        focus_dirs=args.focus_dirs,
-        include_root_context=args.include_root_context,
-        max_symbols_per_file=args.max_symbols_per_file,
-        symbol_types=symbol_types,
-        max_entries=args.max_entries,
-        use_default_exclusions=args.use_default_exclusions,
-    )
-    if args.format == "json":
-        data = dump_explore_data(data)
-        invoked_as = args.command
-        if args.detail == "compact":
-            compact = compact_explore(data)
-            compact.update(
-                {
-                    "schema_version": compact_schema_version(args),
-                    **({"ok": True} if args.schema == "v3" else {}),
-                    "command": "explore",
-                    "invoked_as": invoked_as,
-                }
-            )
-            if data["truncated"]:
-                compact["warnings"] = [
-                    f"Explore output truncated at {args.max_entries} entries; "
-                    "narrow with --focus/--max-depth or raise --max-entries."
-                ]
-            print_json(compact, pretty=args.pretty)
-            return 0
-        data.update(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "ok": True,
-                "command": "explore",
-                "invoked_as": invoked_as,
-                "warnings": (
-                    [
-                        f"Explore output truncated at {args.max_entries} entries; "
-                        "narrow with --focus/--max-depth or raise --max-entries."
-                    ]
-                    if data["truncated"]
-                    else []
-                ),
-            }
-        )
-        print_json(dump_explore_envelope(data), pretty=args.pretty)
-    else:
-        print(data["tree_text"])
-        if data["truncated"]:
-            print(
-                f"... output truncated at {args.max_entries} entries; "
-                "narrow with --focus/--max-depth or raise --max-entries."
-            )
-    return 0
-
-
-def handle_find(args: argparse.Namespace) -> int:
-    if args.limit < 1:
-        raise ValueError("--limit must be 1 or greater for a continuable read.")
-    if args.min_score < 0 or args.min_score > MAX_SCORE:
-        raise ValueError("--min-score must be between 0 and 100.")
-
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    identity, _offset = _validate_page_args(
-        args,
-        "find",
-        indexer.root_path,
-        {
-            "query": args.query,
-            "min_score": args.min_score,
-            "paths": args.paths or [],
-            "languages": args.languages or [],
-            "symbol_types": args.symbol_types or [],
-            "visibility": args.visibility or [],
-            "detail": args.detail,
-        },
-        indexer.repository_snapshot_fingerprint(),
-    )
-    results = indexer.find_symbol(
-        args.query,
-        limit=None,
-        min_score=args.min_score,
-        include_scores=True,
-        paths=args.paths,
-        languages=args.languages,
-        symbol_types=args.symbol_types,
-        visibility=args.visibility,
-    )
-    warnings = list(getattr(indexer, "last_warnings", []))
-    search_failed = not getattr(indexer, "last_search_succeeded", False)
-    if search_failed:
-        raise AstGrepError(warnings[0] if warnings else "Symbol search failed.")
-    formatted_results = [format_symbol_for_json(symbol, indexer.root_path) for symbol in results]
-    page, page_metadata = page_items(
-        formatted_results,
-        command="find",
-        root_path=indexer.root_path,
-        identity=identity,
-        limit=args.limit,
-        cursor=args.cursor,
-    )
-    if args.format == "text":
-        for symbol in page:
-            print(format_symbol(symbol))
-        for warning in warnings:
-            print(f"warning: {warning}", file=sys.stderr)
-    elif args.detail == "compact":
-        print_json(
-            {
-                "schema_version": compact_schema_version(args),
-                "ok": not search_failed,
-                "command": "find",
-                "root_path": str(indexer.root_path),
-                "query": args.query,
-                "limit": args.limit,
-                "min_score": args.min_score,
-                "symbols": page,
-                **page_metadata,
-                "warnings": warnings,
-            },
-            pretty=args.pretty,
-        )
-    else:
-        print_json(
-            dump_find_envelope(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "ok": not search_failed,
-                    "command": "find",
-                    "root_path": str(indexer.root_path),
-                    "query": args.query,
-                    "limit": args.limit,
-                    "min_score": args.min_score,
-                    "symbols": page,
-                    "error": "Symbol search failed." if search_failed else None,
-                    **page_metadata,
-                    "warnings": warnings,
-                }
-            ),
-            pretty=args.pretty,
-        )
-    return 1 if search_failed else 0
-
-
-def handle_interface(args: argparse.Namespace) -> int:
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    exact_symbol = load_interface_symbol(args, indexer.root_path)
-    if exact_symbol is not None:
-        if args.detail == "full":
-            raise ValueError(
-                "Exact-symbol interface selection is unavailable in the full/v1 projection selected by "
-                "--detail full; use compact v3 or select a file."
-            )
-        if args.schema != "v3":
-            raise ValueError(
-                "Exact-symbol interface selection is unavailable in compact v2 selected by --schema v2; "
-                "use compact v3 or select a file."
-            )
-        file_path = str(exact_symbol["path"])
-    elif args.file_path:
-        file_path = args.file_path
-    else:
-        raise ValueError("Provide FILE_PATH or exactly one of --symbol-json/--symbol-file.")
-    if args.detail == "full":
-        rendered = indexer.read_interface(file_path)
-        failed = rendered.startswith("Error reading interface:")
-        if args.format == "text":
-            print(rendered)
-        else:
-            print_json(
-                dump_interface_envelope(
-                    {
-                        "schema_version": SCHEMA_VERSION,
-                        "ok": not failed,
-                        "command": "interface",
-                        "root_path": str(indexer.root_path),
-                        "file_path": file_path,
-                        "interface": None if failed else rendered,
-                        "error": rendered if failed else None,
-                        "warnings": [],
-                    }
-                ),
-                pretty=args.pretty,
-            )
-        return 1 if failed else 0
+def normalize_shell_root(value: str) -> str:
+    """Resolve an explicitly supplied shell root to an existing directory."""
+    if not isinstance(value, str) or not value:
+        raise CliInputError("ROOT must be a non-empty path")
+    if "\x00" in value:
+        raise CliInputError("ROOT must not contain NUL bytes")
     try:
-        structured = dump_interface_data(
-            indexer.read_interface_structured(
-                file_path,
-                symbol_names=args.symbol_names,
-                visibility=args.visibility,
-                symbol_types=args.symbol_types,
-                member_depth=args.member_depth,
-                max_symbols=None,
-                max_members=args.max_members,
-                exact_symbol=exact_symbol,
-            )
-        )
-    except InterfaceReadError as exc:
-        raise exc
-
-    identity, _offset = _validate_page_args(
-        args,
-        "interface",
-        indexer.root_path,
-        {
-            "file_path": file_path,
-            **({"exact_symbol": exact_symbol} if exact_symbol is not None else {}),
-            "symbol_names": args.symbol_names or [],
-            "visibility": args.visibility or [],
-            "symbol_types": args.symbol_types or [],
-            "member_depth": args.member_depth,
-            "max_members": args.max_members,
-        },
-        indexer.repository_snapshot_fingerprint(),
-    )
-    symbols, metadata = page_items(
-        structured["symbols"],
-        command="interface",
-        root_path=indexer.root_path,
-        identity=identity,
-        limit=args.limit,
-        cursor=args.cursor,
-    )
-    structured["symbols"] = symbols
-    structured.update(metadata)
-    if metadata["truncated"]:
-        structured["complete"] = False
-        structured["warnings"].append("Top-level interface symbols are paged; continue with next_cursor.")
-
-    rendered = indexer.render_interface(structured)
-    if args.schema == "v3":
-        structured = compact_v3_interface(structured)
-    else:
-        structured.pop("warning_details", None)
-    if args.format == "text":
-        print(rendered)
-    else:
-        print_json(
-            {
-                "schema_version": compact_schema_version(args),
-                "ok": True,
-                "command": "interface",
-                "root_path": str(indexer.root_path),
-                "interface": structured,
-            },
-            pretty=args.pretty,
-        )
-    return 0
+        candidate = Path(value).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise CliInputError(f"ROOT cannot be resolved: {value}") from exc
+    if not candidate.is_dir():
+        raise CliInputError(f"ROOT is not a directory: {value}")
+    return candidate.as_posix()
 
 
-def handle_read_symbol(args: argparse.Namespace) -> int:
-    """Read one exact symbol source range through the shared bounded core."""
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    symbol = load_symbol(args, indexer.root_path)
-    result = indexer.read_symbol(
-        symbol,
-        context_lines=args.context_lines,
-        max_lines=args.max_lines,
-        max_bytes=args.max_bytes,
-    )
-    print_json(
-        _compact_envelope("read-symbol", args=args, root_path=str(indexer.root_path), result=result), pretty=args.pretty
-    )
-    return 0
+def _bounded_message(value: object) -> str:
+    text = str(value) or "request failed"
+    encoded = text.encode("utf-8")
+    if len(encoded) > MAX_ERROR_MESSAGE_BYTES:
+        text = encoded[:MAX_ERROR_MESSAGE_BYTES].decode("utf-8", errors="ignore")
+    return text or "request failed"
 
 
-def handle_symbol_at(args: argparse.Namespace) -> int:
-    """Resolve one source location to the narrowest enclosing symbol."""
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    symbol = indexer.symbol_at(args.file_path, args.line)
-    if symbol is not None:
-        symbol = format_symbol_for_json(symbol, indexer.root_path)
-    print_json(
-        _compact_envelope(
-            "symbol-at",
-            args=args,
-            root_path=str(indexer.root_path),
-            file_path=args.file_path,
-            line=args.line,
-            symbol=symbol,
-            found=symbol is not None,
-        ),
-        pretty=args.pretty,
-    )
-    return 0
-
-
-def handle_impact(args: argparse.Namespace) -> int:
-    if args.context_lines < 0:
-        raise ValueError("--context-lines must be 0 or greater.")
-    if args.start_line is not None and args.start_line < 1:
-        raise ValueError("--start-line must be 1 or greater.")
-    if args.end_line is not None and args.end_line < 1:
-        raise ValueError("--end-line must be 1 or greater.")
-    if args.limit < 1:
-        raise ValueError("--limit must be 1 or greater for a continuable read.")
-
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    symbol = load_symbol(args, indexer.root_path)
-    identity, offset = _validate_page_args(
-        args,
-        "impact",
-        indexer.root_path,
-        {
-            "symbol": {key: symbol.get(key) for key in ("name", "path", "abs_path", "start_line", "end_line", "type")},
-            "context_lines": args.context_lines,
-            "detail": args.detail,
-        },
-        indexer.repository_snapshot_fingerprint(),
-    )
-    result = dump_impact_result(
-        indexer.what_breaks(
-            symbol,
-            context_lines=args.context_lines,
-            max_results=offset + args.limit + 1,
-        )
-    )
-    is_error = isinstance(result, dict) and "error" in result
-    raw_references = result.get("references", []) if isinstance(result, dict) else []
-    references: Sequence[Mapping[str, Any]] = (
-        raw_references
-        if args.detail == "full"
-        else compact_impact_references(raw_references, indexer.root_path, str(symbol["name"]))
-    )
-    page, metadata = page_items(
-        references,
-        command="impact",
-        root_path=indexer.root_path,
-        identity=identity,
-        limit=args.limit,
-        cursor=args.cursor,
-        total_exact=bool(result.get("total_exact", True)),
-    )
-    presented = {**result, "references": [dict(reference) for reference in page], **metadata}
-    if args.schema == "v3" and args.detail == "compact":
-        presented = compact_v3_impact(presented)
-    if args.format == "text":
-        print(format_impact(presented))
-    elif args.detail == "compact":
-        print_json(
-            {
-                "schema_version": compact_schema_version(args),
-                **({"ok": not is_error} if args.schema == "v3" else {}),
-                "command": "impact",
-                "root_path": str(indexer.root_path),
-                "symbol": format_symbol_for_json(symbol, indexer.root_path),
-                "impact": presented,
-            },
-            pretty=args.pretty,
-        )
-    else:
-        print_json(
-            dump_impact_envelope(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "ok": not is_error,
-                    "command": "impact",
-                    "root_path": str(indexer.root_path),
-                    "symbol": format_symbol_for_json(symbol, indexer.root_path),
-                    "impact": presented,
-                    "error": result.get("error") if is_error else None,
-                    "warnings": [],
-                }
-            ),
-            pretty=args.pretty,
-        )
-    return 1 if is_error else 0
-
-
-def _command_envelope(command: str, root_path: Path, **payload: Any) -> dict[str, Any]:
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "ok": True,
-        "command": command,
-        "root_path": str(root_path),
-        **payload,
-        "warnings": [],
+def _error_payload(operation: str | None, code: str, message: object) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "schema": "xray.v1",
+        "ok": False,
+        "error": {"code": code, "message": _bounded_message(message)},
     }
+    if operation is not None:
+        values["op"] = operation
+        if operation == "change_apply":
+            values["mutation"] = {"state": "not_applied", "rollback_status": "not_attempted"}
+    return Error.model_validate(values).to_payload()
 
 
-def _validate_page_args(
-    args: argparse.Namespace,
-    command: str,
-    root_path: Path,
-    identity: Mapping[str, Any],
-    source_snapshot: str,
-    *,
-    continuable: bool = True,
-) -> tuple[dict[str, Any], int]:
-    """Bind paging to a content snapshot and validate it before repository work."""
-    if continuable and args.limit < 1:
-        raise ValueError("--limit must be 1 or greater for a continuable read.")
-    if not continuable and args.limit < 0:
-        raise ValueError("--limit must be 0 or greater.")
-    bound_identity = {
-        **identity,
-        "projection": getattr(args, "detail", "compact"),
-        **({"schema": "v3"} if getattr(args, "schema", "v3") == "v3" else {}),
-        "source_snapshot": source_snapshot,
-    }
-    fingerprint = cursor_fingerprint(command, root_path, bound_identity)
+def _strict_json_constant(value: str) -> Any:
+    raise ValueError(f"invalid JSON constant {value!r}")
+
+
+def _parse_json(raw: bytes, source: str) -> Any:
+    if len(raw) > MAX_REQUEST_JSON_BYTES:
+        raise CliInputError(f"JSON input from {source} exceeds {MAX_REQUEST_JSON_BYTES} bytes")
     try:
-        offset = decode_cursor(args.cursor, fingerprint)
-    except ValueError as exc:
-        raise ValueError(f"--{exc}") from exc
-    return bound_identity, offset
-
-
-def _structural_payload(
-    raw_items: Sequence[Mapping[str, Any]],
-    args: argparse.Namespace,
-    command: str,
-    root_path: Path,
-    identity: Mapping[str, Any],
-    *,
-    indexer: XRayIndexer | None = None,
-    total_exact: bool = True,
-    continuable: bool = True,
-) -> tuple[Sequence[Mapping[str, Any]], dict[str, Any]]:
-    has_multi = any(
-        isinstance(meta := item.get("metaVariables"), Mapping) and bool(meta.get("multi")) for item in raw_items
-    )
-    if args.detail == "compact" and has_multi and indexer is not None:
-        page, metadata = page_items(
-            raw_items,
-            command=command,
-            root_path=root_path,
-            identity=identity,
-            limit=args.limit,
-            cursor=args.cursor,
-            continuable=continuable,
-            total_exact=total_exact,
-        )
-        projected, warnings = indexer.project_semantic_captures(page)
-        if warnings:
-            metadata["warnings"] = warnings
-        return compact_structural_items(projected, root_path), metadata
-    projected: Sequence[Mapping[str, Any]] = (
-        raw_items if args.detail == "full" else compact_structural_items(raw_items, root_path)
-    )
-    return page_items(
-        projected,
-        command=command,
-        root_path=root_path,
-        identity=identity,
-        limit=args.limit,
-        cursor=args.cursor,
-        continuable=continuable,
-        total_exact=total_exact,
-    )
-
-
-def compact_schema_version(args: argparse.Namespace) -> str:
-    """Return the selected compact schema."""
-    return V3_SCHEMA_VERSION if getattr(args, "schema", "v3") == "v3" else COMPACT_SCHEMA_VERSION
-
-
-def _compact_envelope(command: str, *, args: argparse.Namespace | None = None, **payload: Any) -> dict[str, Any]:
-    schema_version = V3_SCHEMA_VERSION if getattr(args, "schema", "v3") == "v3" else COMPACT_SCHEMA_VERSION
-    return {"schema_version": schema_version, "ok": True, "command": command, **payload}
-
-
-def handle_search(args: argparse.Namespace) -> int:
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    identity, offset = _validate_page_args(
-        args,
-        "search",
-        indexer.root_path,
-        {"pattern": args.pattern, "lang": args.lang, "paths": args.paths or [], "globs": args.globs or []},
-        indexer.repository_snapshot_fingerprint(),
-    )
-    matches = indexer.search_pattern(
-        args.pattern,
-        args.lang,
-        paths=args.paths,
-        globs=args.globs,
-        max_results=offset + args.limit + 1,
-    )
-    page, metadata = _structural_payload(
-        matches,
-        args,
-        "search",
-        indexer.root_path,
-        identity,
-        indexer=indexer,
-        total_exact=indexer.last_result_total_exact,
-    )
-    if args.format == "text":
-        print_structural_items(page)
-        if metadata["truncated"] and "next_cursor" in metadata:
-            print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
-        return 0
-    if args.detail == "compact":
-        print_json(_compact_envelope("search", args=args, matches=page, **metadata), pretty=args.pretty)
-        return 0
-    print_json(
-        _command_envelope(
-            "search", indexer.root_path, pattern=args.pattern, language=args.lang, matches=page, **metadata
-        ),
-        pretty=args.pretty,
-    )
-    return 0
-
-
-def handle_rewrite(args: argparse.Namespace) -> int:
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    identity = {"pattern": args.pattern, "replacement": args.replacement, "lang": args.lang}
-    identity, _offset = _validate_page_args(
-        args,
-        "rewrite",
-        indexer.root_path,
-        identity,
-        indexer.repository_snapshot_fingerprint(),
-        continuable=False,
-    )
-    summary = indexer.rewrite_pattern(args.pattern, args.replacement, args.lang)
-    if args.format == "text":
-        changed = summary.get("changed_match_count", summary["match_count"])
-        match_label = "match" if changed == 1 else "matches"
-        file_label = "file" if summary["file_count"] == 1 else "files"
-        print(
-            f"{changed} {match_label} changed in {summary['file_count']} {file_label}; "
-            f"{summary.get('no_op_count', 0)} no-op matches"
-        )
-        for path in summary["files_modified"]:
-            print(path)
-        return 0
-    matches = summary.pop("matches", [])
-    page, metadata = _structural_payload(matches, args, "rewrite", indexer.root_path, identity, continuable=False)
-    metadata.pop("next_cursor", None)
-    if args.detail == "compact":
-        print_json(_compact_envelope("rewrite", args=args, **summary), pretty=args.pretty)
-        return 0
-    print_json(
-        _command_envelope(
-            "rewrite",
-            indexer.root_path,
-            pattern=args.pattern,
-            replacement=args.replacement,
-            language=args.lang,
-            **summary,
-            matches=page,
-            **metadata,
-        ),
-        pretty=args.pretty,
-    )
-    return 0
-
-
-def handle_scan(args: argparse.Namespace) -> int:
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    identity = {
-        "rule": args.rule,
-        "fix": args.fix,
-        "paths": args.paths or [],
-        "globs": args.globs or [],
-    }
-    if args.fix and args.cursor:
-        raise ValueError("--cursor cannot be used with scan --fix because fixes mutate the result set.")
-    identity, offset = _validate_page_args(
-        args,
-        "scan",
-        indexer.root_path,
-        identity,
-        indexer.repository_snapshot_fingerprint(),
-        continuable=not args.fix,
-    )
-    matches = indexer.scan_rules(
-        args.rule,
-        args.fix,
-        paths=args.paths,
-        globs=args.globs,
-        max_results=None if args.fix else offset + args.limit + 1,
-    )
-    mutation_summary = indexer.last_mutation_summary if args.fix else None
-    page, metadata = _structural_payload(
-        matches,
-        args,
-        "scan",
-        indexer.root_path,
-        identity,
-        indexer=indexer,
-        total_exact=indexer.last_result_total_exact,
-        continuable=not args.fix,
-    )
-    if args.fix:
-        metadata.pop("next_cursor", None)
-    if args.format == "text":
-        print_structural_items(page)
-        if mutation_summary is not None:
-            print(
-                f"changed={mutation_summary['changed_count']} files={mutation_summary['file_count']} "
-                f"no_ops={mutation_summary['no_op_count']}"
-            )
-        if metadata["truncated"] and "next_cursor" in metadata:
-            print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
-        return 0
-    if args.detail == "compact":
-        payload = _compact_envelope(
-            "scan",
-            args=args,
-            matches=page,
-            fixed=args.fix,
-            selection=indexer.last_rule_selection,
-            **metadata,
-        )
-        if mutation_summary is not None:
-            payload["mutation"] = mutation_summary
-        print_json(payload, pretty=args.pretty)
-        return 0
-    print_json(
-        _command_envelope(
-            "scan",
-            indexer.root_path,
-            rule=args.rule,
-            fixed=args.fix,
-            matches=page,
-            mutation=mutation_summary,
-            selection=indexer.last_rule_selection,
-            **metadata,
-        ),
-        pretty=args.pretty,
-    )
-    return 0
-
-
-def handle_rules_check(args: argparse.Namespace) -> int:
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    identity, offset = _validate_page_args(
-        args,
-        "rules.check",
-        indexer.root_path,
-        {"rule": args.rule, "paths": args.paths or [], "globs": args.globs or []},
-        indexer.repository_snapshot_fingerprint(),
-    )
-    result = indexer.check_rules(
-        args.rule,
-        paths=args.paths,
-        globs=args.globs,
-        max_results=offset + args.limit + 1,
-    )
-    matches, metadata = _structural_payload(
-        result.pop("matches"),
-        args,
-        "rules.check",
-        indexer.root_path,
-        identity,
-        indexer=indexer,
-        total_exact=bool(result.pop("total_exact")),
-    )
-    result.update({"matches": matches, **metadata})
-    if args.format == "text":
-        print_structural_items(matches)
-        if metadata["truncated"] and "next_cursor" in metadata:
-            print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
-        return 0
-    print_json(_compact_envelope("rules.check", root_path=str(indexer.root_path), result=result), pretty=args.pretty)
-    return 0
-
-
-def handle_rules_explain(args: argparse.Namespace) -> int:
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    result = indexer.explain_rules(
-        args.rule,
-        source_limit=args.source_limit,
-        paths=args.paths,
-        globs=args.globs,
-    )
-    print_json(_compact_envelope("rules.explain", root_path=str(indexer.root_path), result=result), pretty=args.pretty)
-    return 0
-
-
-def handle_rules_test(args: argparse.Namespace) -> int:
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    result = indexer.test_rules(test_dir=args.test_dir, config_path=args.config)
-    print_json(_compact_envelope("rules.test", root_path=str(indexer.root_path), result=result), pretty=args.pretty)
-    return 0
-
-
-def handle_capabilities(args: argparse.Namespace) -> int:
-    supplied_root = args.root_path is not None
-    root = normalize_path(args.root_path) if supplied_root else str(Path.cwd().resolve())
-    result = XRayIndexer(root).capabilities(include_repository=supplied_root)
-    print_json(
-        _compact_envelope("capabilities", args=args, invoked_as=args.command, capabilities=result),
-        pretty=args.pretty,
-    )
-    return 0 if result["healthy"] else 1
-
-
-def handle_outline_items(args: argparse.Namespace) -> int:
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    identity = {"file_path": args.file_path}
-    identity, _offset = _validate_page_args(
-        args,
-        args.outline_item,
-        indexer.root_path,
-        identity,
-        indexer.repository_snapshot_fingerprint(),
-    )
-    items = indexer.file_outline_items(args.file_path, args.outline_item)
-    page, metadata = _structural_payload(items, args, args.outline_item, indexer.root_path, identity)
-    if args.format == "text":
-        print_structural_items(page)
-        if metadata["truncated"] and "next_cursor" in metadata:
-            print(f"... {metadata['returned']} of {metadata['total']} results; next_cursor={metadata['next_cursor']}")
-        return 0
-    if args.detail == "compact":
-        print_json(_compact_envelope(args.outline_item, args=args, items=page, **metadata), pretty=args.pretty)
-        return 0
-    print_json(
-        _command_envelope(args.outline_item, indexer.root_path, file_path=args.file_path, items=page, **metadata),
-        pretty=args.pretty,
-    )
-    return 0
-
-
-def handle_skill_install(args: argparse.Namespace) -> int:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CliInputError(f"JSON input from {source} is not valid UTF-8") from exc
+    if not text.strip():
+        raise CliInputError(f"JSON input from {source} is empty")
     try:
-        result = install_cli_skill(project_root=args.project, force=args.force)
-    except OSError as exc:
-        raise SkillInstallError(f"skill installation failed: {exc}") from exc
-    print_json(
-        {
-            "schema_version": SCHEMA_VERSION,
-            "ok": True,
-            "command": "skill",
-            "action": "install",
-            **result.as_dict(),
-            "warnings": [],
-        },
-        pretty=args.pretty,
-    )
-    return 0
+        return json.loads(text, parse_constant=_strict_json_constant)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise CliInputError(f"JSON input from {source} is not valid JSON: {exc}") from exc
 
 
-def handle_replace_plan(args: argparse.Namespace) -> int:
-    """Create and emit a complete, bounded, non-mutating replacement plan."""
-    pattern_source = args.pattern is not None or args.replacement is not None
-    rule_source = args.rule is not None
-    if pattern_source == rule_source:
-        raise ValueError("Provide exactly one replacement source: --pattern/--replacement or --rule.")
-    if pattern_source and (not args.pattern or args.replacement is None):
-        raise ValueError("--pattern and --replacement must be provided together.")
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    plan = indexer.plan_replacement(
-        pattern=args.pattern,
-        replacement=args.replacement,
-        rule_path=args.rule,
-        lang=args.lang,
-        paths=args.paths,
-        globs=args.globs,
-        max_matches=args.max_matches,
-        max_files=args.max_files,
-        allow_noop=args.allow_noop,
-        allow_truncated_review=args.allow_truncated_review,
-        allow_dirty_affected=args.allow_dirty_affected,
-        allow_new_parse_errors=args.allow_new_parse_errors,
-        preview_limit=args.preview_limit,
-        diff_limit=args.diff_limit,
-    )
-    print_json(_compact_envelope("replace.plan", plan=plan), pretty=args.pretty)
-    return 0
-
-
-def handle_replace_refine(args: argparse.Namespace) -> int:
-    """Recompute a reviewed v2 plan for a selected stable edit subset."""
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    plan = _read_plan_json(args.plan_file)
-    refined = indexer.refine_replacement(plan, edit_ids=args.edit_ids)
-    print_json(_compact_envelope("replace.refine", plan=refined), pretty=args.pretty)
-    return 0
-
-
-def _read_plan_json(path_value: str) -> dict[str, Any]:
-    """Read a bounded replacement plan from a file or standard input."""
-    if path_value == "-":
-        raw = sys.stdin.read(MAX_PLAN_JSON_CHARS + 1)
-        source = "stdin"
-    else:
-        path = Path(path_value).expanduser()
+def _read_json_source(value: str) -> Any:
+    if value == "-":
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
         try:
-            if path.stat().st_size > MAX_PLAN_JSON_CHARS:
-                raise ValueError(f"Replacement plan exceeds {MAX_PLAN_JSON_CHARS} characters.")
-            raw = path.read_text(encoding="utf-8")
+            raw = stream.read(MAX_REQUEST_JSON_BYTES + 1)
         except OSError as exc:
-            raise ValueError(f"Could not read replacement plan file '{path_value}': {exc}") from exc
-        source = str(path)
-    if len(raw) > MAX_PLAN_JSON_CHARS:
-        raise ValueError(f"Replacement plan from {source} exceeds {MAX_PLAN_JSON_CHARS} characters.")
+            raise CliInputError(f"could not read JSON input from stdin: {exc}") from exc
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+        if not isinstance(raw, bytes):
+            raise CliInputError("could not read JSON input from stdin")
+        return _parse_json(raw, "stdin")
+
+    path = Path(value).expanduser()
     try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Replacement plan from {source} is not valid JSON: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ValueError("Replacement plan JSON must be an object.")
-    plan = value.get("plan", value)
-    if not isinstance(plan, dict):
-        raise ValueError("Replacement plan envelope must contain an object field named 'plan'.")
-    return plan
+        with path.open("rb") as stream:
+            raw = stream.read(MAX_REQUEST_JSON_BYTES + 1)
+    except OSError as exc:
+        raise CliInputError(f"could not read JSON file '{value}': {exc}") from exc
+    return _parse_json(raw, str(path))
 
 
-def handle_replace_apply(args: argparse.Namespace) -> int:
-    """Apply one reviewed plan only after independent digest and source guards pass."""
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    plan = _read_plan_json(args.plan_file)
-    result = indexer.apply_replacement(plan, expected_digest=args.expected_digest)
-    print_json(_compact_envelope("replace.apply", result=result), pretty=args.pretty)
-    return 0
+def _as_int(name: str, value: str) -> int:
+    try:
+        return int(value, 10)
+    except (TypeError, ValueError) as exc:
+        raise CliInputError(f"{name} requires an integer") from exc
 
 
-def handle_replace_verify(args: argparse.Namespace) -> int:
-    """Recompute every replacement apply guard without writing files."""
-    indexer = XRayIndexer(normalize_path(args.root_path))
-    plan = _read_plan_json(args.plan_file)
-    result = indexer.verify_replacement(plan, expected_digest=args.expected_digest)
-    print_json(_compact_envelope("replace.verify", result=result), pretty=args.pretty)
-    return 0
+def _split_option(token: str) -> tuple[str, str | None]:
+    if not token.startswith("--") or token == "--":
+        return token, None
+    if "=" in token:
+        name, value = token.split("=", 1)
+        return name, value
+    return token, None
 
 
-def print_structural_items(items: Sequence[Mapping[str, Any]]) -> None:
-    """Print concise, lossy ast-grep results for human scanning."""
-    for item in items:
-        nested_items = item.get("items")
-        if isinstance(nested_items, list):
-            group_path = item.get("path") or item.get("file") or ""
-            for nested_item in nested_items:
-                if isinstance(nested_item, Mapping):
-                    print_structural_item(nested_item, default_path=str(group_path))
-            continue
-        print_structural_item(item)
+def _option_value(tokens: list[str], index: int, name: str, inline: str | None) -> tuple[str, int]:
+    if inline is not None:
+        return inline, index
+    next_index = index + 1
+    if next_index >= len(tokens):
+        raise CliInputError(f"{name} requires a value")
+    return tokens[next_index], next_index
 
 
-def print_structural_item(item: Mapping[str, Any], *, default_path: str = "") -> None:
-    """Print one ast-grep match or outline item as a tab-separated scan line."""
-    path = item.get("file") or item.get("path") or default_path
-    range_data = item.get("range")
-    start = range_data.get("start", {}) if isinstance(range_data, Mapping) else {}
-    line = start.get("line") if isinstance(start, Mapping) else None
-    if line is None:
-        line = item.get("line")
-    location = str(path)
-    if line is not None:
-        display_line = int(line) if "line" in item and not range_data else int(line) + 1
-        location = f"{location}:{display_line}" if location else str(display_line)
-
-    label = (
-        item.get("text")
-        or item.get("lines")
-        or item.get("signature")
-        or item.get("name")
-        or item.get("kind")
-        or item.get("ruleId")
-        or item.get("id")
-    )
-    if label is None:
-        label = json.dumps(item, separators=(",", ":"), sort_keys=True)
-    label = " ".join(str(label).split())
-    print(f"{location}\t{label}" if location else label)
+def _ensure_unique(seen: set[str], name: str) -> None:
+    if name in seen:
+        raise CliInputError(f"{name} may be supplied only once")
+    seen.add(name)
 
 
-def load_symbol(args: argparse.Namespace, root_path: Path | None = None) -> dict[str, Any]:
-    sources = [bool(args.symbol_json), bool(args.symbol_file), bool(args.name or args.path)]
-    if sum(sources) != 1:
-        raise ValueError("Provide exactly one symbol source: --symbol-json, --symbol-file, or --name with --path.")
-
-    if args.symbol_json:
-        symbol = json.loads(args.symbol_json)
-    elif args.symbol_file:
-        if args.symbol_file == "-":
-            raw = read_bounded_symbol_json(sys.stdin, "stdin")
-        else:
-            symbol_file = Path(args.symbol_file)
-            try:
-                raw = read_bounded_symbol_json_file(symbol_file)
-            except OSError as exc:
-                raise ValueError(f"Could not read symbol file '{args.symbol_file}': {exc.strerror or exc}") from exc
-        symbol = json.loads(raw)
+def _normalize_location_path(value: str, root: str) -> str:
+    """Normalize a natural location path without dereferencing its target."""
+    if not value or "\x00" in value:
+        raise CliInputError("TARGET must be a non-empty path")
+    root_path = Path(root)
+    expanded = Path(value).expanduser()
+    if expanded.is_absolute():
+        candidate = Path(os.path.normpath(expanded.as_posix()))
+        try:
+            relative = candidate.relative_to(root_path)
+        except ValueError as exc:
+            raise CliInputError(f"TARGET '{value}' is outside ROOT '{root}'", code="path_outside_root") from exc
     else:
-        if not args.name or not args.path:
-            raise ValueError("Manual symbols require both --name and --path.")
-        if args.start_line is None:
-            raise ValueError(
-                "Manual symbols require --start-line so the definition can be excluded from impact results."
-            )
-        symbol = {
-            "name": args.name,
-            "type": args.type,
-            "path": args.path,
-            "start_line": args.start_line,
-            "end_line": args.end_line if args.end_line is not None else args.start_line,
+        relative = Path(os.path.normpath(value))
+        if relative.is_absolute() or relative == Path(".") or relative.parts[:1] == ("..",):
+            raise CliInputError(f"TARGET '{value}' is outside ROOT '{root}'", code="path_outside_root")
+    normalized = relative.as_posix()
+    if not normalized or normalized == ".":
+        raise CliInputError("TARGET must identify a file")
+    return normalized
+
+
+def _output_options(values: dict[str, Any]) -> OutputOptions:
+    output_format = values.get("format", "json")
+    if output_format not in {"json", "text"}:
+        raise CliInputError("--format must be json or text")
+    return OutputOptions(format=output_format, pretty=bool(values.get("pretty", False)))
+
+
+def _parse_output_option(
+    tokens: list[str], index: int, name: str, inline: str | None, values: dict[str, Any], seen: set[str]
+) -> int:
+    if name == "--pretty":
+        _ensure_unique(seen, name)
+        if inline is not None:
+            raise CliInputError("--pretty does not take a value")
+        values["pretty"] = True
+        return index
+    if name == "--format":
+        _ensure_unique(seen, name)
+        value, index = _option_value(tokens, index, name, inline)
+        values["format"] = value
+        return index
+    raise CliInputError(f"unknown option {name}")
+
+
+def _parse_execution_option(
+    tokens: list[str], index: int, name: str, inline: str | None, values: dict[str, Any], seen: set[str]
+) -> int:
+    if name in {"--timeout-seconds", "--cache"}:
+        _ensure_unique(seen, name)
+        value, index = _option_value(tokens, index, name, inline)
+        values[name[2:].replace("-", "_")] = _as_int(name, value) if name == "--timeout-seconds" else value
+        return index
+    raise CliInputError(f"unknown option {name}")
+
+
+def _parse_collection_common_option(
+    tokens: list[str],
+    index: int,
+    name: str,
+    inline: str | None,
+    values: dict[str, Any],
+    seen: set[str],
+) -> tuple[bool, int]:
+    """Parse options shared by the bounded collection operations."""
+    if name in {"--pretty", "--format"}:
+        return True, _parse_output_option(tokens, index, name, inline, values, seen)
+    if name in {"--timeout-seconds", "--cache"}:
+        return True, _parse_execution_option(tokens, index, name, inline, values, seen)
+    if name in {"--cursor", "--limit", "--max-bytes"}:
+        _ensure_unique(seen, name)
+        value, index = _option_value(tokens, index, name, inline)
+        key = name[2:].replace("-", "_")
+        values[key] = _as_int(name, value) if name != "--cursor" else value
+        return True, index
+    return False, index
+
+
+def _append_option_value(
+    tokens: list[str],
+    index: int,
+    name: str,
+    inline: str | None,
+    values: dict[str, Any],
+    key: str,
+) -> int:
+    value, index = _option_value(tokens, index, name, inline)
+    values.setdefault(key, []).append(value)
+    return index
+
+
+def _selection_from_values(values: dict[str, Any]) -> dict[str, Any] | None:
+    selection: dict[str, Any] = {}
+    for field in ("paths", "globs", "languages", "exclusions"):
+        if field in values:
+            selection[field] = values.pop(field)
+    return selection or None
+
+
+def _parse_json_reference(value: Any, option: str) -> dict[str, Any]:
+    parsed = _parse_json(value.encode("utf-8"), option) if isinstance(value, str) else value
+    if not isinstance(parsed, dict):
+        raise CliInputError(f"{option} JSON must contain one symbol reference object")
+    if parsed.get("kind") != "symbol":
+        raise CliInputError(f"{option} JSON must contain one symbol reference object")
+    return parsed
+
+
+def _parse_map(argv: list[str]) -> ParsedCommand:
+    if argv and argv[0] in {"--help", "-h"}:
+        raise CliInputError("help", code="__help_map__")
+    if not argv:
+        raise CliInputError("map requires ROOT")
+    root = normalize_shell_root(argv[0])
+    tokens = argv[1:]
+    positionals: list[str] = []
+    values: dict[str, Any] = {}
+    seen: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in {"--help", "-h"}:
+            raise CliInputError("help", code="__help_map__")
+        if not token.startswith("-"):
+            positionals.append(token)
+            i += 1
+            continue
+        name, inline = _split_option(token)
+        handled, i = _parse_collection_common_option(tokens, i, name, inline, values, seen)
+        if handled:
+            i += 1
+            continue
+        if name == "--focus":
+            i = _append_option_value(tokens, i, name, inline, values, "focus")
+        elif name in {"--depth", "--context", "--exclusions"}:
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values[name[2:].replace("-", "_")] = _as_int(name, value) if name == "--depth" and value != "all" else value
+        else:
+            raise CliInputError(f"unknown option {name}")
+        i += 1
+
+    if positionals:
+        raise CliInputError("map accepts ROOT followed by options only")
+    query: dict[str, Any] = {}
+    for field in ("focus", "depth", "context", "exclusions"):
+        if field in values:
+            query[field] = values.pop(field)
+    request: dict[str, Any] = {"op": "map", "root": root, "query": query}
+    page = {field: values.pop(field) for field in ("cursor", "limit", "max_bytes") if field in values}
+    if page:
+        request["page"] = page
+    execution = {field: values.pop(field) for field in ("timeout_seconds", "cache") if field in values}
+    if execution:
+        request["execution"] = execution
+    output = _output_options({"format": values.pop("format", "json"), "pretty": values.pop("pretty", False)})
+    if values:
+        raise CliInputError(f"unrecognized map arguments: {', '.join(sorted(values))}")
+    return ParsedCommand(operation="map", request=request, output=output)
+
+
+def _parse_find(argv: list[str]) -> ParsedCommand:
+    if argv and argv[0] in {"--help", "-h"}:
+        raise CliInputError("help", code="__help_find__")
+    if not argv:
+        raise CliInputError("find requires ROOT")
+    root = normalize_shell_root(argv[0])
+    tokens = argv[1:]
+    positionals: list[str] = []
+    values: dict[str, Any] = {}
+    seen: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in {"--help", "-h"}:
+            raise CliInputError("help", code="__help_find__")
+        if not token.startswith("-"):
+            positionals.append(token)
+            i += 1
+            continue
+        name, inline = _split_option(token)
+        handled, i = _parse_collection_common_option(tokens, i, name, inline, values, seen)
+        if handled:
+            i += 1
+            continue
+        if name in {"--path", "--glob", "--language", "--kinds", "--visibility"}:
+            key = {"--path": "paths", "--glob": "globs", "--language": "languages"}.get(name, name[2:])
+            i = _append_option_value(tokens, i, name, inline, values, key)
+        elif name in {"--match", "--exclusions"}:
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values[name[2:].replace("-", "_")] = value
+        else:
+            raise CliInputError(f"unknown option {name}")
+        i += 1
+
+    if len(positionals) != 1:
+        raise CliInputError("find requires exactly one QUERY")
+    query: dict[str, Any] = {"text": positionals[0]}
+    selection = _selection_from_values(values)
+    if selection is not None:
+        query["selection"] = selection
+    for field in ("match", "kinds", "visibility"):
+        if field in values:
+            query[field] = values.pop(field)
+    request: dict[str, Any] = {"op": "find", "root": root, "query": query}
+    page = {field: values.pop(field) for field in ("cursor", "limit", "max_bytes") if field in values}
+    if page:
+        request["page"] = page
+    execution = {field: values.pop(field) for field in ("timeout_seconds", "cache") if field in values}
+    if execution:
+        request["execution"] = execution
+    output = _output_options({"format": values.pop("format", "json"), "pretty": values.pop("pretty", False)})
+    if values:
+        raise CliInputError(f"unrecognized find arguments: {', '.join(sorted(values))}")
+    return ParsedCommand(operation="find", request=request, output=output)
+
+
+def _parse_interface(argv: list[str]) -> ParsedCommand:
+    if argv and argv[0] in {"--help", "-h"}:
+        raise CliInputError("help", code="__help_interface__")
+    if not argv:
+        raise CliInputError("interface requires ROOT")
+    root = normalize_shell_root(argv[0])
+    tokens = argv[1:]
+    positionals: list[str] = []
+    values: dict[str, Any] = {}
+    seen: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in {"--help", "-h"}:
+            raise CliInputError("help", code="__help_interface__")
+        if not token.startswith("-"):
+            positionals.append(token)
+            i += 1
+            continue
+        name, inline = _split_option(token)
+        handled, i = _parse_collection_common_option(tokens, i, name, inline, values, seen)
+        if handled:
+            i += 1
+            continue
+        if name in {"--ref-json", "--ref-file"}:
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values[name[2:].replace("-", "_")] = value
+        elif name in {"--sections", "--kinds", "--visibility"}:
+            i = _append_option_value(tokens, i, name, inline, values, name[2:])
+        elif name == "--member-depth":
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values["member_depth"] = _as_int(name, value)
+        elif name == "--documentation":
+            _ensure_unique(seen, name)
+            if inline is not None:
+                raise CliInputError(f"{name} does not take a value")
+            values["documentation"] = True
+        else:
+            raise CliInputError(f"unknown option {name}")
+        i += 1
+
+    target_forms = [name for name in ("ref_json", "ref_file") if name in values]
+    if positionals and target_forms:
+        raise CliInputError("FILE cannot be combined with --ref-json or --ref-file")
+    if len(positionals) > 1:
+        raise CliInputError("interface accepts exactly one FILE")
+    if len(target_forms) > 1:
+        raise CliInputError("interface accepts exactly one JSON reference form")
+    if not positionals and not target_forms:
+        raise CliInputError("interface requires FILE, --ref-json, or --ref-file")
+
+    if positionals:
+        query: dict[str, Any] = {"target": {"kind": "file", "path": _normalize_location_path(positionals[0], root)}}
+    else:
+        form = target_forms[0]
+        source = values.pop(form)
+        parsed = (
+            _parse_json_reference(source, "--ref-json")
+            if form == "ref_json"
+            else _parse_json_reference(_read_json_source(source), "--ref-file")
+        )
+        query = {"target": parsed}
+    for field in ("sections", "member_depth", "documentation", "kinds", "visibility"):
+        if field in values:
+            query[field] = values.pop(field)
+
+    request: dict[str, Any] = {"op": "interface", "root": root, "query": query}
+    page = {field: values.pop(field) for field in ("cursor", "limit", "max_bytes") if field in values}
+    if page:
+        request["page"] = page
+    execution = {field: values.pop(field) for field in ("timeout_seconds", "cache") if field in values}
+    if execution:
+        request["execution"] = execution
+    output = _output_options({"format": values.pop("format", "json"), "pretty": values.pop("pretty", False)})
+    if values:
+        raise CliInputError(f"unrecognized interface arguments: {', '.join(sorted(values))}")
+    return ParsedCommand(operation="interface", request=request, output=output)
+
+
+def _parse_read(argv: list[str]) -> ParsedCommand:
+    if argv and argv[0] in {"--help", "-h"}:
+        raise CliInputError("help", code="__help_read__")
+    if not argv:
+        raise CliInputError("read requires ROOT")
+    root = normalize_shell_root(argv[0])
+    tokens = argv[1:]
+
+    positionals: list[str] = []
+    values: dict[str, Any] = {}
+    seen: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in {"--help", "-h"}:
+            raise CliInputError("help", code="__help_read__")
+        if not token.startswith("-"):
+            positionals.append(token)
+            i += 1
+            continue
+        name, inline = _split_option(token)
+        if name in {"--pretty", "--format"}:
+            i = _parse_output_option(tokens, i, name, inline, values, seen)
+        elif name in {"--timeout-seconds", "--cache"}:
+            i = _parse_execution_option(tokens, i, name, inline, values, seen)
+        elif name in {"--ref-json", "--ref-file", "--targets-file"}:
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values[name[2:].replace("-", "_")] = value
+        elif name in {
+            "--line",
+            "--end-line",
+            "--column",
+            "--context-lines",
+            "--max-bytes",
+            "--max-lines",
+            "--source-bytes",
+        }:
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values[name[2:].replace("-", "_")] = _as_int(name, value)
+        elif name == "--cursor":
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values["cursor"] = value
+        elif name in {"--include-enclosing", "--no-enclosing"}:
+            _ensure_unique(seen, name)
+            if inline is not None:
+                raise CliInputError(f"{name} does not take a value")
+            values["include_enclosing"] = name == "--include-enclosing"
+        else:
+            raise CliInputError(f"unknown option {name}")
+        i += 1
+
+    target_forms = [name for name in ("ref_json", "ref_file", "targets_file") if name in values]
+    if positionals and target_forms:
+        raise CliInputError("TARGET cannot be combined with --ref-json, --ref-file, or --targets-file")
+    if len(target_forms) > 1:
+        raise CliInputError("read accepts exactly one JSON target-input form")
+
+    if positionals:
+        if len(positionals) != 1:
+            raise CliInputError("read accepts exactly one natural TARGET")
+        if "line" not in values:
+            raise CliInputError("natural TARGET requires --line")
+        if "ref_json" in values or "ref_file" in values or "targets_file" in values:
+            raise CliInputError("natural TARGET cannot be combined with a JSON target-input form")
+        location: dict[str, Any] = {
+            "kind": "location",
+            "path": _normalize_location_path(positionals[0], root),
+            "line": values.pop("line"),
+        }
+        for field in ("end_line", "column"):
+            if field in values:
+                location[field] = values.pop(field)
+        targets: Any = [location]
+    elif target_forms:
+        if any(field in values for field in ("line", "end_line", "column")):
+            raise CliInputError("line options apply only to a natural TARGET")
+        form = target_forms[0]
+        source_value = values.pop(form)
+        parsed = (
+            _parse_json(source_value.encode("utf-8"), "--ref-json")
+            if form == "ref_json"
+            else _read_json_source(source_value)
+        )
+        if form == "targets_file":
+            if not isinstance(parsed, list):
+                raise CliInputError("--targets-file JSON must contain an array of targets")
+            targets = parsed
+        else:
+            if not isinstance(parsed, dict):
+                raise CliInputError(f"--{form.replace('_', '-')} JSON must contain one target object")
+            targets = [parsed]
+    else:
+        raise CliInputError("read requires TARGET, --ref-json, --ref-file, or --targets-file")
+    if not isinstance(targets, list) or not 1 <= len(targets) <= MAX_READ_TARGETS:
+        raise CliInputError("read accepts one to eight targets")
+
+    query: dict[str, Any] = {"targets": targets}
+    for field in ("context_lines", "include_enclosing"):
+        if field in values:
+            query[field] = values.pop(field)
+
+    page_fields = ("cursor", "max_bytes", "max_lines", "source_bytes")
+    page = {field: values.pop(field) for field in page_fields if field in values}
+    execution: dict[str, Any] = {}
+    for field in ("timeout_seconds", "cache"):
+        if field in values:
+            execution[field] = values.pop(field)
+    output = _output_options({"format": values.pop("format", "json"), "pretty": values.pop("pretty", False)})
+    if values:
+        raise CliInputError(f"unrecognized read arguments: {', '.join(sorted(values))}")
+
+    request: dict[str, Any] = {"op": "read", "root": root, "query": query}
+    if page:
+        request["page"] = page
+    if execution:
+        request["execution"] = execution
+    return ParsedCommand(operation="read", request=request, output=output)
+
+
+def _parse_capabilities(argv: list[str]) -> ParsedCommand:
+    if argv and argv[0] in {"--help", "-h"}:
+        raise CliInputError("help", code="__help_capabilities__")
+    positionals: list[str] = []
+    values: dict[str, Any] = {}
+    seen: set[str] = set()
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token in {"--help", "-h"}:
+            raise CliInputError("help", code="__help_capabilities__")
+        if not token.startswith("-"):
+            positionals.append(token)
+            i += 1
+            continue
+        name, inline = _split_option(token)
+        if name in {"--pretty", "--format"}:
+            i = _parse_output_option(argv, i, name, inline, values, seen)
+        elif name in {"--timeout-seconds", "--cache"}:
+            i = _parse_execution_option(argv, i, name, inline, values, seen)
+        elif name == "--detail":
+            _ensure_unique(seen, name)
+            if inline is None and (i + 1 >= len(argv) or argv[i + 1].startswith("-")):
+                values["detail"] = "detail"
+            else:
+                value, i = _option_value(argv, i, name, inline)
+                values["detail"] = value
+
+        else:
+            raise CliInputError(f"unknown option {name}")
+        i += 1
+    if len(positionals) > 1:
+        raise CliInputError("capabilities accepts at most one ROOT")
+
+    request: dict[str, Any] = {
+        "op": "capabilities",
+        "query": {"detail": values.pop("detail", "summary")},
+    }
+    if positionals:
+        request["root"] = normalize_shell_root(positionals[0])
+    execution: dict[str, Any] = {}
+    for field in ("timeout_seconds", "cache"):
+        if field in values:
+            execution[field] = values.pop(field)
+    output = _output_options({"format": values.pop("format", "json"), "pretty": values.pop("pretty", False)})
+    if values:
+        raise CliInputError(f"unrecognized capabilities arguments: {', '.join(sorted(values))}")
+    if execution:
+        request["execution"] = execution
+    return ParsedCommand(operation="capabilities", request=request, output=output)
+
+
+def _parse_search(argv: list[str]) -> ParsedCommand:
+    if argv and argv[0] in {"--help", "-h"}:
+        raise CliInputError("help", code="__help_search__")
+    if not argv:
+        raise CliInputError("search requires ROOT")
+    root = normalize_shell_root(argv[0])
+    tokens = argv[1:]
+    positionals: list[str] = []
+    values: dict[str, Any] = {}
+    seen: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in {"--help", "-h"}:
+            raise CliInputError("help", code="__help_search__")
+        if not token.startswith("-"):
+            positionals.append(token)
+            i += 1
+            continue
+        name, inline = _split_option(token)
+        handled, i = _parse_collection_common_option(tokens, i, name, inline, values, seen)
+        if handled:
+            i += 1
+            continue
+        if name in {"--literal", "--pattern", "--rule", "--config"}:
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values[name[2:]] = value
+        elif name == "--lang":
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values["lang"] = value
+        elif name in {"--path", "--glob", "--language"}:
+            key = {"--path": "paths", "--glob": "globs", "--language": "languages"}[name]
+            i = _append_option_value(tokens, i, name, inline, values, key)
+        elif name == "--exclusions":
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values["exclusions"] = value
+        elif name == "--detail":
+            _ensure_unique(seen, name)
+            if inline is None and (i + 1 >= len(tokens) or tokens[i + 1].startswith("-")):
+                values["detail"] = "detail"
+            else:
+                value, i = _option_value(tokens, i, name, inline)
+                values["detail"] = value
+        else:
+            raise CliInputError(f"unknown option {name}")
+        i += 1
+
+    if positionals:
+        raise CliInputError("search accepts ROOT followed by options only")
+    source_forms = [name for name in ("literal", "pattern", "rule", "config") if name in values]
+    if len(source_forms) != 1:
+        raise CliInputError("search requires exactly one of --literal, --pattern, --rule, or --config")
+    source_name = source_forms[0]
+    if source_name == "literal":
+        if "lang" in values:
+            raise CliInputError("--lang applies only to --pattern")
+        source: dict[str, Any] = {"kind": "literal", "text": values.pop("literal")}
+    elif source_name == "pattern":
+        if "lang" not in values:
+            raise CliInputError("--pattern requires --lang")
+        source = {
+            "kind": "pattern",
+            "pattern": values.pop("pattern"),
+            "language": values.pop("lang"),
+        }
+    else:
+        if "lang" in values:
+            raise CliInputError("--lang applies only to --pattern")
+        source = {
+            "kind": "rule",
+            "input": {
+                "kind": "rule" if source_name == "rule" else "config",
+                "path": _normalize_location_path(values.pop(source_name), root),
+            },
         }
 
-    symbol = validate_symbol_input(symbol)
+    query: dict[str, Any] = {"source": source}
+    selection = _selection_from_values(values)
+    if selection is not None:
+        query["selection"] = selection
+    if "detail" in values:
+        query["detail"] = values.pop("detail")
 
-    if root_path is not None:
-        symbol = dict(symbol)
-        if "abs_path" in symbol:
-            resolve_inside_root(str(symbol["abs_path"]), root_path, "abs_path")
-        symbol["path"] = str(resolve_inside_root(str(symbol["path"]), root_path, "path"))
-    return symbol
+    request: dict[str, Any] = {"op": "search", "root": root, "query": query}
+    page = {field: values.pop(field) for field in ("cursor", "limit", "max_bytes") if field in values}
+    if page:
+        request["page"] = page
+    execution = {field: values.pop(field) for field in ("timeout_seconds", "cache") if field in values}
+    if execution:
+        request["execution"] = execution
+    output = _output_options({"format": values.pop("format", "json"), "pretty": values.pop("pretty", False)})
+    if values:
+        raise CliInputError(f"unrecognized search arguments: {', '.join(sorted(values))}")
+    return ParsedCommand(operation="search", request=request, output=output)
 
 
-def load_interface_symbol(args: argparse.Namespace, root_path: Path) -> dict[str, Any] | None:
-    """Load the JSON-only exact-symbol alternatives accepted by interface."""
-    if args.symbol_json and args.symbol_file:
-        raise ValueError("Provide only one of --symbol-json or --symbol-file.")
-    if not args.symbol_json and not args.symbol_file:
-        return None
-    if args.file_path:
-        raise ValueError("Do not combine FILE_PATH with --symbol-json or --symbol-file.")
-    if args.symbol_json:
-        raw = args.symbol_json
-    elif args.symbol_file == "-":
-        raw = read_bounded_symbol_json(sys.stdin, "stdin")
+def _parse_impact(argv: list[str]) -> ParsedCommand:
+    if argv and argv[0] in {"--help", "-h"}:
+        raise CliInputError("help", code="__help_impact__")
+    if not argv:
+        raise CliInputError("impact requires ROOT")
+    root = normalize_shell_root(argv[0])
+    tokens = argv[1:]
+    positionals: list[str] = []
+    values: dict[str, Any] = {}
+    seen: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in {"--help", "-h"}:
+            raise CliInputError("help", code="__help_impact__")
+        if not token.startswith("-"):
+            positionals.append(token)
+            i += 1
+            continue
+        name, inline = _split_option(token)
+        handled, i = _parse_collection_common_option(tokens, i, name, inline, values, seen)
+        if handled:
+            i += 1
+            continue
+        if name in {"--ref-json", "--ref-file"}:
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values[name[2:].replace("-", "_")] = value
+        elif name in {"--path", "--glob", "--language"}:
+            key = {"--path": "paths", "--glob": "globs", "--language": "languages"}[name]
+            i = _append_option_value(tokens, i, name, inline, values, key)
+        elif name == "--exclusions":
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values["exclusions"] = value
+        elif name == "--mode":
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values["mode"] = value
+        else:
+            raise CliInputError(f"unknown option {name}")
+        i += 1
+
+    if positionals:
+        raise CliInputError("impact accepts ROOT followed by options only")
+    target_forms = [name for name in ("ref_json", "ref_file") if name in values]
+    if len(target_forms) != 1:
+        raise CliInputError("impact requires exactly one of --ref-json or --ref-file")
+    form = target_forms[0]
+    source = values.pop(form)
+    target = (
+        _parse_json_reference(source, "--ref-json")
+        if form == "ref_json"
+        else _parse_json_reference(_read_json_source(source), "--ref-file")
+    )
+
+    query: dict[str, Any] = {"target": target}
+    selection = _selection_from_values(values)
+    if selection is not None:
+        query["selection"] = selection
+    if "mode" in values:
+        query["mode"] = values.pop("mode")
+
+    request: dict[str, Any] = {"op": "impact", "root": root, "query": query}
+    page = {field: values.pop(field) for field in ("cursor", "limit", "max_bytes") if field in values}
+    if page:
+        request["page"] = page
+    execution = {field: values.pop(field) for field in ("timeout_seconds", "cache") if field in values}
+    if execution:
+        request["execution"] = execution
+    output = _output_options({"format": values.pop("format", "json"), "pretty": values.pop("pretty", False)})
+    if values:
+        raise CliInputError(f"unrecognized impact arguments: {', '.join(sorted(values))}")
+    return ParsedCommand(operation="impact", request=request, output=output)
+
+
+def _read_change_plan(value: str) -> dict[str, Any]:
+    """Read one complete ``xray.change.v1`` plan from a file or stdin.
+
+    The plan artifact is intentionally passed through to ``execute`` for the
+    authoritative closed-model and digest checks.  A current CLI plan response
+    is accepted as a transport convenience, but no legacy plan envelope or
+    field reconstruction is performed.
+    """
+    parsed = _read_json_source(value)
+    if not isinstance(parsed, dict):
+        raise CliInputError("--plan-file JSON must contain one complete plan object")
+    if "plan_schema" in parsed:
+        return parsed
+    data = parsed.get("data")
+    if (
+        parsed.get("schema") == "xray.v1"
+        and parsed.get("ok") is True
+        and parsed.get("op") in {"change_plan", "change_refine"}
+        and isinstance(data, dict)
+        and isinstance(data.get("plan"), dict)
+    ):
+        return data["plan"]
+    return parsed
+
+
+def _parse_change_plan(argv: list[str]) -> ParsedCommand:
+    if argv and argv[0] in {"--help", "-h"}:
+        raise CliInputError("help", code="__help_change_plan__")
+    if not argv:
+        raise CliInputError("change plan requires ROOT")
+    root = normalize_shell_root(argv[0])
+    tokens = argv[1:]
+    positionals: list[str] = []
+    values: dict[str, Any] = {}
+    seen: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in {"--help", "-h"}:
+            raise CliInputError("help", code="__help_change_plan__")
+        if not token.startswith("-"):
+            positionals.append(token)
+            i += 1
+            continue
+        name, inline = _split_option(token)
+        if name in {"--pretty", "--format"}:
+            i = _parse_output_option(tokens, i, name, inline, values, seen)
+        elif name in {"--timeout-seconds", "--cache"}:
+            i = _parse_execution_option(tokens, i, name, inline, values, seen)
+        elif name in {"--pattern", "--replacement", "--lang", "--rule", "--config"}:
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values[name[2:]] = value
+        elif name in {"--path", "--glob", "--language"}:
+            key = {"--path": "paths", "--glob": "globs", "--language": "languages"}[name]
+            i = _append_option_value(tokens, i, name, inline, values, key)
+        elif name == "--exclusions":
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values["exclusions"] = value
+        elif name in {"--max-candidates", "--max-files", "--max-bytes"}:
+            _ensure_unique(seen, name)
+            value, i = _option_value(tokens, i, name, inline)
+            values[name[2:].replace("-", "_")] = _as_int(name, value)
+        elif name in {"--allow-dirty-affected", "--allow-new-parse-errors"}:
+            _ensure_unique(seen, name)
+            if inline is not None:
+                raise CliInputError(f"{name} does not take a value")
+            values[name[2:].replace("-", "_")] = True
+        else:
+            raise CliInputError(f"unknown option {name}")
+        i += 1
+
+    if positionals:
+        raise CliInputError("change plan accepts ROOT followed by options only")
+
+    source_forms = [name for name in ("pattern", "rule", "config") if name in values]
+    if len(source_forms) != 1:
+        raise CliInputError("change plan requires exactly one of --pattern, --rule, or --config")
+    source_name = source_forms[0]
+    if source_name == "pattern":
+        if "replacement" not in values:
+            raise CliInputError("--pattern requires --replacement")
+        if "lang" not in values:
+            raise CliInputError("--pattern requires --lang")
+        source: dict[str, Any] = {
+            "kind": "pattern",
+            "pattern": values.pop("pattern"),
+            "replacement": values.pop("replacement"),
+            "language": values.pop("lang"),
+        }
     else:
-        try:
-            raw = read_bounded_symbol_json_file(Path(str(args.symbol_file)))
-        except OSError as exc:
-            raise ValueError(f"Could not read symbol file '{args.symbol_file}': {exc.strerror or exc}") from exc
-    symbol = validate_symbol_input(json.loads(raw))
-    symbol = dict(symbol)
-    if "abs_path" in symbol:
-        resolve_inside_root(str(symbol["abs_path"]), root_path, "abs_path")
-    symbol["path"] = str(resolve_inside_root(str(symbol["path"]), root_path, "path"))
-    return symbol
+        if "replacement" in values or "lang" in values:
+            raise CliInputError("--replacement and --lang apply only to --pattern")
+        source = {
+            "kind": "rule",
+            "input": {
+                "kind": source_name,
+                "path": _normalize_location_path(values.pop(source_name), root),
+            },
+        }
+
+    query: dict[str, Any] = {"source": source}
+    selection = _selection_from_values(values)
+    if selection is not None:
+        query["selection"] = selection
+    bounds = {field: values.pop(field) for field in ("max_candidates", "max_files", "max_bytes") if field in values}
+    if bounds:
+        query["bounds"] = bounds
+    acknowledgements: dict[str, Any] = {}
+    if values.pop("allow_dirty_affected", False):
+        acknowledgements["dirty_affected"] = True
+    if values.pop("allow_new_parse_errors", False):
+        acknowledgements["new_parse_errors"] = True
+    if acknowledgements:
+        query["acknowledgements"] = acknowledgements
+
+    execution = {field: values.pop(field) for field in ("timeout_seconds", "cache") if field in values}
+    output = _output_options({"format": values.pop("format", "json"), "pretty": values.pop("pretty", False)})
+    if values:
+        raise CliInputError(f"unrecognized change plan arguments: {', '.join(sorted(values))}")
+    request: dict[str, Any] = {"op": "change_plan", "root": root, "query": query}
+    if execution:
+        request["execution"] = execution
+    return ParsedCommand(operation="change_plan", request=request, output=output)
 
 
-def read_bounded_symbol_json_file(path: Path) -> str:
-    """Read a symbol JSON file with the same size cap as stdin."""
-    try:
-        if path.stat().st_size > MAX_SYMBOL_JSON_CHARS:
-            raise ValueError(f"Symbol JSON exceeds {MAX_SYMBOL_JSON_CHARS} characters.")
-    except FileNotFoundError:
-        raise
-    except OSError:
-        pass
+def _parse_change_refine(argv: list[str]) -> ParsedCommand:
+    if argv and argv[0] in {"--help", "-h"}:
+        raise CliInputError("help", code="__help_change_refine__")
+    if not argv:
+        raise CliInputError("change refine requires ROOT")
+    root = normalize_shell_root(argv[0])
+    tokens = argv[1:]
+    positionals: list[str] = []
+    values: dict[str, Any] = {}
+    seen: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in {"--help", "-h"}:
+            raise CliInputError("help", code="__help_change_refine__")
+        if not token.startswith("-"):
+            positionals.append(token)
+            i += 1
+            continue
+        name, inline = _split_option(token)
+        if name in {"--pretty", "--format"}:
+            i = _parse_output_option(tokens, i, name, inline, values, seen)
+        elif name in {"--timeout-seconds", "--cache"}:
+            i = _parse_execution_option(tokens, i, name, inline, values, seen)
+        elif name == "--plan-file":
+            _ensure_unique(seen, name)
+            values["plan_file"], i = _option_value(tokens, i, name, inline)
+        elif name == "--edit-id":
+            i = _append_option_value(tokens, i, name, inline, values, "edit_ids")
+        else:
+            raise CliInputError(f"unknown option {name}")
+        i += 1
 
-    with open(path, encoding="utf-8") as stream:
-        return read_bounded_symbol_json(stream, str(path))
-
-
-def read_bounded_symbol_json(stream: Any, source: str) -> str:
-    """Read symbol JSON input while preventing accidental unbounded reads."""
-    chunks: list[str] = []
-    total = 0
-    while True:
-        chunk = stream.read(min(65536, MAX_SYMBOL_JSON_CHARS + 1 - total))
-        if not chunk:
-            break
-        chunks.append(chunk)
-        total += len(chunk)
-        if total > MAX_SYMBOL_JSON_CHARS:
-            raise ValueError(f"Symbol JSON from {source} exceeds {MAX_SYMBOL_JSON_CHARS} characters.")
-
-    raw = "".join(chunks)
-    if not raw.strip():
-        raise ValueError(f"Symbol JSON from {source} is empty.")
-    return raw
-
-
-def resolve_inside_root(path: str, root_path: Path, field_name: str) -> Path:
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = root_path / candidate
-    candidate = candidate.resolve()
-    try:
-        candidate.relative_to(root_path)
-    except ValueError:
-        raise ValueError(f"Symbol {field_name} '{path}' is outside repository root '{root_path}'.")
-    return candidate
-
-
-def format_symbol_for_json(symbol: Mapping[str, Any], root_path: Path) -> dict[str, Any]:
-    formatted = dict(symbol)
-    symbol_path = Path(str(formatted.get("path", "")))
-    abs_path = symbol_path if symbol_path.is_absolute() else (root_path / symbol_path).resolve()
-    try:
-        relative_path = abs_path.resolve().relative_to(root_path).as_posix()
-    except ValueError:
-        relative_path = str(formatted.get("path", ""))
-
-    formatted["path"] = relative_path
-    formatted["abs_path"] = str(abs_path.resolve())
-    return dump_symbol_output(formatted)
+    if positionals:
+        raise CliInputError("change refine accepts ROOT followed by options only")
+    if "plan_file" not in values:
+        raise CliInputError("change refine requires --plan-file")
+    plan = _read_change_plan(values.pop("plan_file"))
+    edit_ids = values.pop("edit_ids", [])
+    if len(set(edit_ids)) != len(edit_ids):
+        raise CliInputError("--edit-id values must be unique")
+    edit_ids = sorted(edit_ids, key=lambda item: item.encode("utf-8"))
+    query: dict[str, Any] = {"plan": plan, "edit_ids": edit_ids}
+    execution = {field: values.pop(field) for field in ("timeout_seconds", "cache") if field in values}
+    output = _output_options({"format": values.pop("format", "json"), "pretty": values.pop("pretty", False)})
+    if values:
+        raise CliInputError(f"unrecognized change refine arguments: {', '.join(sorted(values))}")
+    request: dict[str, Any] = {"op": "change_refine", "root": root, "query": query}
+    if execution:
+        request["execution"] = execution
+    return ParsedCommand(operation="change_refine", request=request, output=output)
 
 
-def format_symbol(symbol: Mapping[str, Any]) -> str:
-    location = f"{symbol.get('path', '')}:{symbol.get('start_line', '')}"
-    symbol_type = symbol.get("type", "symbol")
-    return f"{symbol.get('name', '')}\t{symbol_type}\t{location}"
+def _parse_change_review(argv: list[str], operation: str) -> ParsedCommand:
+    help_code = f"__help_{operation}__"
+    if argv and argv[0] in {"--help", "-h"}:
+        raise CliInputError("help", code=help_code)
+    if not argv:
+        raise CliInputError(f"{operation.removeprefix('change_')} requires ROOT")
+    root = normalize_shell_root(argv[0])
+    tokens = argv[1:]
+    positionals: list[str] = []
+    values: dict[str, Any] = {}
+    seen: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in {"--help", "-h"}:
+            raise CliInputError("help", code=help_code)
+        if not token.startswith("-"):
+            positionals.append(token)
+            i += 1
+            continue
+        name, inline = _split_option(token)
+        if name in {"--pretty", "--format"}:
+            i = _parse_output_option(tokens, i, name, inline, values, seen)
+        elif name in {"--timeout-seconds", "--cache"}:
+            i = _parse_execution_option(tokens, i, name, inline, values, seen)
+        elif name == "--plan-file":
+            _ensure_unique(seen, name)
+            values["plan_file"], i = _option_value(tokens, i, name, inline)
+        elif name == "--expected-digest":
+            _ensure_unique(seen, name)
+            values["expected_digest"], i = _option_value(tokens, i, name, inline)
+        else:
+            raise CliInputError(f"unknown option {name}")
+        i += 1
+
+    leaf = operation.removeprefix("change_")
+    if positionals:
+        raise CliInputError(f"change {leaf} accepts ROOT followed by options only")
+    if "plan_file" not in values:
+        raise CliInputError(f"change {leaf} requires --plan-file")
+    if "expected_digest" not in values:
+        raise CliInputError(f"change {leaf} requires --expected-digest")
+    plan = _read_change_plan(values.pop("plan_file"))
+    expected_digest = values.pop("expected_digest")
+    query: dict[str, Any] = {"plan": plan, "expected_digest": expected_digest}
+    execution = {field: values.pop(field) for field in ("timeout_seconds", "cache") if field in values}
+    output = _output_options({"format": values.pop("format", "json"), "pretty": values.pop("pretty", False)})
+    if values:
+        raise CliInputError(f"unrecognized change {leaf} arguments: {', '.join(sorted(values))}")
+    request: dict[str, Any] = {"op": operation, "root": root, "query": query}
+    if execution:
+        request["execution"] = execution
+    return ParsedCommand(operation=operation, request=request, output=output)
 
 
-def format_impact(result: Mapping[str, Any]) -> str:
-    lines = [result.get("note", "")]
-    for reference in result.get("references", []):
-        location = f"{reference.get('file', '')}:{reference.get('line', '')}"
-        lines.append(f"{location}\t{reference.get('type', 'reference')}")
-        text = reference.get("text")
-        if text:
-            lines.append(text)
-    return "\n".join(line for line in lines if line)
+def _parse_change(argv: list[str]) -> ParsedCommand:
+    if not argv or argv[0] in {"--help", "-h"}:
+        raise CliInputError("help", code="__help_change__")
+    command = argv[0]
+    if command == "plan":
+        return _parse_change_plan(argv[1:])
+    if command == "refine":
+        return _parse_change_refine(argv[1:])
+    if command == "verify":
+        return _parse_change_review(argv[1:], "change_verify")
+    if command == "apply":
+        return _parse_change_review(argv[1:], "change_apply")
+    raise CliInputError(f"unknown change command {command!r}", code="unknown_operation")
 
 
-def print_json(value: Any, stream: Any = None, *, pretty: bool = False) -> None:
+def _parse_skill(argv: list[str]) -> ParsedCommand:
+    if not argv or argv[0] in {"--help", "-h"}:
+        raise CliInputError("help", code="__help_skill__")
+    if argv[0] != "install":
+        raise CliInputError(f"unknown skill command {argv[0]!r}")
+    values: dict[str, Any] = {}
+    seen: set[str] = set()
+    i = 1
+    while i < len(argv):
+        token = argv[i]
+        if token in {"--help", "-h"}:
+            raise CliInputError("help", code="__help_skill__")
+        if not token.startswith("-"):
+            raise CliInputError(f"unexpected skill argument {token!r}")
+        name, inline = _split_option(token)
+        if name in {"--user", "--force", "--pretty"}:
+            _ensure_unique(seen, name)
+            if inline is not None:
+                raise CliInputError(f"{name} does not take a value")
+            values[name[2:].replace("-", "_")] = True
+        elif name == "--project":
+            _ensure_unique(seen, name)
+            values["project"], i = _option_value(argv, i, name, inline)
+
+        else:
+            raise CliInputError(f"unknown option {name}")
+        i += 1
+    if values.get("user") and "project" in values:
+        raise CliInputError("--user and --project are mutually exclusive")
+    return ParsedCommand(
+        operation="skill_install",
+        output=OutputOptions(pretty=bool(values.get("pretty", False))),
+        admin=True,
+        project_root=values.get("project"),
+        force=bool(values.get("force", False)),
+    )
+
+
+def _parse_command(argv: list[str]) -> ParsedCommand:
+    if not argv:
+        raise CliInputError("a command is required")
+    command = argv[0]
+    if command not in CLI_COMMANDS:
+        if command in {"--help", "-h"}:
+            raise CliInputError("help", code="__help_root__")
+        raise CliInputError(f"unknown command {command!r}", code="unknown_operation")
+    if command == "map":
+        return _parse_map(argv[1:])
+    if command == "find":
+        return _parse_find(argv[1:])
+    if command == "interface":
+        return _parse_interface(argv[1:])
+    if command == "read":
+        return _parse_read(argv[1:])
+    if command == "impact":
+        return _parse_impact(argv[1:])
+    if command == "search":
+        return _parse_search(argv[1:])
+    if command == "change":
+        return _parse_change(argv[1:])
+    if command == "capabilities":
+        return _parse_capabilities(argv[1:])
+    return _parse_skill(argv[1:])
+
+
+def _scan_output_options(argv: list[str]) -> OutputOptions:
+    output_format = "json"
+    pretty = False
+    for index, token in enumerate(argv):
+        if token == "--pretty":
+            pretty = True
+        elif token.startswith("--format="):
+            candidate = token.split("=", 1)[1]
+            if candidate in {"json", "text"}:
+                output_format = candidate
+        elif token == "--format" and index + 1 < len(argv):
+            candidate = argv[index + 1]
+            if candidate in {"json", "text"}:
+                output_format = candidate
+    return OutputOptions(format=output_format, pretty=pretty)
+
+
+def _render_read_text(payload: dict[str, Any]) -> str:
+    data = payload.get("data", {})
+    items = data.get("items", []) if isinstance(data, dict) else []
+    rendered: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        ref = item.get("ref", {})
+        location = item.get("location", {})
+        start = location.get("start", {}) if isinstance(location, dict) else {}
+        end = location.get("end", {}) if isinstance(location, dict) else {}
+        path = ref.get("path", "") if isinstance(ref, dict) else ""
+        start_line = start.get("line", "") if isinstance(start, dict) else ""
+        end_line = end.get("line", "") if isinstance(end, dict) else ""
+        rendered.append(f"{path}:{start_line}-{end_line}")
+        source = item.get("source", "")
+        rendered.append(str(source).rstrip("\n"))
+    return "\n".join(rendered)
+
+
+def _ref_location(ref: Any, location: Any = None) -> str:
+    if not isinstance(ref, dict):
+        return ""
+    path = str(ref.get("path", ""))
+    if isinstance(location, dict):
+        start = location.get("start", {})
+        end = location.get("end", {})
+        if isinstance(start, dict) and isinstance(end, dict):
+            return f"{path}:{start.get('line', '')}-{end.get('line', '')}"
+    return f"{path}:{ref.get('start', '')}-{ref.get('end', '')}"
+
+
+def _render_map_text(payload: dict[str, Any]) -> str:
+    data = payload.get("data", {})
+    items = data.get("items", []) if isinstance(data, dict) else []
+    rendered: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        fields = [str(item.get("path", "")), str(item.get("kind", ""))]
+        if item.get("language") is not None:
+            fields.append(str(item["language"]))
+        if item.get("frontier") is True:
+            fields.append("frontier")
+        rendered.append("\t".join(fields))
+    return "\n".join(rendered)
+
+
+def _render_find_text(payload: dict[str, Any]) -> str:
+    data = payload.get("data", {})
+    items = data.get("items", []) if isinstance(data, dict) else []
+    rendered: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rendered.append(
+            "\t".join(
+                [
+                    str(item.get("name", "")),
+                    str(item.get("kind", "")),
+                    str(item.get("qualified_name", "")),
+                    _ref_location(item.get("ref"), item.get("location")),
+                ]
+            )
+        )
+    return "\n".join(rendered)
+
+
+def _render_search_text(payload: dict[str, Any]) -> str:
+    data = payload.get("data", {})
+    items = data.get("items", []) if isinstance(data, dict) else []
+    rendered: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rendered.append("\t".join([_ref_location(item.get("ref"), item.get("location")), str(item.get("text", ""))]))
+    return "\n".join(rendered)
+
+
+def _render_impact_text(payload: dict[str, Any]) -> str:
+    data = payload.get("data", {})
+    items = data.get("items", []) if isinstance(data, dict) else []
+    rendered: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rendered.append(
+            "\t".join(
+                [
+                    _ref_location(item.get("ref"), item.get("location")),
+                    str(item.get("kind", "")),
+                    str(item.get("evidence", "")),
+                    str(item.get("text", "")),
+                ]
+            )
+        )
+    return "\n".join(rendered)
+
+
+def _render_change_text(payload: dict[str, Any]) -> str:
+    operation = payload.get("op", "")
+    data = payload.get("data", {})
+    if operation in {"change_plan", "change_refine"}:
+        plan = data.get("plan", {}) if isinstance(data, dict) else {}
+        if not isinstance(plan, dict):
+            return ""
+        eligibility = plan.get("eligibility", {})
+        digest = plan.get("plan_digest", "")
+        applicable = eligibility.get("applicable", False) if isinstance(eligibility, dict) else False
+        lines = [f"plan_digest\t{digest}", f"applicable\t{str(applicable).lower()}"]
+        files = plan.get("files", [])
+        if isinstance(files, list):
+            for item in files:
+                if not isinstance(item, dict):
+                    continue
+                lines.append(
+                    "\t".join(
+                        [
+                            "file",
+                            str(item.get("path", "")),
+                            str(item.get("preimage_sha256", "")),
+                            str(item.get("postimage_sha256", "")),
+                        ]
+                    )
+                )
+                diff = item.get("diff")
+                if isinstance(diff, str) and diff:
+                    lines.extend(diff.rstrip("\n").splitlines())
+        return "\n".join(lines)
+    if not isinstance(data, dict):
+        return ""
+    if operation == "change_verify":
+        return f"plan_digest\t{data.get('plan_digest', '')}\tready"
+    if operation == "change_apply":
+        return "\t".join(
+            [
+                "plan_digest",
+                str(data.get("plan_digest", "")),
+                str(data.get("state", "")),
+                str(data.get("rollback_status", "")),
+            ]
+        )
+    return ""
+
+
+def _render_interface_text(payload: dict[str, Any]) -> str:
+    data = payload.get("data", {})
+    items = data.get("items", []) if isinstance(data, dict) else []
+    rendered: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        section = str(item.get("section", ""))
+        location = _ref_location(item.get("ref"))
+        if section == "symbols":
+            rendered.append(
+                "\t".join(
+                    [
+                        section,
+                        str(item.get("name", "")),
+                        str(item.get("kind", "")),
+                        str(item.get("qualified_name", "")),
+                        location,
+                        str(item.get("signature", "")),
+                    ]
+                )
+            )
+        elif section == "imports":
+            rendered.append(
+                "\t".join(
+                    [
+                        section,
+                        str(item.get("module_text", "")),
+                        str(item.get("imported_name") or ""),
+                        str(item.get("local_name") or ""),
+                        location,
+                    ]
+                )
+            )
+        elif section == "exports":
+            rendered.append(
+                "\t".join(
+                    [
+                        section,
+                        str(item.get("name") or ""),
+                        str(item.get("module_text") or ""),
+                        str(item.get("kind", "")),
+                        location,
+                    ]
+                )
+            )
+    return "\n".join(rendered)
+
+
+def _render_capabilities_text(payload: dict[str, Any]) -> str:
+    data = payload.get("data", {})
+    if not isinstance(data, dict):
+        return ""
+    lines = [f"version: {data.get('version', '')}", f"healthy: {str(data.get('healthy', False)).lower()}"]
+    languages = data.get("languages")
+    if isinstance(languages, list):
+        lines.append(f"languages: {', '.join(str(item) for item in languages)}")
+    dependencies = data.get("dependencies")
+    if isinstance(dependencies, list):
+        lines.append("dependencies:")
+        for dependency in dependencies:
+            if isinstance(dependency, dict):
+                lines.append(f"  {dependency.get('name', '')}: {dependency.get('state', '')}")
+    operations = data.get("operations")
+    if isinstance(operations, list):
+        lines.append("operations:")
+        for operation in operations:
+            if isinstance(operation, dict):
+                lines.append(f"  {operation.get('name', '')}: {operation.get('mutation', '')}")
+    return "\n".join(lines)
+
+
+def _write_json(payload: dict[str, Any], *, pretty: bool, stream: Any = None) -> None:
     if stream is None:
         stream = sys.stdout
     if pretty:
-        output = json.dumps(value, indent=2, sort_keys=True)
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
     else:
-        output = json.dumps(value, separators=(",", ":"), sort_keys=True)
-    print(output, file=stream)
+        text = canonical_json(payload)
+    print(text, file=stream)
 
 
-def leaf_command(args: argparse.Namespace) -> str | None:
-    """Return the exact public leaf operation selected by parsed arguments."""
-    command = getattr(args, "command", None)
-    if command == "map":
-        command = "explore"
-    if not isinstance(command, str):
-        return None
-    nested = {
-        "replace": getattr(args, "replace_command", None),
-        "rules": getattr(args, "rules_command", None),
-        "skill": getattr(args, "skill_command", None),
-    }.get(command)
-    return f"{command}.{nested}" if nested else command
-
-
-def print_error(
-    message: str,
-    args: argparse.Namespace,
-    *,
-    code: str = "command_failed",
-    details: Mapping[str, Any] | None = None,
-) -> None:
-    if getattr(args, "format", None) == "json":
-        compact = getattr(args, "detail", "compact") != "full"
-        print_json(
-            dump_error_envelope(
-                {
-                    "schema_version": compact_schema_version(args) if compact else SCHEMA_VERSION,
-                    "ok": False,
-                    "command": leaf_command(args),
-                    "error": (
-                        {"code": code, "message": message, **({"details": dict(details)} if details else {})}
-                        if compact
-                        else message
-                    ),
-                    "warnings": [],
-                }
-            ),
-            stream=sys.stderr,
-            pretty=getattr(args, "pretty", False),
-        )
-    else:
-        print(f"xray: {message}", file=sys.stderr)
-
-
-def wants_json_output(argv: Sequence[str] | None) -> bool:
-    args = list(sys.argv[1:] if argv is None else argv)
-    for index, value in enumerate(args):
-        if value == "--format" and index + 1 < len(args) and args[index + 1] == "text":
-            return False
-        if value == "--format=text":
-            return False
-    return True
-
-
-def wants_pretty_output(argv: Sequence[str] | None) -> bool:
-    args = list(sys.argv[1:] if argv is None else argv)
-    return "--pretty" in args
-
-
-def parse_command_name(argv: Sequence[str] | None) -> str | None:
-    args = list(sys.argv[1:] if argv is None else argv)
-    commands = {
-        "explore",
-        "map",
-        "find",
-        "interface",
-        "read-symbol",
-        "symbol-at",
-        "impact",
-        "search",
-        "rewrite",
-        "scan",
-        "rules",
-        "replace",
-        "skill",
-        "imports",
-        "exports",
-        "capabilities",
-        "doctor",
+def _cli_budget_error(payload: dict[str, Any], minimum_bytes: int, *, include_context: bool = True) -> Error:
+    operation = payload.get("op")
+    values: dict[str, Any] = {
+        "schema": "xray.v1",
+        "ok": False,
+        "error": {
+            "code": "budget_too_small",
+            "message": "budget_too_small: CLI output exceeds the operation hard byte ceiling",
+            "details": {"minimum_bytes": max(_CLI_ERROR_RESPONSE_BYTES, minimum_bytes)},
+        },
     }
-    for index, value in enumerate(args):
-        if value not in commands:
-            continue
-        command = "explore" if value == "map" else "capabilities" if value == "doctor" else value
-        if command in {"replace", "rules", "skill"} and index + 1 < len(args) and not args[index + 1].startswith("-"):
-            return f"{command}.{args[index + 1]}"
-        return command
-    return None
+    if operation in _CLI_HARD_RESPONSE_BYTES:
+        values["op"] = operation
+        if include_context:
+            for field in ("root", "provenance"):
+                if isinstance(payload.get(field), dict):
+                    values[field] = payload[field]
+        if operation == "change_apply":
+            mutation = payload.get("mutation")
+            if isinstance(mutation, dict) and mutation.get("state") != "applied":
+                values["mutation"] = mutation
+            else:
+                values["mutation"] = {"state": "not_applied", "rollback_status": "not_attempted"}
+    return Error.model_validate(values)
 
 
-def wants_full_output(argv: Sequence[str] | None) -> bool:
-    args = list(sys.argv[1:] if argv is None else argv)
-    return any(
-        (value == "--detail" and index + 1 < len(args) and args[index + 1] == "full") or value == "--detail=full"
-        for index, value in enumerate(args)
-    )
-
-
-def wants_v2_output(argv: Sequence[str] | None) -> bool:
-    args = list(sys.argv[1:] if argv is None else argv)
-    return any(
-        (value == "--schema" and index + 1 < len(args) and args[index + 1] == "v2") or value == "--schema=v2"
-        for index, value in enumerate(args)
-    )
-
-
-def print_parse_error(message: str, argv: Sequence[str] | None) -> None:
-    if wants_json_output(argv):
-        compact = not wants_full_output(argv)
-        print_json(
-            dump_error_envelope(
-                {
-                    "schema_version": (
-                        COMPACT_SCHEMA_VERSION
-                        if compact and wants_v2_output(argv)
-                        else V3_SCHEMA_VERSION
-                        if compact
-                        else SCHEMA_VERSION
-                    ),
-                    "ok": False,
-                    "command": parse_command_name(argv),
-                    "error": {"code": "invalid_arguments", "message": message} if compact else message,
-                    "warnings": [],
-                }
-            ),
-            stream=sys.stderr,
-            pretty=wants_pretty_output(argv),
-        )
+def _json_output_bytes(payload: dict[str, Any], *, pretty: bool) -> bytes:
+    if pretty:
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
     else:
+        text = canonical_json(payload)
+    return text.encode("utf-8")
+
+
+def _text_output(payload: dict[str, Any]) -> str:
+    if payload.get("op") == "map":
+        return _render_map_text(payload)
+    if payload.get("op") == "find":
+        return _render_find_text(payload)
+    if payload.get("op") == "interface":
+        return _render_interface_text(payload)
+    if payload.get("op") == "read":
+        return _render_read_text(payload)
+    if payload.get("op") == "impact":
+        return _render_impact_text(payload)
+    if payload.get("op") == "search":
+        return _render_search_text(payload)
+    if payload.get("op") in {"change_plan", "change_refine", "change_verify", "change_apply"}:
+        return _render_change_text(payload)
+    if payload.get("op") == "capabilities":
+        return _render_capabilities_text(payload)
+    return ""
+
+
+def _error_exit_code(code: str, *, parse: bool = False) -> int:
+    if parse and code == "path_outside_root":
+        return 2
+    invalid = {
+        "invalid_request",
+        "unknown_operation",
+        "invalid_pattern",
+        "invalid_rule",
+        "invalid_encoding",
+        "invalid_reference",
+        "invalid_cursor",
+        "cursor_query_mismatch",
+        "invalid_plan",
+        "unsupported_file",
+        "unsupported_configuration",
+    }
+    return 2 if code in invalid else 1
+
+
+def _write_result(result: Result, output: OutputOptions) -> int:
+    payload = result.to_payload()
+    if output.format == "text" and result.ok:
+        rendered = _text_output(payload)
+        encoded = rendered.encode("utf-8") if rendered else b""
+    else:
+        encoded = _json_output_bytes(payload, pretty=output.pretty)
+
+    if result.ok:
+        limit = _CLI_HARD_RESPONSE_BYTES.get(str(payload.get("op")))
+    else:
+        limit = _CLI_ERROR_RESPONSE_BYTES
+    framing_bytes = 1 if output.format != "text" or encoded else 0
+    emitted_size = len(encoded) + framing_bytes
+    authoritative_apply = (
+        result.ok
+        and payload.get("op") == "change_apply"
+        and isinstance(payload.get("data"), dict)
+        and payload["data"].get("state") == "applied"
+    )
+    if limit is not None and emitted_size > limit and authoritative_apply and output.pretty:
+        encoded = _json_output_bytes(payload, pretty=False)
+        emitted_size = len(encoded) + 1
+    if limit is not None and emitted_size > limit and authoritative_apply:
+        # The change service preflights canonical apply responses before the
+        # first write. If an injected executor violates that invariant, report
+        # the authoritative mutation outcome rather than fabricate not_applied.
+        limit = None
+    if limit is not None and emitted_size > limit:
+        minimum_bytes = emitted_size
+        result = Result(_cli_budget_error(payload, minimum_bytes))
+        payload = result.to_payload()
+        if output.format == "text":
+            encoded = b""
+        else:
+            encoded = _json_output_bytes(payload, pretty=output.pretty)
+            if len(encoded) + 1 > _CLI_ERROR_RESPONSE_BYTES:
+                result = Result(_cli_budget_error(payload, minimum_bytes, include_context=False))
+                payload = result.to_payload()
+                encoded = _json_output_bytes(payload, pretty=output.pretty)
+
+    if output.format == "text":
+        if result.ok:
+            if encoded:
+                sys.stdout.write(encoded.decode("utf-8"))
+                sys.stdout.write("\n")
+        else:
+            message = f"xray: {payload['error']['message']}"
+            mutation = payload.get("mutation")
+            if isinstance(mutation, dict):
+                message += (
+                    f" [mutation state={mutation.get('state', '')}"
+                    f" rollback_status={mutation.get('rollback_status', '')}]"
+                )
+            print(message, file=sys.stderr)
+    else:
+        sys.stdout.write(encoded.decode("utf-8"))
+        sys.stdout.write("\n")
+    if result.ok:
+        return 0
+    return _error_exit_code(str(payload["error"]["code"]))
+
+
+def _write_failure(operation: str | None, error: CliInputError, output: OutputOptions) -> int:
+    if error.code.startswith("__help_"):
+        help_text = {
+            "__help_root__": ROOT_HELP,
+            "__help_map__": MAP_HELP,
+            "__help_find__": FIND_HELP,
+            "__help_interface__": INTERFACE_HELP,
+            "__help_read__": READ_HELP,
+            "__help_impact__": IMPACT_HELP,
+            "__help_search__": SEARCH_HELP,
+            "__help_change__": CHANGE_HELP,
+            "__help_change_plan__": CHANGE_PLAN_HELP,
+            "__help_change_refine__": CHANGE_REFINE_HELP,
+            "__help_change_verify__": CHANGE_VERIFY_HELP,
+            "__help_change_apply__": CHANGE_APPLY_HELP,
+            "__help_capabilities__": CAPABILITIES_HELP,
+            "__help_skill__": SKILL_HELP,
+        }[error.code]
+        print(help_text, end="")
+        return 0
+    if output.format == "text" and operation != "skill_install":
+        message = f"xray: {error}"
+        if operation == "change_apply":
+            message += " [mutation state=not_applied rollback_status=not_attempted]"
         print(message, file=sys.stderr)
+    else:
+        _write_json(_error_payload(operation, error.code, error), pretty=output.pretty)
+    return _error_exit_code(error.code, parse=True)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
+def _run_admin(command: ParsedCommand) -> int:
     try:
-        args = parser.parse_args(argv)
-    except ParserExit as exc:
-        if exc.status == 0:
-            if exc.message:
-                print(exc.message, end="")
-            return 0
-        print_parse_error(exc.message, argv)
-        return exc.status
-
-    handler: Callable[[argparse.Namespace], int] = args.handler
-    try:
-        return handler(args)
-    except json.JSONDecodeError as exc:
-        print_error(f"invalid JSON: {exc}", args, code="invalid_json")
-        return 2
+        result = install_cli_skill(project_root=command.project_root, force=command.force)
     except ValueError as exc:
-        print_error(str(exc), args, code="invalid_request")
+        error = _error_payload("skill_install", "invalid_request", exc)
+        _write_json(error, pretty=command.output.pretty)
         return 2
-    except InterfaceReadError as exc:
-        print_error(str(exc), args, code=exc.code)
-        return 1
-    except AstGrepValidationError as exc:
-        print_error(str(exc), args, code="invalid_request")
-        return 2
-    except AstGrepError as exc:
-        print_error(str(exc), args, code="ast_grep_error")
-        return 1
-    except ReplacementDriftError as exc:
-        print_error(str(exc), args, code="replacement_source_drift", details=exc.details)
-        return 1
-    except ReplacementApplyError as exc:
-        print_error(
-            str(exc),
-            args,
-            code="replacement_apply_failed",
-            details={
-                "rollback_attempted": exc.rollback_attempted,
-                "rollback_count": exc.rollback_count,
-                "rollback_succeeded": exc.rollback_succeeded,
-                "rollback_status": exc.rollback_status,
-            },
-        )
-        return 1
-    except SkillInstallError as exc:
-        print_error(str(exc), args, code="skill_install_failed")
-        return 1
-    except BrokenPipeError:
+    except OSError as exc:
+        error = _error_payload("skill_install", "io_error", exc)
+        _write_json(error, pretty=command.output.pretty)
         return 1
     except Exception as exc:
-        print_error(str(exc), args, code="internal_error")
+        error = _error_payload("skill_install", "internal_error", exc)
+        _write_json(error, pretty=command.output.pretty)
         return 1
+
+    payload = AdministrativeSuccess(
+        schema="xray.v1",
+        ok=True,
+        op="skill_install",
+        data=AdministrativeData.model_validate(
+            {
+                "scope": result.scope,
+                "target": result.target,
+                "changed": result.changed,
+                "replaced": result.replaced,
+                "files": list(result.files),
+            }
+        ),
+    ).to_payload()
+    _write_json(payload, pretty=command.output.pretty)
+    return 0
+
+
+def main(argv: list[str] | tuple[str, ...] | None = None) -> int:
+    """Parse and execute one handwritten CLI command."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments == ["--version"] or (arguments and arguments[0] == "--version"):
+        print(f"xray {get_version()}")
+        return 0
+    output = _scan_output_options(arguments)
+    if arguments in (["--help"], ["-h"]):
+        print(ROOT_HELP, end="")
+        return 0
+    if not arguments:
+        return _write_failure(None, CliInputError("a command is required"), output)
+    try:
+        command = _parse_command(arguments)
+    except CliInputError as exc:
+        operation = {
+            "map": "map",
+            "find": "find",
+            "interface": "interface",
+            "read": "read",
+            "impact": "impact",
+            "search": "search",
+            "capabilities": "capabilities",
+            "skill": "skill_install",
+        }.get(arguments[0] if arguments else "")
+        if arguments and arguments[0] == "change" and len(arguments) > 1:
+            operation = {
+                "plan": "change_plan",
+                "refine": "change_refine",
+                "verify": "change_verify",
+                "apply": "change_apply",
+            }.get(arguments[1])
+        return _write_failure(operation, exc, output)
+
+    if command.admin:
+        return _run_admin(command)
+    try:
+        result = execute(command.request)
+    except Exception as exc:
+        error = _error_payload(command.operation, "internal_error", exc)
+        _write_json(error, pretty=command.output.pretty)
+        return 1
+    return _write_result(result, command.output)
 
 
 if __name__ == "__main__":

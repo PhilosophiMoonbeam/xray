@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 XRAY MCP Configuration Generator
-Generates MCP config for different tools and installation methods.
+Generates MCP configuration for supported local and installed stdio methods.
 """
 
 import json
@@ -14,13 +14,11 @@ ConfigMethods = dict[str, ConfigPayload]
 CONFIGS: dict[str, ConfigMethods] = {
     "cursor": {
         "local_python": {"mcpServers": {"xray": {"command": "uv", "args": ["run", "python", "-m", "xray.mcp_server"]}}},
-        "docker": {"mcpServers": {"xray": {"command": "docker", "args": ["run", "--rm", "-i", "xray"]}}},
         "source": {"mcpServers": {"xray": {"command": "uv", "args": ["run", "xray-mcp"], "cwd": str(Path.cwd())}}},
         "installed_script": {"mcpServers": {"xray": {"command": "xray-mcp"}}},
     },
     "claude": {
         "local_python": {"mcpServers": {"xray": {"command": "uv", "args": ["run", "python", "-m", "xray.mcp_server"]}}},
-        "docker": {"mcpServers": {"xray": {"command": "docker", "args": ["run", "--rm", "-i", "xray"]}}},
         "installed_script": {"mcpServers": {"xray": {"command": "xray-mcp"}}},
     },
     "vscode": {
@@ -30,9 +28,6 @@ CONFIGS: dict[str, ConfigMethods] = {
                     "xray": {"type": "stdio", "command": "uv", "args": ["run", "python", "-m", "xray.mcp_server"]}
                 }
             }
-        },
-        "docker": {
-            "mcp": {"servers": {"xray": {"type": "stdio", "command": "docker", "args": ["run", "--rm", "-i", "xray"]}}}
         },
         "source": {
             "mcp": {
@@ -53,6 +48,11 @@ def print_config(tool: str, method: str) -> bool:
     if tool not in CONFIGS:
         print(f"❌ Unknown tool: {tool}")
         print(f"Available tools: {', '.join(CONFIGS.keys())}")
+        return False
+
+    if method == "docker":
+        print("Unsupported method: containerized MCP transport is not supported.")
+        print(f"Supported methods for {tool}: {', '.join(CONFIGS[tool].keys())}")
         return False
 
     if method not in CONFIGS[tool]:
@@ -92,7 +92,7 @@ def main() -> int:
         print()
         print("Examples:")
         print("  uv run python mcp-config-generator.py cursor local_python")
-        print("  uv run python mcp-config-generator.py claude docker")
+        print("  uv run python mcp-config-generator.py claude installed_script")
         print("  uv run python mcp-config-generator.py vscode source")
         return 1
 

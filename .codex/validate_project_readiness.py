@@ -1,139 +1,76 @@
-#!/usr/bin/env python3
-"""Gate XRAY readiness on a complete project profile and architecture."""
-
-from __future__ import annotations
+# ruff: noqa: E501,PLR2004
 
 import argparse
 import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PROFILE = ROOT / "PROJECT.md"
-ARCHITECTURE = ROOT / "ARCHITECTURE.md"
-PROJECT_SECTIONS = (
-    "Purpose",
-    "Architecture",
-    "Integration branch",
-    "Component ownership",
-    "Canonical commands",
-    "Delivery authority",
-    "External and shared resources",
-    "Sensitive and destructive operations",
-    "Required nested instructions",
-    "CI qualification",
-    "Compatibility, risks, and rollback",
-    "Evidence",
-)
-ARCHITECTURE_SECTIONS = (
-    "System boundaries",
-    "Component and ownership map",
-    "CLI contract",
-    "MCP contract and intentional surface differences",
-    "Bounds, containment, and cursors",
-    "Analysis and mutation semantics",
-    "Runtime state and resources",
-    "Distribution and package compatibility",
-    "Verification and evidence boundaries",
-    "Synchronized change edges",
-)
-PLACEHOLDER_PATTERNS = (
-    r"^REQUIRED:",
-    r"\bTBD\b",
-    r"\bTODO\b",
-    r"\bFIXME\b",
-    r"<placeholder>",
-    r"Replace this explanatory text",
-)
-PROJECT_SECTION_MIN_CHARS = 80
-ARCHITECTURE_SECTION_MIN_CHARS = 120
-ARCHITECTURE_MIN_WORDS = 1200
-ARCHITECTURE_MIN_BYTES = 9000
-
-
-def headings(text: str) -> set[str]:
-    return set(re.findall(r"^##\s+(.+?)\s*$", text, re.MULTILINE))
+PROFILE, ARCHITECTURE = ROOT / "PROJECT.md", ROOT / "ARCHITECTURE.md"
+# fmt: off
+PROJECT_SECTIONS = "Purpose|Architecture|Integration branch|Component ownership|Canonical commands|Delivery authority|External and shared resources|Sensitive and destructive operations|Required nested instructions|CI qualification|Compatibility, risks, and rollback|Evidence".split("|")
+ARCHITECTURE_SECTIONS = "System boundaries|Component and ownership map|CLI contract|MCP contract and intentional surface differences|Bounds, containment, and cursors|Analysis and mutation semantics|Runtime state and resources|Distribution and package compatibility|Verification and evidence boundaries|Synchronized change edges".split("|")
+PLACEHOLDER = re.compile(r"^REQUIRED:|<placeholder>|Replace this explanatory text|\b(?:TBD|TODO|FIXME)\b", re.I | re.M)
+LEGACY = re.compile(r"\b(?:" + "|".join(map(re.escape, "0.11.4|explore_repo|find_symbol|read_symbol|symbol_at|scan_rules|check_rules|apply_rule_fixes|rewrite_pattern|plan_replacement|refine_replacement|verify_replacement|apply_replacement".split("|"))) + r"|last_[A-Za-z_]+)\b|\bxray\.(?:replace\.v[12]|cli\.v[123])\b|\b(?:XRAY_AST_GREP_OUTPUT_LIMIT_CHARS|XRAY_AST_GREP_TIMEOUT_SECONDS|XRAY_MCP_INDEXER_CACHE_LIMIT)\b|--(?:max-depth|all-depths|strict-focus|include-symbols|max-entries|schema)\b|--detail full\b|/tmp/\.xray_cache\b|symbol skeleton|process-local indexer cache|lsp_config\.json|\brules (?:check|explain|test)\b")
+CURRENT_TEXT_FILES = tuple(ROOT / p for p in "README.md docs/implementation-standard.md Makefile install.sh src/xray/guidance.md skills/xray-cli/SKILL.md src/xray/agent_skills/xray-cli/SKILL.md src/xray/skills/xray-progressive-discovery/SKILL.md".split())
+VERSION_FILES = (ROOT / "pyproject.toml", ROOT / "src/xray/__init__.py", ROOT / "uv.lock")
 
 
 def section_body(text: str, name: str) -> str:
-    pattern = rf"^##\s+{re.escape(name)}\s*$\n(.*?)(?=^##\s+|\Z)"
-    match = re.search(pattern, text, re.MULTILINE | re.DOTALL)
+    match = re.search(rf"^##\s+{re.escape(name)}\s*$\n(.*?)(?=^##\s+|\Z)", text, re.M | re.S)
     return "" if match is None else match.group(1).strip()
+def release_version_problems() -> list[str]:
+    problems, versions = [], []
+    patterns = (r'^version\s*=\s*"([^"]+)"\s*$', r'^__version__\s*=\s*"([^"]+)"\s*$', r'(?ms)^\[\[package\]\]\nname = "xray"\nversion = "([^"]+)"')
+    for path, pattern in zip(VERSION_FILES, patterns):
+        try:
+            match = re.search(pattern, path.read_text(encoding="utf-8"), re.M)
+        except OSError:
+            problems.append("version file unreadable")
+            continue
+        if match:
+            versions.append(match[1])
+        else:
+            problems.append("version missing")
+    if len(versions) == 3 and len(set(versions)) != 1:
+        problems.append("versions differ")
+    return problems
 
-
-def readiness_problems(profile_text: str, architecture_text: str) -> list[str]:
-    problems: list[str] = []
-    statuses = re.findall(r"^Status:\s*(\S+)\s*$", profile_text, re.MULTILINE)
-    if statuses != ["READY"]:
-        problems.append("PROJECT.md status must occur once and be exactly READY")
-    combined = profile_text + "\n" + architecture_text
-    for pattern in PLACEHOLDER_PATTERNS:
-        if re.search(pattern, combined, re.MULTILINE | re.IGNORECASE):
-            problems.append(f"unresolved placeholder matches {pattern}")
-
-    project_headings = headings(profile_text)
-    for name in PROJECT_SECTIONS:
-        if name not in project_headings:
-            problems.append(f"PROJECT.md mandatory section is missing: {name}")
-        elif len(section_body(profile_text, name)) < PROJECT_SECTION_MIN_CHARS:
-            problems.append(f"PROJECT.md mandatory section is not substantive: {name}")
-
-    architecture_headings = headings(architecture_text)
-    for name in ARCHITECTURE_SECTIONS:
-        if name not in architecture_headings:
-            problems.append(f"ARCHITECTURE.md mandatory section is missing: {name}")
-        elif len(section_body(architecture_text, name)) < ARCHITECTURE_SECTION_MIN_CHARS:
-            problems.append(f"ARCHITECTURE.md section is not substantive: {name}")
-    if (
-        len(architecture_text.split()) < ARCHITECTURE_MIN_WORDS
-        or len(architecture_text.encode("utf-8")) < ARCHITECTURE_MIN_BYTES
-    ):
-        problems.append("ARCHITECTURE.md is too small to substantiate the frozen component contract")
-    architecture_contracts = (
-        "xray.cli.v2",
-        "xray.cli.v1",
-        "Python `>=3.10`",
-        "/tmp/.xray_cache",
-        "src/xray/lsp_config.json",
-        "Synchronized change edges",
-    )
-    problems.extend(
-        f"ARCHITECTURE.md contract is missing: {item}"
-        for item in architecture_contracts
-        if item not in architecture_text
-    )
+def readiness_problems(profile: str, architecture: str) -> list[str]:
+    sections = (section_body(architecture, name) for name in ("XRAY 1.0.0 current contract", *ARCHITECTURE_SECTIONS))
+    files = (p.read_text(encoding="utf-8") for p in CURRENT_TEXT_FILES if p.exists())
+    current = "\n".join((profile, *sections, *files))
+    checks = ((re.findall(r"^Status:\s*(\S+)\s*$", profile, re.M) != ["READY"], "status"), (PLACEHOLDER.search(profile + "\n" + architecture) is not None, "placeholder"), (LEGACY.search(current) is not None, "legacy"), ((ROOT / "src/xray/lsp_config.json").exists(), "inactive LSP"))
+    problems = [message for failed, message in checks if failed]
+    for text, names, minimum, label in ((profile, PROJECT_SECTIONS, 80, "PROJECT.md"), (architecture, ARCHITECTURE_SECTIONS, 120, "ARCHITECTURE.md")):
+        found = set(re.findall(r"^##\s+(.+?)\s*$", text, re.M))
+        for name in names:
+            if name not in found:
+                problems.append(f"{label} missing: {name}")
+            elif len(section_body(text, name)) < minimum:
+                problems.append(f"{label} thin: {name}")
+    if len(architecture.split()) < 1200 or len(architecture.encode()) < 9000:
+        problems.append("architecture too small")
+    required = "XRAY 1.0.0 current contract|xray.v1|xray.change.v1|Python `>=3.10`|DerivedCache|platform cache directory|xray/derived|search_tools|call_tool|xray://workflow|Synchronized change edges".split("|")
+    problems.extend(f"ARCHITECTURE.md contract is missing: {item}" for item in required if item not in architecture)
     return problems
 
 
 def self_test() -> None:
-    profile = PROFILE.read_text(encoding="utf-8")
-    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    profile, architecture = PROFILE.read_text(encoding="utf-8"), ARCHITECTURE.read_text(encoding="utf-8")
     ready = profile.replace("Status: NOT_READY", "Status: READY", 1)
-    failures: list[str] = []
-    cases = {
-        "current NOT_READY": readiness_problems(profile, architecture),
-        "REQUIRED field": readiness_problems(ready + "\nREQUIRED: value\n", architecture),
-        "placeholder architecture": readiness_problems(ready, "# Architecture\n\nTBD\n"),
-        "missing project section": readiness_problems(ready.replace("## Evidence", "## Removed"), architecture),
-        "thin architecture": readiness_problems(ready, "# XRAY Architecture\n\n## System boundaries\n\nThin.\n"),
-    }
-    if readiness_problems(ready, architecture):
-        failures.append("self-test rejected the current substantive authority after exact READY substitution")
-    failures.extend(f"self-test missed {name}" for name, problems in cases.items() if not problems)
-    if failures:
-        raise SystemExit("readiness validator self-test failed:\n" + "\n".join(failures))
-    print(f"validated exact READY positive case and {len(cases)} readiness negative cases")
+    cases = ((profile.replace("Status: READY", "Status: NOT_READY", 1), architecture), (ready + "\nREQUIRED: value\n", architecture), (ready, "# Architecture\n\nTBD\n"), (ready.replace("## Evidence", "## Removed"), architecture), (ready, "# XRAY Architecture\n\n## System boundaries\n\nThin.\n"), (ready, architecture + "\nexplore_repo\n"))
+    if readiness_problems(ready, architecture) or release_version_problems() or any(not readiness_problems(p, a) for p, a in cases):
+        raise SystemExit("self-test failed")
+    print(f"validated {len(cases)} readiness negatives")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
-    args = parser.parse_args()
-    if args.self_test:
+    if parser.parse_args().self_test:
         self_test()
         return
-    profile_text = PROFILE.read_text(encoding="utf-8")
-    architecture_text = ARCHITECTURE.read_text(encoding="utf-8")
-    problems = readiness_problems(profile_text, architecture_text)
+    problems = readiness_problems(PROFILE.read_text(encoding="utf-8"), ARCHITECTURE.read_text(encoding="utf-8")) + release_version_problems()
     if problems:
         raise SystemExit("XRAY project is not ready:\n" + "\n".join(problems))
     print("validated XRAY project readiness")

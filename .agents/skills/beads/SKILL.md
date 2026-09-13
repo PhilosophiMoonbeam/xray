@@ -6,14 +6,18 @@ description: Use Beads for durable project work, dependencies, blockers, and han
 # Beads
 
 Follow repository authority. Run `bd prime` after session start or context
-loss. If empty, run `bd where`; report
-`bd init --non-interactive --skip-agents` only when no tracker exists.
+loss when durable work or ownership history is needed. Use the canonical XRAY
+planning checkout; never create a replacement store or fabricate tracker state.
 
-Root reads with `bd ready` and `bd show <id>`. XRAY uses a dedicated planning
-store, so root mutates through `bd -C ~/.beads-planning`: claim with `update
-<id> --claim`; use `create`, `dep add`, `update --notes`, and `close` for durable
-state. Do not push or pull the Dolt remote without separate authority.
+Root reads and mutates Beads through `bd -C ~/.beads-planning`. Root may use
+`update <id> --claim`, `create`, `dep add`, `update --notes`, and `close` for
+durable work. Children use `bd --readonly show <id>` for cited context and do
+not mutate Beads, dependencies, remotes, hooks, backups, or tracker
+configuration. A Bead is not required for every local question, edit,
+hypothesis, or test.
 
-Use `--json` for machine parsing. Never use blocking `bd edit`. Children do not
-mutate Beads; they use `bd --readonly show <id>` when their contract permits
-reads. Local plans are temporary; Beads is the durable handoff.
+Use `--json` for machine parsing and never use blocking `bd edit`. Preserve
+unrelated dirty state. If recovery is unavailable, report the limitation and
+continue only a fully scoped independent Sprint task whose context and
+authority are available; stop work that depends on missing ownership or
+history. Never push or pull the Dolt remote without separate authority.

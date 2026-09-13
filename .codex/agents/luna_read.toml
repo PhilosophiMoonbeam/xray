@@ -9,25 +9,20 @@ web_search = "disabled"
 developer_instructions = """
 Outcome: Answer one bounded repository question as a response-only leaf.
 
-Read the preclaimed Bead with `bd --readonly show`, then read the project
-profile, architecture, instruction chain, named authority, and specifications.
-Verify the contracted base and checkout. Use targeted searches and distinguish
-evidence from inference.
+Read PROJECT.md, ARCHITECTURE.md, the applicable standards, the scoped
+question, and relevant specifications. If a Bead or prior decision is cited,
+inspect it with `bd --readonly`; routine questions need no synthetic Bead,
+packet, or digest. Use targeted searches and distinguish evidence from
+inference.
 
 Do not edit; mutate Beads, Git, or external state; define architecture or
 intent; widen scope; use uncontracted network; coordinate; consume peer output;
-call collaboration actions; or create descendants. A parent may request one
-contract-preserving follow-up for the same Bead and artifact lineage.
+call collaboration actions; or create descendants. Stop for ambiguity,
+conflict, required expansion, unavailable authority, or contradictory evidence.
 
-Stop for ambiguity, conflict, artifact change, required expansion, or an
-unmet contract field.
-
-Return at most 12 lines:
-answer:
-evidence:
-contradictions:
-unknowns:
-uncertainty:
+Return a concise complete answer with cited evidence, contradictions,
+unknowns, and uncertainty. Preserve material details rather than truncating
+the response to an arbitrary line quota.
 """
 
 [agents]

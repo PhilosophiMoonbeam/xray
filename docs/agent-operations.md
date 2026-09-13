@@ -1,174 +1,158 @@
 # XRAY Agent Operations
 
-This document owns durable work, contracts, allocation, evidence,
-adjudication, integration, rollback, and delivery.
+This document owns routine planning, delegation, evidence, recovery, review,
+integration, and delivery. `PROJECT.md` selects the operating mode and owns
+commands, resources, and delivery facts. `ARCHITECTURE.md` owns product
+boundaries, interfaces, containment, compatibility, storage, and mutation.
 
-It implements frozen packet version 2, Bead `xray-aly`. `PROJECT.md` owns project commands,
-resources, and delivery facts; `ARCHITECTURE.md` owns product boundaries.
+## Development Sprint defaults
 
-## Beads and planning
+Development Sprint is the default. A small cohesive task needs no separate
+plan artifact. For multi-file work, root writes a short dependency-ordered plan
+before editing. Consult `sol_design` once when a decision materially changes
+architecture, a shared API or schema, persistence, a trust boundary,
+compatibility, or ownership. Use its actionable contract; reconsult only when
+evidence invalidates it or a material decision changes.
 
-Run `bd prime` after session start or context loss. Root then inspects the full
-ready frontier and active claims. If no tracker exists, stop and follow the
-packet-defined XRAY contributor bootstrap in `docs/ADAPTATION.md`; never create
-an independent canonical store or import recipe state.
+Implement the smallest complete requested increment. Preserve supported
+behavior, authorization, containment, data protection, compatibility, resource
+limits, and truthful mutation outcomes. Remove obsolete in-scope paths and
+update affected callers. Do not add speculative compliance machinery,
+migrations, infrastructure, or compatibility scaffolding.
 
-Only root mutates Beads. Before implementation, claim with
-`bd -C ~/.beads-planning update <id> --claim`. A ready Bead is an independently
-acceptable leaf with resolved authority, contract, interface, writes, and
-resources. Exclude coordination parents.
+## Durable work and Beads
 
-Add a dependency with
-`bd -C ~/.beads-planning dep add <issue> <prerequisite>` only when an exact
-result is required first. Parentage, priority, context, and scheduling order are
-not blockers. After graph changes, inspect cycles, blocked work, and the
-explained ready frontier.
+Use the canonical Beads store for durable multi-session work, dependencies,
+blockers, and handoff. Root alone mutates it through
+`bd -C ~/.beads-planning`; children use `bd --readonly` for cited context and
+never create, claim, update, link, close, back up, or synchronize tracker
+state. A Bead is not required for every local question, edit, hypothesis, or
+test. Never create a replacement canonical store or fabricate state.
 
-Keep notes as the current handoff: exact SHA, evidence, remaining gap, retained
-artifacts, and next command. Git and Beads history retain superseded attempts.
-Close only proven work.
+After session start or context loss, recover relevant current work when durable
+ownership or history matters. Do not repeatedly scan the entire frontier or
+recreate a passed planning phase. If tracker recovery is unavailable, report
+the limitation and continue a fully scoped independent Sprint task only when
+its context, authority, and acceptance are available; stop work that depends
+on unavailable ownership or history.
 
-Never initialize from or copy recipe `.beads/` state. Preserve XRAY's
-project-owned history and recovery material. Children use `bd --readonly` and
-do not change tracker configuration, memories, issues, dependencies, remotes,
-hooks, or backups.
+A handoff records the objective, active mode reference, changed paths,
+evidence, remaining defects, and next action. Preserve unrelated dirty state.
+Close durable work only when its named acceptance is proven; do not relabel an
+incomplete Enterprise qualification as passed.
 
-## Contract and allocation
+## Scoped assignment and allocation
 
-Every assignment supplies or cites each value:
+An assignment states:
 
-```yaml
-bead:
-outcome_or_question:
-design_packet:
-sol_contract:
-  behavior:
-  non_goals:
-  interfaces_and_invariants:
-  compatibility_and_rollback:
-  risk_and_reversibility:
-base_commit:
-worktree_branch:
-writes:
-acceptance_checks:
-resources:
-runtime:
-return:
-overrides:
-```
+- the outcome or bounded question;
+- owned paths and explicit non-goals;
+- relevant interfaces, invariants, and compatibility boundaries;
+- allowed operations, resources, and runtime;
+- observable acceptance and focused checks;
+- material risks, recovery or rollback needs, and return format.
 
-Use overrides only for task-specific differences. A child reads its Bead,
-project profile, architecture, instruction chain, authority, and checks before
-work. It verifies the base, worktree, branch, and write set. Missing or
-conflicting input stops the assignment.
+Cite a Bead or design decision when one exists; neither is invented as a
+prerequisite for every leaf. Missing information blocks only when needed for
+safe execution. Root retains intent, scope, integration, and delivery
+authority.
 
-Delegate only when it saves a turn, enables real concurrency, or supplies
-risk-required evidence. Parallel leaves need disjoint behavior, primary write
-sets, generated outputs, resources, and frozen interfaces. Root allocates each
-concurrent writer a clean branch and worktree from an immutable SHA.
+Root implements directly unless at least two genuinely independent units
+shorten the critical path or a specialist materially reduces risk. Multiple
+files alone do not justify delegation. Children do not create descendants,
+coordinate peers, widen scope, self-approve, integrate, or deliver.
 
-XRAY allows at most three open child threads and at most three concurrent
-writers including root. A completed child may remain resident for follow-up.
-When no follow-up is needed, root interrupts the completed lane. Interruption
-marks the lane as relinquished but does not itself reclaim its resident slot.
-At a full pool, the next spawn replaces the least-recently-used unloadable
-relinquished resident. If replacement fails after every child lane is
-relinquished, stop delegation and report the V2 residency failure.
+Keep current host limits and capability settings. Concurrent writers require
+disjoint primary paths, generated outputs, exclusive resources, and agreed
+interfaces. Serialize overlap. Use a worktree when isolation provides real
+value; do not require one as routine paperwork or create commits merely to
+manufacture a clean worker base when commit authority is absent.
 
-Children never mutate Beads, create descendants, coordinate peers, integrate,
-deliver, widen scope, or self-approve. Writers do not merge, rebase, stash,
-push, publish, deploy, remove worktrees, or delete branches. A child may commit
-only when its contract requires a complete scoped artifact.
+## Routine evidence and verification
 
-All roles run with trusted automation permissions. Those permissions do not
-widen authority. Root records before-and-after repository and named state,
-inspects complete diffs, and rejects unexplained changes.
+Record the actual command or scenario, exit/result, material observation,
+relevant environment, and limitation in the final report or durable work item.
+Exact artifact hashes are required when the product contract requires them,
+especially a reviewed change-plan digest, or when an activated assurance
+contract depends on exact identity. They are not required for every ordinary
+file or role prompt.
 
-## Evidence and failure handling
+Routine completion uses changed-path tests, the relevant type or static check,
+and the narrowest real runtime proof. CLI-facing changes need a real focused
+`uv run xray` process against an explicit small fixture or authorized root.
+MCP-facing or shared behavior needs an actual `uv run xray-mcp` standard-stdio
+child: initialize it, list the two adapter tools, call the changed operation,
+observe the result or typed error, and shut it down cleanly. An in-process
+`Client(mcp)` test, mock echo, or idle process is not transport proof.
 
-Run narrow checks during work, then every project gate affected by the change.
-Evidence records the command, exit status, material output, environment, and
-exact artifact SHA. Reuse evidence only at the same artifact with unchanged
-inputs and toolchain. A patch invalidates only affected evidence.
+Shared behavior gets one focused scenario per affected public transport. Add a
+negative case for a changed validation, authorization, containment, or
+mutation boundary. Package metadata, dependencies, entry points, installers,
+resources, or version-sensitive primitives require an isolated installed
+package smoke and a relevant Python-floor check. Do not run every operation,
+language, cache state, or corpus without an affected-contract reason.
 
-At adoption or release boundaries, hash only small, explicit artifact sets
-whose unexpected byte change is itself material, such as runtime configuration,
-hooks, role TOMLs, or deliberately unchanged examples. Do not require a
-repository-wide aggregate preserve manifest for routine development. For paths
-expected to evolve, use semantic validators, focused tests, and complete Git
-diff review. Expand a byte-invariant set only when its authority records why
-byte identity, rather than behavior, is required.
+## Failure, recovery, and rollback
 
-XRAY's byte-invariant adoption set is limited to the six role TOMLs, Beads
-skill UI metadata, and three deliberately unchanged examples named by the
-frozen packet. A YAML-shaped assignment example is not XRAY CLI output and
-does not reopen the JSON-first, no-YAML product decision.
+Use a failed result to obtain discriminatory evidence and repair its owning
+path. Change the diagnostic approach or obtain useful specialist help when a
+failure remains materially stuck. Do not impose exact retry, repair, or
+follow-up quotas, and do not repeat evidence-free guesses.
 
-For user-facing work, verify applicable loading, empty, success, validation,
-error, accessibility, console, network, and responsive states. Semantic review
-also covers hierarchy, spacing, alignment, density, affordance, overflow,
-touch targets, content priority, and consistency.
+Stop the affected action for unavailable authorization, a prohibited operation,
+an uncertain destructive target, a material contract conflict, contradictory
+evidence, an unexplained introduced regression, or an unsafe or
+outcome-ambiguous mutation. Never retry an uncertain mutation merely to see
+whether it applied; establish the authoritative outcome first.
 
-A retry is a repeated technical hypothesis after the previous hypothesis left
-the same failure and added no discriminatory evidence. Formatting, fixture
-correction, deterministic test feedback, environmental outage, and contract
-clarification are not retries.
-
-Key a stubborn failure by Bead, Design Packet version and digest, artifact
-lineage, and failure signature. After exactly two consecutive evidence-free
-hypotheses with that unchanged key, stop implementation and send the complete
-failure packet to `breakthrough_read`. Reset the counter after a key change,
-new evidence, repair, rejected approach, or new packet. Route an architectural
-change back through `sol_design`.
-
-Every child stops for ambiguity, contract conflict, required expansion of
-authority, scope, writes, tools, resources, permissions, or network; a
-prohibited action; contradictory evidence; or an unexplained regression.
-Terra also stops for an incomplete packet or artifact change.
+Back up before a real destructive or persistent-data transition. Do not back
+up every read or edit ceremonially. Routine code rollback uses the actual
+pre-change state or an authorized integration boundary, not a historical
+adoption base. Preserve recoverable dirty state and use exact validated
+targets. Cache loss is expendable only where the product contract says it
+changes performance, not truth.
 
 ## Review and adjudication
 
-Use Terra only after deterministic checks when independent counterexample
-search materially reduces risk. Give a fresh verifier the unchanged contract,
-authority, base and artifact SHAs, complete diff, evidence, uncertainty,
-residual risk, allowed operations, and observed state. Terra performs no write
-or output-producing check and returns all material findings once.
+Root reviews the scoped change and proof. Independent correctness or security
+review is optional unless a concrete trust, mutation, compatibility, or
+delivery risk, or a named acceptance contract, makes it necessary. Review the
+affected boundary rather than every component. A reviewer’s silence is not
+authorization. Repair local defects with their owner; return to `sol_design`
+only for a material contract-invalidating finding.
 
-P0 and P1 findings block. P2 blocks only for a direct acceptance dependency,
-release risk, or material near-term rework. Re-review only changed findings.
-No findings is evidence, not approval.
+When review is used, give the reviewer the identified change, applicable
+contract, complete relevant diff, actual evidence, uncertainty, residual risk,
+allowed read-only operations, and observed state. The reviewer returns all
+material findings; no finding is evidence, not approval.
 
-Root inspects the contract, diff, evidence, uncertainty, failed attempts, and
-review findings. It chooses exactly one result:
+## Enterprise/Certification milestone
 
-1. accept for the next protected gate;
-2. request one bounded repair;
-3. reject and redesign;
-4. declare requirements underspecified;
-5. escalate to a human.
+The enhanced workflow is conditional. The user or authorized maintainer must
+explicitly activate Enterprise/Certification in `PROJECT.md` for a named
+milestone, assurance objective, and acceptance contract. A risk, role name,
+Make target, broad command, old tracker item, major-version label, or recovered
+handoff cannot activate it. An explicit request for one broad check authorizes
+that check, not every assurance ceremony.
+
+For an activated milestone, follow its named existing contract: bounded
+planning/dependency stages, exact relevant candidate and evidence identity,
+applicable full gates, independent fixed-artifact review, qualification
+populations, and replay or attestation only where that contract requires them.
+Use existing packet, evidence, and artifact locations. Do not add a generic
+compliance framework, certification schema, service, or policy engine.
+
+Explicitly activating next-major I5 selects the preserved v1-v4 contract and
+its adjudicated method requirements. The incomplete method and rejected
+product findings remain blockers for that claim; historical counts are not
+current proof. At completion, cancellation, or deactivation, record the
+truthful result and residual work, then return new work to Sprint.
 
 ## Integration and delivery
 
-Root uses one integration queue. For each accepted artifact, confirm ancestry
-and paths, inspect the semantic diff, reconcile on the current integration SHA,
-rerun invalidated checks, and record the result SHA and rollback.
-
-Keep worktrees until their results are durable. After integration, remove a
-clean accepted worktree with `git worktree remove`, delete its merged branch
-without force, prune, and inspect the remaining worktree list. Never discard a
-dirty or unintegrated artifact.
-
-Without explicit project delivery authority, stop after local verification.
-With authority, record residual work and rollback, verify, commit, push the
-exact SHA, wait for protected CI and approval, merge or release, close Beads,
-synchronize its approved remote, and audit Git, Beads, CI, and worktrees. Stop
-at the last durable boundary on failure.
-
-Repository configuration cannot enforce credentials, protected Git, retry
-limits, production isolation, or human approval. Runtime permissions,
-credential systems, repository rules, CI, branch protection, and humans retain
-those controls.
-
-For this adoption, root may create local branches and worktrees and integrate
-locally. Commit, push, merge, release, deployment, remote mutation, and Beads
-Dolt synchronization remain unauthorized until separately granted.
+Root integrates accepted artifacts serially after checking paths, semantic
+diff, affected evidence, and rollback. Keep unintegrated work recoverable.
+Without separate delivery authority, stop after local verification. Commit,
+push, merge, release, deployment, publication, remote mutation, credentials,
+and Beads Dolt synchronization remain unauthorized. A passing local check or
+Enterprise result never expands that authority.

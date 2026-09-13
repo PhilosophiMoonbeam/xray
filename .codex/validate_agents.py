@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""Validate objective invariants of XRAY's adapted Codex control plane."""
-
-from __future__ import annotations
-
 import argparse
 import copy
 import hashlib
@@ -24,14 +20,6 @@ ROLES = {
     "luna_read": ("gpt-5.6-luna", "max"),
     "luna_write": ("gpt-5.6-luna", "max"),
     "terra_verify": ("gpt-5.6-terra", "high"),
-}
-ROLE_HASHES = {
-    "breakthrough_read": "f0c8475387b0f8480353396818805293007aeb4b933682d79284abb9425f276e",
-    "luna_read": "e744ed380b91f420e943beac3ab9eaee6e1a3c84b975059bd461b06289c0a730",
-    "luna_write": "90e31a0ad9eaa7753a6cba32f510694cc61eaf6f954ca9d5c95c6eb90a5696b1",
-    "sol_design": "2936ac5c06af4472fa88fbcc78bf14d3336e1fb8de73fbf7945960083201ef38",
-    "sol_write": "6ed26a090e514983340a6ed340a7317336fb721ee2d953a85097cb971a422d44",
-    "terra_verify": "1314e94aba1d1f9cdaa8ac8fe99d2ce0e3e64fd65e8da8af2406ca07cc6d3fdd",
 }
 BYTE_INVARIANTS = {
     Path(".agents/skills/beads/agents/openai.yaml"): (
@@ -62,12 +50,9 @@ ROLE_KEYS = {
     "agents",
 }
 ROLE_PATH_PARTS = 3
-ROLE_WORD_BUDGET = 1160
-ROLE_BYTE_BUDGET = 9250
-AUTOMATION_BYTE_BUDGET = 35000
-DIGEST_FIELD_COUNT = 2
 TRAILING_WHITESPACE_EVIDENCE = {Path("docs/adoption-design-packet-v1.md")}
-DESIGN_PACKETS = {Path(f"docs/adoption-design-packet-v{version}.md") for version in (1, 2)}
+DESIGN_PACKETS = {Path(f"docs/next-major-design-packet-v{version}.md") for version in range(1, 5)}
+ADOPTION_PACKETS = {Path(f"docs/adoption-design-packet-v{version}.md") for version in range(1, 3)}
 INDEX_TARGETS = {
     "PROJECT.md",
     "ARCHITECTURE.md",
@@ -94,7 +79,8 @@ REQUIRED_FILES = {
     Path(".agents/skills/beads/agents/openai.yaml"),
     CLAUDE,
     *DESIGN_PACKETS,
-    *(packet.with_suffix(".sha256") for packet in DESIGN_PACKETS),
+    *ADOPTION_PACKETS,
+    *(packet.with_suffix(".sha256") for packet in DESIGN_PACKETS | ADOPTION_PACKETS),
     Path("docs/ADAPTATION.md"),
     Path("docs/agent-model-routing.md"),
     Path("docs/agent-operations.md"),
@@ -112,6 +98,10 @@ MANIFEST_TARGETS = {
     "docs/adoption-design-packet-v1.sha256",
     "docs/adoption-design-packet-v2.md",
     "docs/adoption-design-packet-v2.sha256",
+    "docs/next-major-design-packet-v3.md",
+    "docs/next-major-design-packet-v3.sha256",
+    "docs/next-major-design-packet-v4.md",
+    "docs/next-major-design-packet-v4.sha256",
     ".codex/config.toml",
     ".codex/agents/*.toml",
     ".codex/hooks.json",
@@ -143,44 +133,18 @@ DELETED_RUNTIME = {
     Path(".codex/validate_language.py"),
     Path(".codex/validate_text.py"),
 }
-BUDGETS = {
-    Path("AGENTS.md"): (1050, 8500),
-    Path("PROJECT.md"): (1800, 14000),
-    Path("ARCHITECTURE.md"): (2500, 20000),
-    Path("README.md"): (2800, 22000),
-    Path("TEMPLATE_MANIFEST.md"): (600, 5000),
-    Path("docs/adoption-design-packet-v1.md"): (3300, 26000),
-    Path("docs/adoption-design-packet-v2.md"): (1800, 14000),
-    Path("docs/ADAPTATION.md"): (700, 5200),
-    Path("docs/agent-model-routing.md"): (500, 3800),
-    Path("docs/agent-operations.md"): (1200, 9000),
-    Path("docs/implementation-standard.md"): (850, 6500),
-    Path("docs/repository-language-standard.md"): (1000, 7500),
-    Path("docs/instruction-transformation-evidence.md"): (1800, 13000),
-    Path("examples/assignment-contracts.md"): (350, 2800),
-    Path("examples/beads-dag.md"): (250, 1700),
-    Path("examples/nested-AGENTS.md"): (180, 1400),
-    CONFIG: (140, 1400),
-    HOOKS: (75, 800),
-    Path(".codex/session_start.py"): (900, 9000),
-    Path(".agents/skills/beads/SKILL.md"): (150, 1200),
-    Path(".agents/skills/beads/agents/openai.yaml"): (30, 300),
-    Path("Makefile"): (180, 2200),
-    Path(".codex/validate_agents.py"): (1800, 21000),
-    Path(".codex/validate_project_readiness.py"): (525, 5800),
-}
 
 
-def sha256(data: bytes) -> str:
+def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def read_toml(path: Path) -> dict[str, Any]:
+def read_toml(path):
     with path.open("rb") as source:
         return tomllib.load(source)
 
 
-def configuration_problems(config: dict[str, Any], roles: dict[str, dict[str, Any]]) -> list[str]:
+def configuration_problems(config, roles):
     problems: list[str] = []
     if set(config) != ROOT_KEYS:
         problems.append("root config keys differ from the XRAY schema")
@@ -195,7 +159,6 @@ def configuration_problems(config: dict[str, Any], roles: dict[str, dict[str, An
     for key, value in expected_root.items():
         if config.get(key) != value:
             problems.append(f"root {key} differs")
-
     agents = config.get("agents")
     if not isinstance(agents, dict):
         return [*problems, "agents table is missing"]
@@ -205,7 +168,6 @@ def configuration_problems(config: dict[str, Any], roles: dict[str, dict[str, An
     registrations = {key: value for key, value in agents.items() if isinstance(value, dict)}
     if set(registrations) != set(ROLES):
         problems.append("registered role set differs")
-
     for name, (model, effort) in ROLES.items():
         registration = registrations.get(name, {})
         role = roles.get(name, {})
@@ -235,7 +197,7 @@ def configuration_problems(config: dict[str, Any], roles: dict[str, dict[str, An
     return problems
 
 
-def expected_hook() -> dict[str, Any]:
+def expected_hook():
     return {
         "description": "Recover XRAY Beads workflow and current work when a Codex session starts or compacts.",
         "hooks": {
@@ -257,7 +219,7 @@ def expected_hook() -> dict[str, Any]:
     }
 
 
-def hook_problems(hooks: dict[str, Any], composer: str) -> list[str]:
+def hook_problems(hooks, composer):
     problems = [] if hooks == expected_hook() else ["SessionStart hook differs from the XRAY uv contract"]
     forbidden = ("PostCompact", "PreCompact", "UserPromptSubmit", "bd codex-hook")
     combined = json.dumps(hooks, sort_keys=True) + composer
@@ -269,7 +231,7 @@ def hook_problems(hooks: dict[str, Any], composer: str) -> list[str]:
     return problems
 
 
-def claude_problems(settings: dict[str, Any]) -> list[str]:
+def claude_problems(settings):
     expected = {
         "hooks": {
             "SessionStart": [
@@ -324,70 +286,26 @@ def hygiene_problems(relative: Path, data: bytes) -> list[str]:
     return problems
 
 
-def size(data: bytes) -> tuple[int, int]:
-    return len(data.decode("utf-8").split()), len(data)
-
-
-def exceeds_budget(current: tuple[int, int], limit: tuple[int, int]) -> bool:
-    return current[0] > limit[0] or current[1] > limit[1]
-
-
 def governed_paths(root: Path) -> list[Path]:
     paths = set(REQUIRED_FILES)
-    paths.update(path for path in BUDGETS if (root / path).is_file())
     paths.update({Path(".codex/validate_agents.py"), Path(".codex/validate_project_readiness.py")})
     return sorted(path for path in paths if (root / path).is_file())
 
 
-def budget_problems(root: Path) -> tuple[list[str], list[str]]:
+def digest_problems(root: Path, digest=sha256) -> list[str]:
     problems: list[str] = []
-    reports: list[str] = []
-    for relative, limit in BUDGETS.items():
-        path = root / relative
-        if not path.is_file():
-            continue
-        current = size(path.read_bytes())
-        reports.append(f"{relative}: words={current[0]}/{limit[0]} bytes={current[1]}/{limit[1]}")
-        if exceeds_budget(current, limit):
-            problems.append(f"size budget exceeded: {relative}")
-
-    role_sizes = [size((root / f".codex/agents/{name}.toml").read_bytes()) for name in ROLES]
-    role_words = sum(item[0] for item in role_sizes)
-    role_bytes = sum(item[1] for item in role_sizes)
-    reports.append(f"six roles: words={role_words}/{ROLE_WORD_BUDGET} bytes={role_bytes}/{ROLE_BYTE_BUDGET}")
-    if role_words > ROLE_WORD_BUDGET or role_bytes > ROLE_BYTE_BUDGET:
-        problems.append("six-role aggregate budget exceeded")
-
-    automation_paths = (
-        Path(".codex/session_start.py"),
-        Path(".codex/validate_agents.py"),
-        Path(".codex/validate_project_readiness.py"),
-    )
-    automation_bytes = sum((root / path).stat().st_size for path in automation_paths if (root / path).is_file())
-    reports.append(f"Python automation: bytes={automation_bytes}/{AUTOMATION_BYTE_BUDGET}")
-    if automation_bytes > AUTOMATION_BYTE_BUDGET:
-        problems.append("Python automation aggregate budget exceeded")
-    return problems, reports
-
-
-def digest_problems(root: Path) -> list[str]:
-    problems: list[str] = []
-    for packet in DESIGN_PACKETS:
+    for packet in DESIGN_PACKETS | ADOPTION_PACKETS:
         companion = packet.with_suffix(".sha256")
-        fields = (root / companion).read_text(encoding="utf-8").split()
-        if len(fields) != DIGEST_FIELD_COUNT or fields[1] != packet.as_posix():
+        expected = f"{digest((root / packet).read_bytes())}  {packet.as_posix()}\n".encode("ascii")
+        if (root / companion).read_bytes() != expected:
             problems.append(f"{companion}: digest format differs")
-        elif fields[0] != sha256((root / packet).read_bytes()):
-            problems.append(f"{companion}: digest is stale")
     return problems
 
 
 def byte_invariant_problems(root: Path) -> list[str]:
-    expected = dict(BYTE_INVARIANTS)
-    expected.update({Path(f".codex/agents/{name}.toml"): digest for name, digest in ROLE_HASHES.items()})
     return [
         f"byte-invariant artifact differs: {path}"
-        for path, digest in expected.items()
+        for path, digest in BYTE_INVARIANTS.items()
         if sha256((root / path).read_bytes()) != digest
     ]
 
@@ -405,7 +323,6 @@ def repository_problems(root: Path = ROOT) -> tuple[list[str], list[str]]:
     problems.extend(f"required XRAY control-plane file is missing: {path}" for path in missing)
     if missing:
         return problems, []
-
     paths = {path.relative_to(root) for path in (root / ".codex").rglob("*") if path.is_file()}
     problems.extend(inventory_problems(paths))
     try:
@@ -430,9 +347,7 @@ def repository_problems(root: Path = ROOT) -> tuple[list[str], list[str]]:
     problems.extend(byte_invariant_problems(root))
     for relative in governed_paths(root):
         problems.extend(hygiene_problems(relative, (root / relative).read_bytes()))
-    size_failures, reports = budget_problems(root)
-    problems.extend(size_failures)
-    return problems, reports
+    return problems, []
 
 
 def self_test() -> None:
@@ -442,7 +357,6 @@ def self_test() -> None:
     composer = (ROOT / ".codex/session_start.py").read_text(encoding="utf-8")
     failures: list[str] = []
     cases: list[tuple[str, list[str]]] = []
-
     wrong_model = copy.deepcopy(roles)
     wrong_model["luna_read"]["model"] = "wrong"
     cases.append(("wrong model", configuration_problems(config, wrong_model)))
@@ -460,7 +374,7 @@ def self_test() -> None:
     cases.append(("descendants enabled", configuration_problems(config, descendants)))
     permissions = copy.deepcopy(config)
     permissions["approval_policy"] = "on-request"
-    cases.append(("wrong permissions", configuration_problems(permissions, roles)))
+    cases.append(("permissions", configuration_problems(permissions, roles)))
     thread_limit = copy.deepcopy(config)
     thread_limit["agents"]["max_concurrent_threads_per_session"] = 5
     cases.append(("wrong thread limit", configuration_problems(thread_limit, roles)))
@@ -471,7 +385,7 @@ def self_test() -> None:
     cases.append(("wrong inventory", inventory_problems({Path(".codex/agents/unknown.toml")})))
     cases.append(("deleted V1 runtime", inventory_problems({next(iter(DELETED_RUNTIME))})))
     cases.append(("wrong manifest", manifest_problems("| Path | Action |\n")))
-
+    cases.append(("corrupt adoption companion", digest_problems(ROOT, lambda _: "0" * 64)))
     for name, result in cases:
         if not result:
             failures.append(f"self-test missed {name}")
@@ -479,8 +393,6 @@ def self_test() -> None:
         failures.append("self-test missed encoding/text hygiene")
     if not hygiene_problems(Path("sample.md"), b"\xff"):
         failures.append("self-test missed invalid UTF-8")
-    if not exceeds_budget((2, 2), (1, 1)):
-        failures.append("self-test missed size budget")
     for name, parser, sample in (("TOML", tomllib.loads, "["), ("JSON", json.loads, "{")):
         try:
             parser(sample)

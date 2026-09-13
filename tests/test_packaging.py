@@ -1,303 +1,479 @@
 import importlib.metadata
-import importlib.util
-import json
-import re
-from contextlib import redirect_stdout
-from io import StringIO
+import importlib.resources
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import zipfile
 from pathlib import Path
 
-import tomllib
-
 ROOT = Path(__file__).parents[1]
+EXPECTED_VERSION = "1.0.0"
+CLI_SKILL_FILES = (Path("SKILL.md"), Path("agents/openai.yaml"))
+RESOURCE_FILES = (
+    Path("guidance.md"),
+    Path("skills/xray-progressive-discovery/SKILL.md"),
+    Path("agent_skills/xray-cli/SKILL.md"),
+    Path("agent_skills/xray-cli/agents/openai.yaml"),
+)
 
 
-def load_config_generator():
-    module_path = ROOT / "mcp-config-generator.py"
-    spec = importlib.util.spec_from_file_location("mcp_config_generator", module_path)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+def _read_package_resource(relative: Path) -> bytes:
+    resource = importlib.resources.files("xray")
+    for component in relative.parts:
+        resource = resource.joinpath(component)
+    return resource.read_bytes()
 
 
-def test_project_metadata_is_cli_first_with_mcp_compatibility():
-    data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    project = data["project"]
-
-    assert project["version"] == "0.11.4"
-    assert "CLI" in project["description"]
-    assert "MCP compatibility" in project["description"]
-    assert "cli" in project["keywords"]
-    assert "agents" in project["keywords"]
-    assert project["scripts"]["xray"] == "xray.cli:main"
-    assert project["scripts"]["xray-mcp"] == "xray.mcp_server:main"
-    assert "ast-grep-cli>=0.45.1,<0.46" in project["dependencies"]
-    assert "ast-grep-py>=0.45.1,<0.46" in project["dependencies"]
-    assert "pydantic>=2.0,<3" in project["dependencies"]
-    assert "pathspec>=0.12,<1" in project["dependencies"]
-    assert "pyright>=1.1.407" in data["dependency-groups"]["dev"]
-    assert "pytest>=9.0.0" in data["dependency-groups"]["dev"]
-    assert "ruff>=0.14.0" in data["dependency-groups"]["dev"]
-    assert "vulture>=2.14" in data["dependency-groups"]["dev"]
+def _build_wheel(output_dir: Path) -> Path:
+    output_dir.mkdir()
+    subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(output_dir), str(ROOT)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    wheels = tuple(output_dir.glob("*.whl"))
+    assert len(wheels) == 1
+    return wheels[0]
 
 
-def test_quality_tooling_is_configured_for_repo_layout():
-    data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+def _build_sdist(output_dir: Path) -> Path:
+    output_dir.mkdir()
+    subprocess.run(
+        ["uv", "build", "--sdist", "--out-dir", str(output_dir), str(ROOT)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    sdists = tuple(output_dir.glob("*.tar.gz"))
+    assert len(sdists) == 1
+    return sdists[0]
 
-    assert data["tool"]["ruff"]["line-length"] == 120
-    assert data["tool"]["ruff"]["target-version"] == "py310"
-    assert "test_samples" in data["tool"]["ruff"]["extend-exclude"]
-    assert data["tool"]["ruff"]["lint"]["select"] == ["E", "F", "I", "UP", "PL", "RUF"]
-    assert "PLR0917" in data["tool"]["ruff"]["lint"]["ignore"]
-    assert data["tool"]["ruff"]["lint"]["per-file-ignores"]["tests/**/*"] == ["PLR2004", "E501"]
-    assert data["tool"]["vulture"]["paths"] == ["src", "mcp-config-generator.py"]
-    assert "test_samples" in data["tool"]["vulture"]["exclude"]
-    assert data["tool"]["vulture"]["min_confidence"] == 80
-    assert data["tool"]["pyright"]["include"] == [
-        "src",
-        "mcp-config-generator.py",
-        "tests",
+
+def _assert_current_guidance(guidance: bytes) -> None:
+    text = guidance.decode("utf-8")
+    assert "xray.v1" in text
+    assert "xray.change.v1" in text
+    for removed in (
+        "explore_repo",
+        "find_symbol",
+        "read_symbol",
+        "symbol_at",
+        "scan_rules",
+        "rewrite_pattern",
+        "plan_replacement",
+        "xray.cli.v2",
+        "xray.replace.v2",
+        "lsp_config.json",
+    ):
+        assert removed not in text
+
+
+def test_importable_package_resources_are_complete():
+    package_root = importlib.resources.files("xray")
+    for relative in RESOURCE_FILES:
+        resource = package_root
+        for component in relative.parts:
+            resource = resource.joinpath(component)
+        assert resource.is_file(), relative
+        assert resource.read_bytes(), relative
+
+
+def test_repository_and_packaged_cli_skill_are_byte_identical():
+    repository_root = ROOT / "skills" / "xray-cli"
+    packaged_root = ROOT / "src" / "xray" / "agent_skills" / "xray-cli"
+
+    repository_files = {path.relative_to(repository_root) for path in repository_root.rglob("*") if path.is_file()}
+    packaged_files = {path.relative_to(packaged_root) for path in packaged_root.rglob("*") if path.is_file()}
+    assert repository_files == packaged_files == set(CLI_SKILL_FILES)
+
+    for relative in CLI_SKILL_FILES:
+        assert (repository_root / relative).read_bytes() == (packaged_root / relative).read_bytes()
+
+
+def test_built_wheel_and_sdist_publish_release_metadata_and_current_assets(tmp_path: Path):
+    assert importlib.metadata.version("xray") == EXPECTED_VERSION
+    wheel = _build_wheel(tmp_path / "wheel")
+    sdist = _build_sdist(tmp_path / "sdist")
+    assert wheel.name.startswith(f"xray-{EXPECTED_VERSION}-")
+    assert sdist.name.startswith(f"xray-{EXPECTED_VERSION}.")
+
+    with zipfile.ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+        metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
+        entry_points_name = next(name for name in names if name.endswith(".dist-info/entry_points.txt"))
+        metadata = archive.read(metadata_name).decode("utf-8")
+        entry_points = archive.read(entry_points_name).decode("utf-8")
+        assert f"\nVersion: {EXPECTED_VERSION}\n" in metadata
+        assert "xray = xray.cli:main" in entry_points
+        assert "xray-mcp = xray.mcp_server:main" in entry_points
+        assert not any(name.endswith("lsp_config.json") for name in names)
+        _assert_current_guidance(archive.read("xray/guidance.md"))
+
+    with tarfile.open(sdist, "r:gz") as archive:
+        names = set(archive.getnames())
+        assert not any(name.endswith("src/xray/lsp_config.json") for name in names)
+        pyproject_name = next(name for name in names if name.endswith("/pyproject.toml"))
+        pyproject = archive.extractfile(pyproject_name)
+        assert pyproject is not None
+        pyproject_text = pyproject.read().decode("utf-8")
+        assert f'version = "{EXPECTED_VERSION}"' in pyproject_text
+        assert 'xray = "xray.cli:main"' in pyproject_text
+        assert 'xray-mcp = "xray.mcp_server:main"' in pyproject_text
+
+
+def test_built_wheel_contains_resources_and_imports_from_clean_target(tmp_path: Path):
+    wheel = _build_wheel(tmp_path / "wheel")
+    package_prefix = "xray/"
+
+    with zipfile.ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+        expected_names = {package_prefix + relative.as_posix() for relative in RESOURCE_FILES}
+        assert expected_names <= names
+        assert not any(name.endswith("lsp_config.json") for name in names)
+        _assert_current_guidance(archive.read("xray/guidance.md"))
+        for relative in RESOURCE_FILES:
+            assert archive.read(package_prefix + relative.as_posix()) == _read_package_resource(relative)
+
+    install_root = tmp_path / "installed"
+    subprocess.run(
+        ["uv", "pip", "install", "--no-deps", "--target", str(install_root), str(wheel)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    script = """
+import importlib.metadata
+import importlib.resources
+import xray
+
+root = importlib.resources.files("xray")
+for relative in ("guidance.md", "skills/xray-progressive-discovery/SKILL.md", "agent_skills/xray-cli/SKILL.md", "agent_skills/xray-cli/agents/openai.yaml"):
+    resource = root
+    for component in relative.split("/"):
+        resource = resource.joinpath(component)
+    assert resource.is_file(), relative
+    assert resource.read_bytes(), relative
+assert xray.__version__ == "1.0.0"
+assert importlib.metadata.version("xray") == "1.0.0"
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(install_root)
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True, env=environment)
+
+
+def _make_checkout(path: Path, *, with_script: bool = True) -> Path:
+    path.mkdir(parents=True)
+    (path / "pyproject.toml").write_text(
+        '[project]\nname = "xray"\nversion = "1.0.0"\n',
+        encoding="utf-8",
+    )
+    (path / "src" / "xray").mkdir(parents=True)
+    (path / "src" / "xray" / "__init__.py").write_text("__version__ = '1.0.0'\n", encoding="utf-8")
+    if with_script:
+        script = path / "install.sh"
+        shutil.copy2(ROOT / "install.sh", script)
+        script.chmod(0o755)
+    return path
+
+
+def _fake_toolchain(tmp_path: Path, *, old_xray: bool = False) -> tuple[dict[str, str], Path, Path, Path, Path]:
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    tool_bin = tmp_path / "uv tools with spaces"
+    tool_bin.mkdir()
+    uv_log = tmp_path / "uv.log"
+    xray_log = tmp_path / "xray.log"
+    old_log = tmp_path / "old-xray.log"
+    home = tmp_path / "home"
+    home.mkdir()
+
+    uv_script = f"""#!/bin/sh
+set -eu
+log={shlex.quote(str(uv_log))}
+tool_bin={shlex.quote(str(tool_bin))}
+printf 'cwd=%s\\n' "$PWD" >> "$log"
+printf 'argv=' >> "$log"
+for arg do printf '<%s>' "$arg" >> "$log"; done
+printf '\\n' >> "$log"
+printf 'selectors=%s|%s|%s\\n' "${{UV_WORKING_DIR-}}" "${{UV_PROJECT-}}" "${{UV_CONFIG_FILE-}}" >> "$log"
+if [ "${{FAKE_UV_MODE:-ok}}" = install-fail ]; then
+    case " $* " in
+        *" tool install "*) exit 17 ;;
+    esac
+fi
+if [ "${{1:-}}" = "--no-config" ]; then shift; fi
+if [ "${{1:-}}" = "--directory" ]; then shift 2; fi
+[ "${{1:-}}" = "tool" ] || exit 18
+shift
+case "${{1:-}}" in
+    install)
+        cat > "$tool_bin/xray" <<'XRAY'
+#!/bin/sh
+set -eu
+log={shlex.quote(str(xray_log))}
+printf 'argv=' >> "$log"
+for arg do printf '<%s>' "$arg" >> "$log"; done
+printf '\\n' >> "$log"
+if [ "${{1:-}}" = "--version" ]; then
+    printf '%s\\n' "${{FAKE_XRAY_VERSION:-xray 1.0.0}}"
+    exit 0
+fi
+if [ "${{1:-}}" = "map" ]; then
+    [ "${{FAKE_XRAY_MAP_FAIL:-0}}" != 1 ]
+    exit $?
+fi
+exit 0
+XRAY
+        chmod +x "$tool_bin/xray"
+        cat > "$tool_bin/xray-mcp" <<'MCP'
+#!/bin/sh
+exit 0
+MCP
+        chmod +x "$tool_bin/xray-mcp"
+        if [ "${{FAKE_UV_MODE:-ok}}" = missing-entry-point ]; then
+            rm -f "$tool_bin/xray-mcp"
+        fi
+        ;;
+    update-shell)
+        ;;
+    dir)
+        [ "${{2:-}}" = "--bin" ] || exit 19
+        printf '%s\\n' "$tool_bin"
+        ;;
+    *) exit 20 ;;
+esac
+"""
+    uv = commands / "uv"
+    uv.write_text(uv_script, encoding="utf-8")
+    uv.chmod(0o755)
+
+    for command in ("git", "curl"):
+        marker = tmp_path / f"{command}.log"
+        wrapper = commands / command
+        wrapper.write_text(
+            f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {shlex.quote(str(marker))}\nexit 99\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+
+    path_entries = [str(commands)]
+    if old_xray:
+        old_bin = tmp_path / "old-bin"
+        old_bin.mkdir()
+        old = old_bin / "xray"
+        old.write_text(
+            f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {shlex.quote(str(old_log))}\nprintf 'xray 0.0.0\\n'\n",
+            encoding="utf-8",
+        )
+        old.chmod(0o755)
+        path_entries.insert(0, str(old_bin))
+    path_entries.append(os.environ["PATH"])
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "PATH": os.pathsep.join(path_entries),
+            "UV_WORKING_DIR": str(tmp_path / "ambient"),
+            "UV_PROJECT": str(tmp_path / "ambient" / "pyproject.toml"),
+            "UV_CONFIG_FILE": str(tmp_path / "ambient" / "uv.toml"),
+        }
+    )
+    return environment, uv_log, xray_log, old_log, home
+
+
+def _run_install(
+    script: Path,
+    *arguments: str,
+    cwd: Path,
+    environment: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(script), *arguments],
+        cwd=cwd,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_install_script_selects_only_explicit_local_checkout_and_uv_bin(tmp_path: Path) -> None:
+    trusted = _make_checkout(tmp_path / "trusted checkout")
+    ambient = _make_checkout(tmp_path / "ambient project")
+    selected = _make_checkout(tmp_path / "selected checkout with spaces")
+    (ambient / "ambient-marker").write_text("unchanged\n", encoding="utf-8")
+    before_trusted = (trusted / "pyproject.toml").read_bytes()
+    environment, uv_log, xray_log, old_log, home = _fake_toolchain(tmp_path, old_xray=True)
+    environment["XRAY_INSTALL_FORCE"] = "1"
+
+    first = _run_install(trusted / "install.sh", cwd=ambient, environment=environment)
+    assert first.returncode == 0, first.stderr
+    second = _run_install(
+        trusted / "install.sh",
+        cwd=ambient,
+        environment=environment,
+        *("--checkout", str(selected)),
+    )
+    assert second.returncode == 0, second.stderr
+
+    log = uv_log.read_text(encoding="utf-8")
+    assert f"<{trusted.resolve()}>" in log
+    assert f"<{selected.resolve()}>" in log
+    assert "tool><install><--force>" in log
+    assert "tool><run>" not in log
+    assert "selectors=||" in log
+    assert all(f"cwd={path.resolve()}" in log for path in (trusted, selected))
+    xray_calls = xray_log.read_text(encoding="utf-8")
+    assert f"<map><{trusted.resolve()}><--depth><1>" in xray_calls
+    assert f"<map><{selected.resolve()}><--depth><1>" in xray_calls
+    assert not old_log.exists()
+    assert not (tmp_path / "git.log").exists()
+    assert not (tmp_path / "curl.log").exists()
+    assert (ambient / "ambient-marker").read_text(encoding="utf-8") == "unchanged\n"
+    assert (trusted / "pyproject.toml").read_bytes() == before_trusted
+    assert not (home / ".xray").exists()
+
+
+def test_install_script_rejects_pipe_source_invalid_args_and_invalid_checkout_before_uv(
+    tmp_path: Path,
+) -> None:
+    trusted = _make_checkout(tmp_path / "trusted")
+    ambient = _make_checkout(tmp_path / "ambient")
+    missing = tmp_path / "missing"
+    standalone = tmp_path / "standalone.sh"
+    shutil.copy2(ROOT / "install.sh", standalone)
+    standalone.chmod(0o755)
+    environment, uv_log, _xray_log, _old_log, _home = _fake_toolchain(tmp_path, old_xray=True)
+
+    cases: list[subprocess.CompletedProcess[str]] = [
+        subprocess.run(
+            ["bash"],
+            input=(ROOT / "install.sh").read_text(encoding="utf-8"),
+            cwd=ambient,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        ),
+        subprocess.run(
+            ["bash", "/dev/stdin"],
+            input=(ROOT / "install.sh").read_text(encoding="utf-8"),
+            cwd=ambient,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        ),
+        subprocess.run(
+            ["bash", "-c", f"source {shlex.quote(str(trusted / 'install.sh'))}"],
+            cwd=ambient,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        ),
+        _run_install(trusted / "install.sh", "--unknown", cwd=ambient, environment=environment),
+        _run_install(
+            trusted / "install.sh",
+            "--checkout",
+            str(trusted),
+            "--checkout",
+            cwd=ambient,
+            environment=environment,
+        ),
+        _run_install(trusted / "install.sh", "--checkout", cwd=ambient, environment=environment),
+        _run_install(
+            trusted / "install.sh",
+            "--checkout",
+            str(missing),
+            cwd=ambient,
+            environment=environment,
+        ),
+        _run_install(standalone, cwd=ambient, environment=environment),
     ]
-    assert "tests" not in data["tool"]["pyright"]["exclude"]
-    assert data["tool"]["pyright"]["pythonVersion"] == "3.10"
-    assert data["tool"]["pyright"]["typeCheckingMode"] == "standard"
-    assert data["tool"]["pyright"]["strict"] == [
-        "src/xray/models.py",
-        "src/xray/core/ast_grep.py",
-        "mcp-config-generator.py",
-    ]
-    assert data["tool"]["pyright"]["reportMissingTypeStubs"] is False
+    assert all(result.returncode != 0 for result in cases)
+    assert not uv_log.exists()
+    assert not (tmp_path / "git.log").exists()
+    assert not (tmp_path / "curl.log").exists()
+
+    help_result = _run_install(trusted / "install.sh", "--help", cwd=ambient, environment=environment)
+    assert help_result.returncode == 0
+    assert "Usage:" in help_result.stdout
+    assert not uv_log.exists()
 
 
-def test_fastmcp_dependency_requires_verified_modern_surface():
-    data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+def test_install_script_keeps_no_change_behavior_and_does_not_delete_home_source(tmp_path: Path) -> None:
+    trusted = _make_checkout(tmp_path / "trusted")
+    ambient = _make_checkout(tmp_path / "ambient")
+    environment, uv_log, _xray_log, old_log, home = _fake_toolchain(tmp_path, old_xray=True)
+    environment.pop("XRAY_INSTALL_FORCE", None)
+    sentinel = home / ".xray"
+    sentinel.mkdir()
+    (sentinel / "keep.txt").write_text("keep\n", encoding="utf-8")
 
-    assert "fastmcp>=3.4.7,<4" in data["project"]["dependencies"]
+    result = _run_install(trusted / "install.sh", cwd=ambient, environment=environment)
 
-
-def test_packaging_includes_mcp_and_agent_skill_data():
-    data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-
-    assert data["tool"]["setuptools"]["package-data"]["xray"] == ["skills/**/*", "agent_skills/**/*"]
-
-
-def test_packaged_cli_skill_exactly_matches_repository_source():
-    source = ROOT / "skills" / "xray-cli"
-    packaged = ROOT / "src" / "xray" / "agent_skills" / "xray-cli"
-
-    source_files = {path.relative_to(source) for path in source.rglob("*") if path.is_file()}
-    packaged_files = {path.relative_to(packaged) for path in packaged.rglob("*") if path.is_file()}
-
-    assert source_files == packaged_files == {Path("SKILL.md"), Path("agents/openai.yaml")}
-    for relative in source_files:
-        assert (packaged / relative).read_bytes() == (source / relative).read_bytes()
+    assert result.returncode == 0
+    assert "Set XRAY_INSTALL_FORCE=1" in result.stdout
+    assert not uv_log.exists()
+    assert not old_log.exists()
+    assert (sentinel / "keep.txt").read_text(encoding="utf-8") == "keep\n"
 
 
-def test_packaged_mcp_skill_is_current_and_token_bounded():
-    content = (ROOT / "src" / "xray" / "skills" / "xray-progressive-discovery" / "SKILL.md").read_text(encoding="utf-8")
+def test_install_script_reports_uv_and_post_install_failures(tmp_path: Path) -> None:
+    trusted = _make_checkout(tmp_path / "trusted")
+    environment, _uv_log, _xray_log, old_log, _home = _fake_toolchain(tmp_path, old_xray=True)
+    environment["XRAY_INSTALL_FORCE"] = "1"
 
-    assert "ranks natural intent" in content
-    assert '`mode="regex"`' in content
-    assert "read_interface_structured" in content
-    assert "read_symbol" in content
-    assert "symbol_at" in content
-    assert "xray_capabilities" in content
-    assert "apply_rule_fixes" in content
-    assert "`scan_rules`, `check_rules`," in content
-    assert "plan_replacement" in content
-    assert "refine_replacement" in content
-    assert "verify_replacement" in content
-    assert "apply_replacement" in content
-    assert "xray.replace.v2" in content
-    assert "`isError=true`" in content
-    assert "YAML is ast-grep rule/test input, never XRAY output" in content
-    assert "Pass `lang` when known" in content
-    assert len(content.split()) <= 500
-    assert len(content.encode()) <= 3600
+    for updates in (
+        {"FAKE_XRAY_VERSION": "xray 9.9.9"},
+        {"FAKE_UV_MODE": "missing-entry-point"},
+        {"FAKE_XRAY_MAP_FAIL": "1"},
+        {"FAKE_UV_MODE": "install-fail"},
+    ):
+        environment.pop("FAKE_XRAY_VERSION", None)
+        environment.pop("FAKE_UV_MODE", None)
+        environment.pop("FAKE_XRAY_MAP_FAIL", None)
+        environment.update(updates)
+        result = _run_install(trusted / "install.sh", cwd=tmp_path, environment=environment)
+        assert result.returncode != 0, (updates, result.stdout, result.stderr)
+
+    assert not old_log.exists()
 
 
-def test_top_level_cli_skill_is_agent_skills_compliant():
-    skill_dir = ROOT / "skills" / "xray-cli"
-    skill_path = skill_dir / "SKILL.md"
-    openai_path = skill_dir / "agents" / "openai.yaml"
+def test_install_script_bootstraps_uv_only_after_source_validation(tmp_path: Path) -> None:
+    trusted = _make_checkout(tmp_path / "trusted")
+    standalone = tmp_path / "standalone.sh"
+    shutil.copy2(ROOT / "install.sh", standalone)
+    standalone.chmod(0o755)
+    environment, uv_log, _xray_log, _old_log, home = _fake_toolchain(tmp_path)
+    commands = tmp_path / "commands"
+    uv_source = tmp_path / "bootstrap-uv"
+    shutil.copy2(commands / "uv", uv_source)
+    (commands / "uv").unlink()
+    curl_marker = tmp_path / "curl.log"
+    (commands / "curl").write_text(
+        f"#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(curl_marker))}\n"
+        f"printf '%s\\n' 'mkdir -p \"$HOME/.local/bin\"'\n"
+        f"printf '%s\\n' 'cp -f -- {shlex.quote(str(uv_source))} \"$HOME/.local/bin/uv\"'\n",
+        encoding="utf-8",
+    )
+    (commands / "curl").chmod(0o755)
 
-    assert skill_path.exists()
-    assert not (ROOT / "skills" / "XRAY-CLI").exists()
-    assert not (skill_dir / "skill.md").exists()
+    environment["PATH"] = os.pathsep.join((str(commands), os.defpath))
+    invalid = _run_install(standalone, cwd=tmp_path, environment=environment)
+    assert invalid.returncode != 0
+    assert not curl_marker.exists()
+    assert not (home / ".local" / "bin" / "uv").exists()
 
-    content = skill_path.read_text(encoding="utf-8")
-    assert content.startswith("---\n")
-    frontmatter, body = content.split("---\n", 2)[1:]
-    metadata = {}
-    for line in frontmatter.splitlines():
-        key, value = line.split(": ", 1)
-        metadata[key] = value.strip('"')
-
-    assert metadata["name"] == skill_dir.name
-    assert re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", metadata["name"])
-    assert 1 <= len(metadata["description"]) <= 1024
-    assert "xray explore" in body
-    assert "xray find" in body
-    assert "xray interface" in body
-    assert "xray read-symbol" in body
-    assert "xray symbol-at" in body
-    assert "xray impact" in body
-    assert "xray search" in body
-    assert "xray replace plan ROOT" in body
-    assert "xray replace refine ROOT" in body
-    assert "xray replace verify ROOT" in body
-    assert "xray replace apply ROOT" in body
-    assert ".edit_manifest[].edit_id" in body
-    assert "xray.replace.v2" in body
-    assert "REVIEWED_DIGEST" in body
-    assert "Legacy `rewrite` and `scan --fix` remain destructive" in body
-    assert "Pass `-l/--lang` for pattern mutations when known" in body
-    assert "xray scan" in body
-    assert "xray rules check" in body
-    assert "xray rules explain" in body
-    assert "xray rules test" in body
-    assert "xray capabilities" in body
-    assert "xray imports" in body
-    assert "xray exports" in body
-    assert "never XRAY output" in body
-    assert "total_exact: false" in body
-    assert "reporting, not edits" in body
-    assert "`find` defaults to `min_score: 60`" in body
-    assert "`--detail full` preserves v1" in body
-    assert "symbol_mismatch" in body
-    assert "page may use a different positive size" in body
-    assert "inspection_lines" in body
-    assert "rollback_attempted" in body
-    assert "rollback_status" in body
-    assert "explicitly selected hidden path" in body
-    assert len(content.split()) <= 500
-    assert len(content.encode()) <= 3600
-
-    openai = openai_path.read_text(encoding="utf-8")
-    assert "$xray-cli" in openai
-    assert "guarded structural changes" in openai
-    assert len(openai.encode()) <= 256
-
-
-def test_mcp_server_imports_with_verified_fastmcp_surface():
-    from xray import mcp_server
-
-    version = tuple(int(part) for part in importlib.metadata.version("fastmcp").split(".")[:3])
-
-    assert (3, 4, 7) <= version < (4, 0, 0)
-    assert mcp_server.mcp.name == "XRAY Code Intelligence"
-    assert callable(mcp_server.main)
-
-
-def test_mcp_entrypoint_forces_documented_stdio_transport(monkeypatch):
-    from xray import mcp_server
-
-    calls = []
-    monkeypatch.setattr(mcp_server.mcp, "run", lambda **kwargs: calls.append(kwargs))
-
-    mcp_server.main()
-
-    assert calls == [{"transport": "stdio"}]
-
-
-def test_readme_documents_generated_cli_decision():
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-
-    assert "FastMCP's `generate-cli` can generate an ad hoc client" in readme
-    assert "XRAY does not ship that generated script as its primary CLI" in readme
-    assert "The `xray` command is the supported user-facing CLI" in readme
-    assert "**Source checkout**" in readme
-    assert "**Installed uv tool**" in readme
-    assert "uv tool install ." in readme
-    assert "xray skill install --user" in readme
-    assert "xray skill install --project /path/to/project" in readme
-    assert "does not forward arbitrary" in readme
-    assert "`search_tools` ranks natural intent by default" in readme
-    assert "xray replace verify ROOT" in readme
-    assert ".edit_manifest[].edit_id" in readme
-    assert "`symbol-at`/`symbol_at` resolves" in readme
-    assert "`xray skill install` is intentionally CLI-only" in readme
-    assert "`xray-mcp` fixes the FastMCP transport to stdio" in readme
-    assert "mcp-config-generator.py cursor installed_script" in readme
-    assert "mcp-config-generator.py vscode installed_script" in readme
-    assert "[mcp_servers.xray]" in readme
-    assert '"command": "xray-mcp"' in readme
-    assert '"mcpServers": {' in readme
-    assert '"xray": {' in readme
-    assert "source-checkout configuration" in readme
-
-
-def test_readme_documents_current_installation_and_cli_contract():
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    normalized_readme = " ".join(readme.split())
-
-    assert "https://github.com/PhilosophiMoonbeam/xray.git" in readme
-    assert "`fastmcp>=3.4.7,<4`" in readme
-    assert "`ast-grep-cli>=0.45.1,<0.46`" in readme
-    assert "`ast-grep-py>=0.45.1,<0.46`" in readme
-    assert "`pathspec>=0.12,<1`" in readme
-    assert "no separate installation is normally required" in normalized_readme
-    assert "JSON symbols include `name`" in readme
-    assert "`rewrite` and `scan --fix` modify files in place" in readme
-    assert "Exit codes are `0` for success" in readme
-    assert "symbols.json" in readme
-    assert "symbols.pkl" not in readme
-    assert "Python interface reads use the standard-library AST" in readme
-    assert "xray replace plan ROOT" in readme
-    assert '--expected-digest "$reviewed_digest"' in readme
-    assert "plan_replacement" in readme
-    assert "apply_replacement" in readme
-
-
-def test_package_fallback_version_matches_pyproject():
-    from xray import __version__
-
-    data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-
-    assert __version__ == data["project"]["version"]
-
-
-def test_mcp_config_generator_uses_uv_for_local_python_configs():
-    generator = load_config_generator()
-
-    cursor = generator.CONFIGS["cursor"]["local_python"]["mcpServers"]["xray"]
-    claude = generator.CONFIGS["claude"]["local_python"]["mcpServers"]["xray"]
-    vscode = generator.CONFIGS["vscode"]["local_python"]["mcp"]["servers"]["xray"]
-
-    assert cursor == {"command": "uv", "args": ["run", "python", "-m", "xray.mcp_server"]}
-    assert claude == {"command": "uv", "args": ["run", "python", "-m", "xray.mcp_server"]}
-    assert vscode["command"] == "uv"
-    assert vscode["args"] == ["run", "python", "-m", "xray.mcp_server"]
-
-
-def test_mcp_config_generator_preserves_installed_xray_mcp_command():
-    generator = load_config_generator()
-
-    for tool, path in [
-        ("cursor", ("mcpServers", "xray")),
-        ("claude", ("mcpServers", "xray")),
-        ("vscode", ("mcp", "servers", "xray")),
-    ]:
-        buffer = StringIO()
-        with redirect_stdout(buffer):
-            assert generator.print_config(tool, "installed_script") is True
-
-        output = buffer.getvalue()
-        json_start = output.index("{")
-        json_end = output.rindex("}") + 1
-        config = json.loads(output[json_start:json_end])
-        selected = config
-        for key in path:
-            selected = selected[key]
-        assert selected["command"] == "xray-mcp"
-
-
-def test_documented_generator_commands_are_supported():
-    generator = load_config_generator()
-
-    with redirect_stdout(StringIO()):
-        assert generator.print_config("cursor", "local_python") is True
-        assert generator.print_config("claude", "docker") is True
-        assert generator.print_config("claude", "installed_script") is True
-        assert generator.print_config("vscode", "source") is True
+    environment["XRAY_INSTALL_FORCE"] = "1"
+    valid = _run_install(trusted / "install.sh", cwd=tmp_path, environment=environment)
+    assert valid.returncode == 0, valid.stderr
+    assert "https://astral.sh/uv/install.sh" in curl_marker.read_text(encoding="utf-8")
+    assert uv_log.exists()

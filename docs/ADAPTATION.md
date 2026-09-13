@@ -1,53 +1,59 @@
 # XRAY Harness Adaptation
 
-This procedure implements the active frozen Design Packet version 2. It
-does not override `AGENTS.md`, `PROJECT.md`, `ARCHITECTURE.md`, Codex
-configuration, or the packet and its companion digest.
+This document describes the historical XRAY harness-adoption procedure. It does
+not override `PROJECT.md`, `AGENTS.md`, `ARCHITECTURE.md`, current standards,
+Codex configuration, or any packet and companion digest.
+Routine Development Sprint work does not reenact this procedure. An explicitly
+activated named Enterprise/Certification milestone may select its applicable
+steps and preserved artifacts.
 
 ## 1. Establish project authority
 
-Keep `PROJECT.md` at `Status: NOT_READY` while project facts, canonical `uv`
-commands, resources, delivery authority, and local qualification gates are
-unproven. `ARCHITECTURE.md` must describe XRAY's CLI, MCP adapter, core engine,
-packaging, caches, compatibility surfaces, generated artifacts, and mutation
-boundaries without changing product behavior.
+`PROJECT.md` is the current mode selector and remains `Status: READY` for a
+usable local harness; that status is not product certification. This
+historical procedure records how project facts, canonical `uv` commands,
+resources, delivery authority, and qualification gates were adopted.
+`ARCHITECTURE.md` describes XRAY's CLI, MCP adapter, core engine, packaging,
+caches, compatibility surfaces, generated artifacts, and mutation boundaries
+without changing product behavior.
 
 The root `AGENTS.md` remains a compact index. Add no nested instruction file
 without a real subtree-specific command, owner, invariant, or review rule.
-Apply the Repository Language Standard to owned prose and keep each rule at
-its named authority.
+Apply the Repository Language Standard to owned prose and keep each rule at its
+named authority.
 
 ## 2. Install the frozen Codex routes
 
-Use the packet's root route and six byte-invariant child profiles. The target
-ceiling is three child threads and at most three concurrent writers including
-root. Children remain unable to create descendants. Update configuration,
-operations, validators, and transformation evidence together if an authorized
-packet revision changes a route, effort, role, or ceiling.
+The six role profiles and current configuration are preserved runtime
+settings, not a routine byte-identical prompt recipe. Keep their models,
+efforts, permissions, no-descendant setting, root-only authority, and host
+limits. Role prose follows the active mode and operations contract; it does
+not activate Enterprise or require a synthetic Bead.
 
 Enable both `features.multi_agent` and `features.multi_agent_v2`. The semantic
 validator rejects a disabled V2 override so the control plane cannot silently
-return to the V1 lifecycle.
+return to the V1 lifecycle. Update configuration, operations, validators, and
+applicability links together when a separately authorized runtime boundary
+changes.
 
 Trusted local automation uses `danger-full-access` with approval `never`.
-Those settings grant no credentials, destructive authority, production
-access, protected Git action, Beads synchronization, publication, release, or
+Those settings grant no credentials, destructive authority, production access,
+protected Git action, Beads synchronization, publication, release, or
 deployment. Use current official Codex documentation for Codex behavior and
 Context7 for other current developer documentation under root instructions.
 
 ## 3. Normalize XRAY-owned recovery
 
-Never copy recipe `.git/` or `.beads/` state. Preserve and back up XRAY's
-canonical planning database before changing contributor routing. Root alone
-mutates Beads; children use `bd --readonly`. Replace legacy direct
-`bd codex-hook`, `PreCompact`, `PostCompact`, and `UserPromptSubmit` groups
-with one SessionStart recovery composer for `startup|resume|clear|compact`.
-Run its Python entry point through `uv run python`.
+Never copy recipe `.git/` or `.beads/` state. Preserve XRAY's canonical
+planning database when an authorized contributor-routing change requires it.
+Root alone mutates Beads; children use `bd --readonly`. The SessionStart
+composer provides bounded read-only recovery for `startup|resume|clear|compact`
+through `uv run python`.
 
-Retain Claude only as the packet-defined read-only compatibility adapter.
-Verify fresh-root, compaction, resume, and fresh-worktree recovery against an
-active claim absent from prior chat context. Hook execution alone is not
-proof of current-work recovery.
+Retain Claude only as the read-only compatibility adapter. Recovery is
+evidence for current ownership when durable history is needed; it does not
+activate an Enterprise milestone. Hook execution alone is not proof of
+current-work recovery.
 
 ## 4. Preserve XRAY behavior
 
@@ -61,28 +67,29 @@ not add YAML output.
 
 ## 5. Calibrate execution
 
-Use root-fast for a cohesive slice. Allocate parallel writers only when
-independent leaves have disjoint behavior, paths, branches, worktrees,
-resources, and generated outputs. Add Terra only when fixed-artifact
-counterexample search materially reduces risk. Root integrates serially and
+Root implements directly for a cohesive Sprint slice. Allocate parallel
+writers only when independent leaves have disjoint behavior, paths, resources,
+and generated outputs. Use worktrees when isolation provides real value, not
+as universal paperwork. Add an independent reviewer only when a concrete risk
+or named acceptance contract makes it useful. Root integrates serially and
 keeps every unintegrated result recoverable.
 
-MultiAgentV2 has no V1 `close_agent` tool. Root may retain a completed child
-for follow-up. When no follow-up is needed, root interrupts the completed lane.
-Interruption marks the lane as relinquished but does not itself reclaim its
-resident slot. When the three-child pool is full, the next spawn replaces the
-least-recently-used unloadable relinquished resident. A failed replacement
-after every child lane is relinquished stops delegation and is reported.
+The host retains its MultiAgentV2 lifecycle and current capacity settings.
+Completed children may receive a useful follow-up or be relinquished according
+to the host lifecycle; no fixed repair or follow-up quota applies.
 
-## 6. Qualify the exact candidate
+## 6. Historical qualification procedure
 
-Hash only the small byte-invariant set named by the packet. Validate adapted
-paths through semantic validators, focused tests, and complete diff review;
-do not create a repository-wide preserve manifest. Run the canonical Make
-targets, product tests, static checks, packaging and smoke checks, strict
-Codex diagnosis, link and stale-reference scans, and `git diff --check`.
+The former exact-candidate qualification procedure is suspended for routine
+work. An explicitly activated named Enterprise/Certification milestone may
+select its preserved packet contract, applicable gates, exact identity,
+independent review, attestation, replay, and evidence locations. Hash only
+artifacts that that contract identifies; do not create a repository-wide
+preserve manifest.
 
-Keep readiness `NOT_READY` until every required value, command, architecture
-claim, recovery path, and exact-SHA gate is proven. Local success does not
-authorize commit, push, merge, sync, release, or deployment. Record exact
-evidence, rollback, residual risk, and remaining work in Beads.
+Keep readiness `READY` for the usable harness. Local Sprint success does not
+authorize commit, push, merge, sync, release, publication, or deployment.
+Record actual evidence, rollback, residual risk, and remaining work in the
+final report or canonical Beads handoff when durable state is needed. Do not
+reopen historical adoption merely because an old packet or qualification Bead
+is present.

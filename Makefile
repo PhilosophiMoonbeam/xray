@@ -22,8 +22,8 @@ validate-package:
 	uv build
 
 validate-smoke:
-	uv run pytest tests/test_mcp_compact.py tests/test_cli.py::test_package_scripts_keep_mcp_and_add_cli tests/test_cli.py::test_mcp_tool_surface_is_search_first_with_compact_metadata tests/test_cli.py::test_mcp_workflow_guidance_is_available_on_demand
-	uv run xray --version && uv run xray explore . --max-depth 1
+	uv run pytest tests/test_mcp_compact.py::test_standard_tools_list_has_exactly_two_raw_adapter_tools tests/test_mcp_compact.py::test_discovery_publishes_complete_enabled_contract_and_seek_cursor tests/test_cli.py::test_help_and_version_are_handwritten_surfaces tests/test_cli.py::test_removed_commands_are_not_legacy_aliases tests/test_cli.py::test_removed_discovery_options_reject
+	uv run xray --version && uv run xray map . --depth 1
 
 validate-cleanliness:
 	git diff --check && git status --porcelain=v1 --untracked-files=all

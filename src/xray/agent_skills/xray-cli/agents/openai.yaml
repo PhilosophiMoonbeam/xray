@@ -1,4 +1,4 @@
 interface:
   display_name: "XRAY CLI"
-  short_description: "Compact discovery and guarded code changes"
-  default_prompt: "Use $xray-cli for compact repository discovery and guarded structural changes."
+  short_description: "Bounded discovery and reviewed structural change workflows"
+  default_prompt: "Use $xray-cli for bounded discovery, plan/review/apply change workflows, and capability checks."

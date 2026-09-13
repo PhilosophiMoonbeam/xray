@@ -14,15 +14,15 @@ max_concurrent_threads_per_session = 3
 interrupt_message = true
 
 [agents.sol_design]
-description = "Proposes one material architecture as a frozen Design Packet for root."
+description = "Proposes one actionable material architecture decision for root."
 config_file = "agents/sol_design.toml"
 
 [agents.sol_write]
-description = "Implements one semantic-quality-sensitive ready Bead under frozen authority."
+description = "Implements one semantic-quality-sensitive scoped assignment."
 config_file = "agents/sol_write.toml"
 
 [agents.breakthrough_read]
-description = "Diagnoses one unchanged failure after two evidence-free hypotheses."
+description = "Diagnoses one materially stuck failure with new evidence."
 config_file = "agents/breakthrough_read.toml"
 
 [agents.luna_read]
@@ -30,9 +30,9 @@ description = "Answers one bounded repository question with cited evidence."
 config_file = "agents/luna_read.toml"
 
 [agents.luna_write]
-description = "Implements one conventional contract-complete ready Bead."
+description = "Implements one conventional scoped assignment."
 config_file = "agents/luna_write.toml"
 
 [agents.terra_verify]
-description = "Searches one fixed artifact for counterexamples to its contract."
+description = "Reviews one scoped change for concrete counterexamples when risk requires it."
 config_file = "agents/terra_verify.toml"

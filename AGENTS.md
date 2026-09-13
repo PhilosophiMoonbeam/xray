@@ -7,8 +7,10 @@ own authority.
 
 User, platform, and orchestrator instructions override this file. A closer
 `AGENTS.override.md` or `AGENTS.md` overrides broader repository guidance only
-for its subtree. No instruction grants credentials, production access,
-destructive authority, remote mutation, merge, publication, or deployment.
+for its subtree. Within repository policy, `PROJECT.md` selects Development
+Sprint or an explicitly activated named Enterprise/Certification milestone.
+No repository instruction grants credentials, production access, destructive
+authority, remote mutation, merge, publication, or deployment.
 
 ## Instruction index
 
@@ -17,13 +19,13 @@ and examples do not override an authoritative source.
 
 | Trigger | Read | Authority |
 |---|---|---|
-| Before planning or claiming work | [`PROJECT.md`](PROJECT.md), [`ARCHITECTURE.md`](ARCHITECTURE.md), and the applicable instruction chain | Readiness, commands, components, interfaces, resources, and project authority |
-| After session start or context loss | Run `bd prime`; then inspect the ready frontier and active claims | Durable work, dependencies, blockers, and handoff |
+| Before planning or claiming work | [`PROJECT.md`](PROJECT.md), [`ARCHITECTURE.md`](ARCHITECTURE.md), and the applicable instruction chain | Mode, readiness, commands, components, interfaces, resources, and project authority |
+| After session start or context loss | Beads skill and current-work recovery when durable history is needed | Durable work, dependencies, blockers, and handoff |
 | Before changing owned text | [`docs/repository-language-standard.md`](docs/repository-language-standard.md) | Vocabulary, strength, semantic density, and transformation evidence |
 | Before implementation | [`docs/implementation-standard.md`](docs/implementation-standard.md) | Supported behavior, implementation, verification, and completion |
 | Before routing or delegation | [`docs/agent-model-routing.md`](docs/agent-model-routing.md), then [`docs/agent-operations.md`](docs/agent-operations.md) | Routes, contracts, allocation, worktrees, evidence, adjudication, and delivery |
 | Before integration, release, or destructive work | [`docs/agent-operations.md`](docs/agent-operations.md) and `PROJECT.md` | Reconciliation, rollback, protected gates, and cleanup |
-| While adopting or updating the harness | [`docs/adoption-design-packet-v2.md`](docs/adoption-design-packet-v2.md), [`docs/ADAPTATION.md`](docs/ADAPTATION.md), and [`TEMPLATE_MANIFEST.md`](TEMPLATE_MANIFEST.md) | Active frozen design, procedure, and inventory |
+| During historical adoption recovery | [`docs/adoption-design-packet-v2.md`](docs/adoption-design-packet-v2.md), [`docs/ADAPTATION.md`](docs/ADAPTATION.md), and [`TEMPLATE_MANIFEST.md`](TEMPLATE_MANIFEST.md) | Historical adoption procedure and frozen evidence; not routine Sprint authority |
 | For product behavior or orientation | [`README.md`](README.md), then `ARCHITECTURE.md` | Public usage and component contracts |
 
 ## Readiness and scope
@@ -31,52 +33,52 @@ and examples do not override an authoritative source.
 If `PROJECT.md` is not exactly `Status: READY`, edit only an explicitly
 authorized harness, profile, architecture, validator, documentation, or
 readiness-repair scope. Do not edit application source or guess a project
-fact. Before editing, inventory applicable configuration, tests, CI, scripts,
-permissions, worktrees, schemas, and instructions. Preserve unrelated state.
-Make the smallest complete change and remove obsolete behavior within scope.
+fact. Inspect the affected configuration, tests, scripts, permissions,
+resources, and instructions before editing; preserve unrelated state. Make the
+smallest complete change and remove obsolete behavior within scope.
 
 ## Root and child boundaries
 
 Root decides meaning and risk. It delegates execution, not authority. Use a
 child only for concrete, bounded work when delegation saves a turn, enables
-safe concurrency, or supplies risk-required independent evidence. Children do
-not mutate Beads, coordinate peers, create descendants, widen scope,
+genuine concurrency, or supplies risk-required independent evidence. Children
+do not mutate Beads, coordinate peers, create descendants, widen scope,
 self-approve, integrate, or deliver. Exact roles, models, efforts, and runtime
 controls live in `.codex/config.toml` and `.codex/agents/*.toml`.
 
 Only root mutates the canonical tracker through `bd -C ~/.beads-planning`.
-Children read Beads with `bd --readonly`. Root claims a ready leaf before
-implementation and records frozen design authority or exact
-architecture-neutral authority. Hierarchy and priority do not create blocking
-dependencies.
+Children read Beads with `bd --readonly` when a cited durable contract is
+needed. Root uses Beads for durable multi-session work, dependencies, blockers,
+and handoff; a Bead is not required for each local question, edit, hypothesis,
+or test.
 
-Every assignment supplies the Bead, outcome, authority, behavior, non-goals,
-interfaces, invariants, compatibility, rollback, risk, base commit, worktree,
-branch, writes, checks, resources, runtime, return schema, and task-specific
-overrides. A missing or conflicting field stops the lane.
+An assignment states the outcome or question, owned paths, relevant interfaces
+and invariants, allowed operations/resources, observable acceptance, and known
+risks. Add compatibility, rollback, runtime, or return details when they affect
+safe execution. Missing information blocks only when needed for safe
+execution.
 
 Concurrent writers require disjoint primary writes, generated outputs,
-resources, branches, and clean root-created worktrees. Root plus at most three
-children may run. At most three agents, including root, may write concurrently.
-Root integrates one artifact at a time and keeps unintegrated work recoverable.
+resources, and stateful operations. Worktrees are risk-driven: use them when
+isolation is needed, and serialize overlapping work. Keep current host limits
+and capability settings. Root integrates accepted artifacts and keeps
+unintegrated work recoverable.
 
 MultiAgentV2 has no V1 `close_agent` tool. Root may retain a completed child
-for follow-up. When no follow-up is needed, root interrupts the completed lane.
-Interruption marks the lane as relinquished but does not itself reclaim its
-resident slot. At a full pool, the next spawn replaces the least-recently-used
-unloadable relinquished resident. If replacement fails after every child lane
-is relinquished, stop delegation and report the V2 residency failure.
+for a useful follow-up and otherwise relinquish it according to the host
+lifecycle. Children never claim that interruption grants delivery authority.
 
-Evidence is an exact artifact or command, exit status, material output,
-environment, and artifact SHA. Reuse it only with unchanged artifact, inputs,
-toolchain, and environment. A check proves only covered behavior; no findings
-is not approval. Completion requires proof of every acceptance requirement and
-no remaining required work.
+Routine evidence is the actual command or scenario, exit/result, material
+observation, environment when relevant, and limitation. Exact artifact hashes,
+complete maps, and attestation ledgers are required only by a product contract
+or an explicitly activated assurance milestone. A check proves only covered
+behavior; no findings is not approval.
 
 Stop for ambiguous intent, contract conflict, required authority or scope
-expansion, contradictory evidence, an unexplained regression, or a prohibited
-action. After exactly two consecutive evidence-free technical hypotheses for
-one unchanged failure key, use the breakthrough route in operations.
+expansion, contradictory evidence, an unexplained regression, a prohibited
+action, or an unsafe/outcome-ambiguous mutation. Change diagnostic approach or
+obtain useful specialist evidence when a failure remains materially stuck; do
+not count retries or impose a fixed repair quota.
 
 Root alone integrates locally. Without separate delivery authority, stop after
 local verification. Commit, push, merge, release, deployment, GitHub mutation,
@@ -117,7 +119,9 @@ targets first. Use `scp -o BatchMode=yes` and `ssh -o BatchMode=yes`; use
 repository root, workspace root, unresolved variable, or broad glob with a
 destructive command.
 
-Changes to this index, Codex configuration, roles, hooks, validators, or
-canonical gates require their synchronized transformation evidence, complete
-diff review, strict configuration diagnosis when applicable, and
-`git diff --check`. Record limitations instead of weakening a gate.
+Harness authority changes update the affected policy, role/configuration,
+validator, recovery, and applicability links. Review the semantic diff and
+run only applicable configuration or static checks authorized for the change.
+Frozen packets, companions, and byte-invariant examples remain historical
+artifacts unless an explicitly activated milestone says otherwise. Record
+limitations instead of weakening product or delivery boundaries.

@@ -1,83 +1,142 @@
-"""Core indexing engine for XRAY - ast-grep based implementation."""
+"""Captured-byte declaration analysis and exact read service for XRAY I1.
+
+The indexer deliberately owns only the analysis work that cannot live in the
+repository capture layer: one canonical declaration artifact per captured
+file, strict reference resolution against that artifact, and exact bounded
+reads.  It never discovers files or rereads source after capture.
+"""
+
+from __future__ import annotations
 
 import ast
-import difflib
-import hashlib
+import bisect
 import json
-import os
 import re
-import shutil
-import stat
-import subprocess
-import tempfile
-import time
-from collections import Counter, OrderedDict
-from collections.abc import Mapping, Sequence
+import unicodedata
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, TypedDict, cast
+from pathlib import Path, PurePosixPath
+from typing import Any, Literal, cast, overload
 
 from ast_grep_py import SgRoot
-from pathspec import GitIgnoreSpec
-from thefuzz import fuzz
 
-from xray import __version__
 from xray.core.ast_grep import (
-    AstGrepCommandError,
-    AstGrepNotFoundError,
-    get_ast_grep_output_limit,
-    get_ast_grep_timeout,
+    AstGrepError,
+    AstGrepResult,
+    BoundedAstGrepExecutor,
+    BoundedAstGrepResult,
+    captured_ast_grep_session,
+    collect_complete_file_candidates,
     parse_json_array,
-    run_ast_grep,
-    run_ast_grep_bounded,
+)
+from xray.core.cache import DerivedCache
+from xray.core.repository import (
+    REGULAR_TEXT_DOMAIN,
+    SUPPORTED_SOURCE_DOMAIN,
+    CapturedFile,
+    CapturedNamespaceEntry,
+    CaptureDomain,
+    CapturedRuleSet,
+    NamespaceHorizon,
+    OperationBudget,
+    RepositoryCapture,
+    RepositoryError,
+    RepositoryProvider,
+    normalize_root,
+)
+from xray.core.toolchain import (
+    ToolchainObservation,
+    ToolchainProvider,
+    ToolchainUnavailableError,
+)
+from xray.core.toolchain import (
+    analyzer_id as toolchain_analyzer_id,
+)
+from xray.models import (
+    Capture,
+    Coverage,
+    CoverageReason,
+    Declaration,
+    Disclosure,
+    Enclosing,
+    EnclosingFound,
+    EnclosingNone,
+    EnclosingResult,
+    EnclosingUnavailable,
+    EnclosingUnsupported,
+    Error,
+    ErrorDetails,
+    ErrorValue,
+    Export,
+    FileCheckpoint,
+    FindArguments,
+    FindData,
+    FindItem,
+    FindRequest,
+    ImpactArguments,
+    ImpactData,
+    ImpactImport,
+    ImpactItem,
+    ImpactRequest,
+    Import,
+    InterfaceArguments,
+    InterfaceData,
+    InterfaceFileQuery,
+    InterfaceOwner,
+    InterfaceRequest,
+    InterfaceSymbolQuery,
+    LiteralSearchSource,
+    LocationTarget,
+    MapArguments,
+    MapData,
+    MapItem,
+    MapRequest,
+    OccurrenceRef,
+    PageFind,
+    PageImpact,
+    PageInterface,
+    PageMap,
+    PageRead,
+    PageResult,
+    PageSearch,
+    PatternSearchSource,
+    Position,
+    Range,
+    ReadArguments,
+    ReadCheckpoint,
+    ReadData,
+    ReadItem,
+    ReadRequest,
+    ReadTarget,
+    RepositoryCursor,
+    RepositoryProvenance,
+    Request,
+    Root,
+    RuleSearchSource,
+    SearchArguments,
+    SearchData,
+    SearchItem,
+    SearchRequest,
+    Selection,
+    SourceRef,
+    Success,
+    SymbolSourceRef,
+)
+from xray.presentation import (
+    canonical_bytes,
+    decode_cursor,
+    digest,
+    encode_cursor,
+    find_row_digest,
+    occurrence_digest,
+    repository_query_digest,
+    symbol_digest,
 )
 
-# Default exclusions
-DEFAULT_EXCLUSIONS = {
-    # Directories
-    "node_modules",
-    "vendor",
-    "__pycache__",
-    "venv",
-    ".venv",
-    "env",
-    "target",
-    "build",
-    "dist",
-    ".git",
-    ".svn",
-    ".hg",
-    ".agents",
-    ".beads",
-    ".claude",
-    ".codex",
-    ".idea",
-    ".vscode",
-    ".reference_projects",
-    ".ruff_cache",
-    ".xray",
-    "site-packages",
-    ".tox",
-    ".pytest_cache",
-    ".mypy_cache",
-    # File patterns
-    "*.pyc",
-    "*.pyo",
-    "*.pyd",
-    "*.so",
-    "*.dll",
-    "*.egg-info",
-    "*.log",
-    ".DS_Store",
-    "Thumbs.db",
-    "*.swp",
-    "*.swo",
-    "*~",
-}
-DEFAULT_EXCLUSION_SPEC = GitIgnoreSpec.from_lines(sorted(DEFAULT_EXCLUSIONS))
-
-# Language extensions
-LANGUAGE_MAP = {
+# The repository layer owns admission language values.  Keeping the extension
+# table here is useful for parser dispatch, but this module never traverses a
+# directory to discover one of them.
+LANGUAGE_MAP: dict[str, str] = {
     ".py": "python",
     ".js": "javascript",
     ".jsx": "javascript",
@@ -87,3594 +146,4861 @@ LANGUAGE_MAP = {
     ".go": "go",
 }
 
-CACHE_FILENAME = "symbols.json"
-CACHE_ROOT = Path("/tmp/.xray_cache")
-CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
-CACHE_MAX_BYTES = 512 * 1024 * 1024
-CACHE_ACTIVE_TEMP_SECONDS = 5 * 60
-MAX_SYMBOL_CACHE_ENTRIES = 2048
-GIT_TIMEOUT_SECONDS = 5
-GIT_PORCELAIN_MIN_RECORD_BYTES = 4
-RG_TIMEOUT_SECONDS = 30
-MAX_RG_OUTPUT_CHARS = 10 * 1024 * 1024
-MAX_SKELETON_FILE_BYTES = 1024 * 1024
-MAX_INVENTORY_FILES = 20_000
-MAX_INVENTORY_SOURCE_BYTES = 256 * 1024 * 1024
-MAX_INVENTORY_SYMBOLS = 100_000
-MAX_SOURCE_ARGUMENT_CHARS = 128 * 1024
-MAX_IMPACT_RAW_RESULTS = 10_000
-INVENTORY_CACHE_FILENAME = "inventory.json"
-INVENTORY_SCHEMA_VERSION = 2
-REPLACEMENT_PLAN_VERSION = "xray.replace.v2"
-DEFAULT_REPLACEMENT_MAX_MATCHES = 1000
-DEFAULT_REPLACEMENT_MAX_FILES = 100
-DEFAULT_REPLACEMENT_PREVIEW_LIMIT = 50
-DEFAULT_REPLACEMENT_DIFF_LIMIT = 100_000
-MAX_REPLACEMENT_SYNTAX_DIAGNOSTICS = 50
-MAX_REPLACEMENT_FILE_BYTES = 10 * 1024 * 1024
-MAX_REPLACEMENT_TOTAL_BYTES = 50 * 1024 * 1024
-SEMANTIC_CAPTURES_KEY = "_xray_semantic_captures"
+# This is an output-affecting identity, not a process-generation or source
+# cache key.  It remains stable for the supported I1 parser profile.
+TOOLCHAIN_ID = digest(["xray.toolchain.v1", "declarations", "ast-grep-py", "python-ast"])
+_LINE_FEED = 0x0A
+_CARRIAGE_RETURN = 0x0D
+_UTF8_CONTINUATION_MASK = 0xC0
+_UTF8_CONTINUATION_PREFIX = 0x80
+_MAX_CONTEXT_LINES = 10
+_MIN_ERROR_DETAIL_BYTES = 4096
+_MAX_READ_TARGETS = 8
+_MAX_ERROR_MESSAGE_BYTES = 512
+_CACHE_ARTIFACT_SCHEMA = "xray.declarations.v1"
+_MAP_ROW_SCHEMA = "xray.map.row.v1"
+_MAX_FIND_DECLARATIONS = 100_000
+_MAX_FIND_CANDIDATES_PER_FILE = 10_000
+_MAX_SEARCH_FILES = 1_000
+_MAX_SEARCH_SOURCE_BYTES = 50 * 1024 * 1024
+_MAX_SEARCH_RAW_CANDIDATES = 10_000
+_MAX_CAPTURE_RECORDS = 16
+_MAX_OCCURRENCE_TEXT_BYTES = 512
+_MIN_QUOTED_STRING_LENGTH = 2
+_MAX_TRANSFORMED_TEXT_BYTES = 512
+_IMPACT_KIND_ORDER = {
+    "definition": 0,
+    "import": 1,
+    "call": 2,
+    "read": 3,
+    "comment": 4,
+    "string": 5,
+    "text": 6,
+    "unknown": 7,
+}
+_SECTION_ORDER = {"symbols": 0, "imports": 1, "exports": 2}
+_KIND_ORDER = {"file": 0, "directory": 1, "symlink": 2}
 
 
-def rollback_status(*, attempted: bool, succeeded: bool) -> str:
-    """Return the authoritative rollback state derived from legacy evidence."""
-    if not attempted:
-        return "not_attempted"
-    return "succeeded" if succeeded else "failed"
+class _IndexerFailure(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        path: str | None = None,
+        action: str | None = None,
+        kind: str | None = None,
+        minimum_bytes: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.path = path
+        self.action = action
+        self.kind = kind
+        self.minimum_bytes = minimum_bytes
 
 
-class ReplacementApplyError(RuntimeError):
-    """Raised when guarded replacement fails, with rollback evidence."""
+@dataclass(frozen=True, slots=True)
+class _SourceGeometry:
+    """Byte and line geometry for one immutable decoded source value."""
+
+    text: str
+    data: bytes
+    line_starts: tuple[int, ...]
+    line_ends: tuple[int, ...]
+    char_to_byte: tuple[int, ...] | None = None
+    byte_to_char: tuple[int, ...] | None = None
+
+    @classmethod
+    def from_text(cls, text: str, *, data: bytes | None = None) -> _SourceGeometry:
+        encoded = text.encode("utf-8") if data is None else data
+        line_starts = [0]
+        for index, value in enumerate(encoded):
+            if value == _LINE_FEED:
+                line_starts.append(index + 1)
+        line_ends = [*line_starts[1:], len(encoded)]
+        return cls(
+            text=text,
+            data=encoded,
+            line_starts=tuple(line_starts),
+            line_ends=tuple(line_ends),
+        )
+
+    def _character_maps(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        char_to_byte = self.char_to_byte
+        byte_to_char = self.byte_to_char
+        if char_to_byte is None or byte_to_char is None:
+            char_values = [0]
+            byte_values: list[int] = [0]
+            byte_offset = 0
+            for char_index, character in enumerate(self.text):
+                width = len(character.encode("utf-8"))
+                byte_offset += width
+                char_values.append(byte_offset)
+                byte_values.extend([char_index] * (width - 1))
+                byte_values.append(char_index + 1)
+            char_to_byte = tuple(char_values)
+            byte_to_char = tuple(byte_values)
+            object.__setattr__(self, "char_to_byte", char_to_byte)
+            object.__setattr__(self, "byte_to_char", byte_to_char)
+        return char_to_byte, byte_to_char
+
+    @property
+    def line_count(self) -> int:
+        return len(self.line_starts)
+
+    def char_index_to_byte(self, index: int) -> int:
+        if index < 0 or index > len(self.text):
+            raise _IndexerFailure("invalid_reference", "source character offset is outside the captured file")
+        char_to_byte, _byte_to_char = self._character_maps()
+        return char_to_byte[index]
+
+    def byte_index_to_char(self, offset: int) -> int:
+        if offset < 0 or offset > len(self.data):
+            raise _IndexerFailure("invalid_reference", "source byte offset is outside the captured file")
+        _char_to_byte, byte_to_char = self._character_maps()
+        return byte_to_char[offset]
+
+    def is_boundary(self, offset: int) -> bool:
+        if offset < 0 or offset > len(self.data):
+            return False
+        return (
+            offset == 0
+            or offset == len(self.data)
+            or (self.data[offset] & _UTF8_CONTINUATION_MASK) != _UTF8_CONTINUATION_PREFIX
+        )
+
+    def line_index(self, offset: int, *, end: bool = False) -> int:
+        if offset < 0 or offset > len(self.data):
+            raise _IndexerFailure("invalid_reference", "source byte offset is outside the captured file")
+        if end and offset > 0:
+            offset -= 1
+        return max(0, bisect.bisect_right(self.line_starts, offset) - 1)
+
+    def line_start(self, line: int) -> int:
+        if line < 1 or line > self.line_count:
+            raise _IndexerFailure("invalid_reference", f"line {line} is outside the captured file")
+        return self.line_starts[line - 1]
+
+    def line_end(self, line: int) -> int:
+        if line < 1 or line > self.line_count:
+            raise _IndexerFailure("invalid_reference", f"line {line} is outside the captured file")
+        return self.line_ends[line - 1]
+
+    def line_content_end(self, line: int) -> int:
+        """Return the byte end of line content, excluding its terminator."""
+        end = self.line_end(line)
+        if end > self.line_start(line) and self.data[end - 1] == _LINE_FEED:
+            end -= 1
+            if end > self.line_start(line) and self.data[end - 1] == _CARRIAGE_RETURN:
+                end -= 1
+        return end
+
+    def position(self, offset: int) -> Position:
+        if not self.is_boundary(offset):
+            raise _IndexerFailure("invalid_reference", "source range is not aligned to a UTF-8 boundary")
+        line = self.line_index(offset)
+        return Position(byte=offset, line=line + 1, column=offset - self.line_starts[line] + 1)
+
+    def decode(self, start: int, end: int) -> str:
+        if not (0 <= start <= end <= len(self.data)) or not self.is_boundary(start) or not self.is_boundary(end):
+            raise _IndexerFailure("invalid_reference", "source range is outside the captured UTF-8 boundaries")
+        try:
+            return self.data[start:end].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _IndexerFailure("invalid_encoding", "captured source range is not valid UTF-8") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class DeclarationRecord:
+    """One canonical declaration owned by a captured file artifact."""
+
+    root_id: str
+    path: str
+    file_digest: str
+    language: str
+    analyzer_id: str
+    kind: str
+    name: str
+    owner_chain: tuple[str, ...]
+    qualified_name: str
+    start: int
+    end: int
+    defining_start: int
+    defining_end: int
+    signature: str
+    visibility: Literal["public", "private", "unknown"]
+    documentation: str | None
+    parent_id: str | None
+    expandable: bool
+    symbol_id: str
+
+    @property
+    def full_owner_chain(self) -> tuple[str, ...]:
+        return self.owner_chain
+
+    @property
+    def name_start(self) -> int:
+        return self.defining_start
+
+    @property
+    def name_end(self) -> int:
+        return self.defining_end
+
+    @property
+    def ref(self) -> SymbolSourceRef:
+        return SymbolSourceRef(
+            kind="symbol",
+            root_id=self.root_id,
+            path=self.path,
+            file_digest=self.file_digest,
+            start=self.start,
+            end=self.end,
+            symbol_id=self.symbol_id,
+            analyzer_id=self.analyzer_id,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DeclarationArtifact:
+    """Complete, deterministic declaration population for one captured file."""
+
+    root_id: str
+    path: str
+    file_digest: str
+    language: str
+    analyzer_id: str
+    declarations: tuple[DeclarationRecord, ...]
+    coverage: Coverage
+    source_size: int
+
+    def by_symbol_id(self, symbol_id: str) -> tuple[DeclarationRecord, ...]:
+        return tuple(item for item in self.declarations if item.symbol_id == symbol_id)
+
+    def resolve(self, ref: SymbolSourceRef) -> DeclarationRecord:
+        if ref.root_id != self.root_id or ref.path != self.path or ref.file_digest != self.file_digest:
+            raise _IndexerFailure("stale_reference", "symbol reference is not bound to this declaration artifact")
+        matches = tuple(
+            item
+            for item in self.declarations
+            if item.symbol_id == ref.symbol_id
+            and item.start == ref.start
+            and item.end == ref.end
+            and item.analyzer_id == ref.analyzer_id
+        )
+        if len(matches) != 1:
+            raise _IndexerFailure("stale_reference", "symbol reference does not match the current declaration artifact")
+        return matches[0]
+
+    def enclosing(self, start: int, end: int) -> DeclarationRecord | None:
+        matches = [item for item in self.declarations if item.start <= start and end <= item.end]
+        if not matches:
+            return None
+        return min(
+            matches,
+            key=lambda item: (
+                item.end - item.start,
+                -item.start,
+                item.defining_start,
+                item.symbol_id,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _RawDeclaration:
+    language: str
+    kind: str
+    name: str
+    owner_chain: tuple[str, ...]
+    start: int
+    end: int
+    defining_start: int
+    defining_end: int
+    signature: str
+    visibility: Literal["public", "private", "unknown"]
+    documentation: str | None
+    expandable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _SyntaxObservation:
+    section: Literal["imports", "exports"]
+    start: int
+    end: int
+    module_text: str | None = None
+    imported_name: str | None = None
+    local_name: str | None = None
+    name: str | None = None
+    kind: Literal["named", "default", "star", "reexport", "unknown"] = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class _FindCandidate:
+    declaration: DeclarationRecord
+    match_kind: Literal[
+        "exact_qualified_name",
+        "exact_name",
+        "exact_path_context",
+        "normalized_name",
+        "prefix",
+        "token",
+        "fuzzy",
+    ]
+    rank: int
+    row_id: str
+
+
+@dataclass(slots=True)
+class _TargetState:
+    index: int
+    target: ReadTarget
+    captured: CapturedFile
+    geometry: _SourceGeometry
+    start: int
+    end: int
+    artifact: DeclarationArtifact | None = None
+    declaration: DeclarationRecord | None = None
+    enclosing: Enclosing | None = None
+
+
+@dataclass(slots=True)
+class _Segment:
+    path: str
+    captured: CapturedFile
+    geometry: _SourceGeometry
+    start: int
+    end: int
+    targets: list[int]
+
+
+@dataclass(frozen=True, slots=True)
+class _MapRow:
+    entry: CapturedNamespaceEntry
+    frontier: bool
+    row_id: str
+
+
+class _MapProjection(Sequence[MapItem]):
+    """Sorted namespace rows with public models materialized on demand."""
+
+    __slots__ = ("_rows",)
+
+    def __init__(self, rows: Sequence[_MapRow]) -> None:
+        self._rows = tuple(rows)
+
+    @property
+    def row_ids(self) -> tuple[str, ...]:
+        return tuple(item.row_id for item in self._rows)
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    @overload
+    def __getitem__(self, index: int) -> MapItem: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[MapItem]: ...
+
+    def __getitem__(self, index: int | slice) -> MapItem | list[MapItem]:
+        if isinstance(index, slice):
+            return [self._item(value) for value in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        return self._item(index)
+
+    def _item(self, index: int) -> MapItem:
+        row = self._rows[index]
+        values: dict[str, Any] = {"path": row.entry.path, "kind": row.entry.kind}
+        if row.entry.language is not None:
+            values["language"] = row.entry.language
+        if row.frontier:
+            values["frontier"] = True
+        return MapItem(**values)
+
+
+class _FindProjection(Sequence[FindItem]):
+    """Ranked find rows with public models materialized on demand."""
+
+    __slots__ = ("_candidates", "_geometries")
 
     def __init__(
         self,
-        message: str,
-        *,
-        rollback_count: int = 0,
-        rollback_succeeded: bool = True,
-        rollback_attempted: bool = False,
-    ):
-        super().__init__(message)
-        self.rollback_count = rollback_count
-        self.rollback_succeeded = rollback_succeeded
-        self.rollback_attempted = rollback_attempted
-        self.rollback_status = rollback_status(attempted=rollback_attempted, succeeded=rollback_succeeded)
+        candidates: Sequence[_FindCandidate],
+        geometries: Mapping[str, _SourceGeometry],
+    ) -> None:
+        self._candidates = tuple(candidates)
+        self._geometries = geometries
+
+    @property
+    def row_ids(self) -> tuple[str, ...]:
+        return tuple(candidate.row_id for candidate in self._candidates)
+
+    def __len__(self) -> int:
+        return len(self._candidates)
+
+    @overload
+    def __getitem__(self, index: int) -> FindItem: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[FindItem]: ...
+
+    def __getitem__(self, index: int | slice) -> FindItem | list[FindItem]:
+        if isinstance(index, slice):
+            return [self._item(value) for value in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        return self._item(index)
+
+    def _item(self, index: int) -> FindItem:
+        candidate = self._candidates[index]
+        declaration = candidate.declaration
+        geometry = self._geometries[declaration.path]
+        return FindItem(
+            ref=declaration.ref,
+            row_id=candidate.row_id,
+            name=declaration.name,
+            kind=declaration.kind,
+            qualified_name=declaration.qualified_name,
+            location=Range(
+                start=geometry.position(declaration.defining_start),
+                end=geometry.position(declaration.defining_end),
+            ),
+            match_kind=candidate.match_kind,
+        )
 
 
-class ReplacementDriftError(ReplacementApplyError):
-    """Raised when a reviewed replacement artifact no longer matches its source."""
-
-    def __init__(self, message: str, *, details: dict[str, Any]):
-        super().__init__(message)
-        self.details = details
-
-
-class InterfaceReadError(RuntimeError):
-    """Typed interface-extraction failure for structured adapters."""
-
-    def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
-
-
-@dataclass(frozen=True)
-class PreparedReplacementFile:
-    """One affected file and its fully prepared postimage."""
-
-    path: Path
-    relative_path: str
-    original: bytes
-    postimage: bytes
-    edits: tuple[dict[str, Any], ...]
-
-
-@dataclass(frozen=True)
-class PreparedReplacement:
-    """Internal complete plan plus staged-in-memory file postimages."""
-
-    plan: dict[str, Any]
-    files: tuple[PreparedReplacementFile, ...]
-    matches: tuple[dict[str, Any], ...]
-
-
-class SymbolSkeleton(TypedDict, total=False):
-    name: str
-    type: str
-    signature: str
-    doc: str
-
-
-class ExploreSymbol(TypedDict):
-    name: str
-    type: str
-    signature: str
-    doc: str
-
-
-class ExploreEntryBase(TypedDict):
-    path: str
-    abs_path: str
-    name: str
-    kind: str
-    depth: int
-
-
-class ExploreEntry(ExploreEntryBase, total=False):
-    language: str
-    symbols: list[ExploreSymbol]
-
-
-class ExploreOptions(TypedDict):
-    max_depth: int | None
-    include_symbols: bool
-    focus_dirs: list[str]
-    include_root_context: bool
-    focus_mode: str
-    max_symbols_per_file: int
-    symbol_types: list[str]
-    max_entries: int
-    use_default_exclusions: bool
-
-
-class ExploreRepoData(TypedDict):
-    root_path: str
-    tree_text: str
-    entries: list[ExploreEntry]
-    options: ExploreOptions
-    truncated: bool
-
-
-class SymbolMatchBase(TypedDict):
-    name: str
-    type: str
-    path: str
-    start_line: int
-    end_line: int
-
-
-class SymbolMatch(SymbolMatchBase, total=False):
-    score: int
-    abs_path: str
-    qualified_name: str
-    owner: str | None
-    language: str
-    match_reason: str
-    confidence: str
-    signature: str
-    role: str
-    visibility: str
-    doc: str
-
-
-class ImpactReferenceBase(TypedDict):
-    file: str
-    line: int
+@dataclass(frozen=True, slots=True)
+class _SearchRecord:
+    captured: CapturedFile
+    geometry: _SourceGeometry
+    start: int
+    end: int
     text: str
+    rule_id: str | None
+    captures: tuple[Capture, ...]
+    row_id: str
 
 
-class ImpactReference(ImpactReferenceBase, total=False):
-    matched_text: str
-    type: str
-    confidence: str
-
-
-class ImpactResult(TypedDict):
-    references: list[ImpactReference]
-    total_count: int
-    raw_count: int
-    filtered_count: int
-    strategy: str
-    note: str
-    total_exact: bool
-    degradation_reason: str | None
-    execution_limited: bool
-    execution_cap: int | None
-
-
-@dataclass(frozen=True)
-class IgnoreRuleSet:
-    """One directory-relative Git ignore specification."""
-
-    base: Path
-    spec: GitIgnoreSpec
-
-
-@dataclass(frozen=True)
-class IgnorePolicy:
-    """Ordered repository ignore rules plus independent built-in exclusions."""
-
-    rules: tuple[IgnoreRuleSet, ...]
-    use_default_exclusions: bool = True
+@dataclass(frozen=True, slots=True)
+class _ImpactOccurrence:
+    captured: CapturedFile
+    geometry: _SourceGeometry
+    start: int
+    end: int
+    kind: Literal["definition", "import", "call", "read", "comment", "string", "text", "unknown"]
+    evidence: Literal["ast_syntax", "lexical"]
+    text: str
+    enclosing: Enclosing | None = None
+    import_value: ImpactImport | None = None
 
 
 class XRayIndexer:
-    """Main indexer for XRAY - provides file tree and symbol extraction using ast-grep."""
+    """One captured-byte declaration/read service for a normalized root."""
 
-    def __init__(self, root_path: str):
-        self.root_path = Path(root_path).resolve()
-        self._cache: OrderedDict[str, list[SymbolSkeleton]] = OrderedDict()
-        self.last_warnings: list[str] = []
-        self.last_result_total_exact = True
-        self.last_result_cap: int | None = None
-        self.last_find_total = 0
-        self.last_mutation_summary: dict[str, Any] | None = None
-        self.last_rule_selection: dict[str, Any] | None = None
-        self._inventory_fingerprint: str | None = None
-        self._inventory: list[dict[str, Any]] | None = None
-        self._init_cache()
+    def __init__(
+        self,
+        root_path: str | Path | Root,
+        *,
+        cache: DerivedCache | None = None,
+        toolchain_provider: ToolchainProvider | Callable[[], ToolchainObservation] | None = None,
+    ) -> None:
+        self.root = normalize_root(root_path)
+        self.root_path = Path(self.root.path)
+        self._cache = cache
+        self._toolchain_provider = toolchain_provider or ToolchainProvider()
+        self._active_toolchain: ToolchainObservation | None = None
 
-    def _init_cache(self):
-        """Initialize cache based on git commit SHA."""
+    @staticmethod
+    def _path_sort_key(path: str) -> tuple[bytes, ...]:
+        return tuple(part.encode("utf-8") for part in PurePosixPath(path).parts)
+
+    def _observe_toolchain(self, *, budget: OperationBudget | None = None) -> ToolchainObservation:
         try:
-            # Get current git commit SHA
-            result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=self.root_path,
-                capture_output=True,
-                check=False,
-                text=True,
-                timeout=GIT_TIMEOUT_SECONDS,
-            )
-            if result.returncode == 0:
-                self.commit_sha = result.stdout.strip()
-                root_hash = hashlib.sha256(str(self.root_path).encode("utf-8")).hexdigest()[:16]
-                self.cache_dir = CACHE_ROOT / f"{root_hash}-{self.commit_sha}"
-                self._prune_disk_cache(self.cache_dir)
-                self.cache_dir.mkdir(parents=True, exist_ok=True)
-                self._load_cache()
+            provider = self._toolchain_provider
+            observe = getattr(provider, "observe", None)
+            if callable(observe):
+                if budget is not None and isinstance(provider, ToolchainProvider):
+                    observation = observe(budget=budget)
+                else:
+                    observation = observe()
             else:
-                self.commit_sha = None
-                self.cache_dir = None
-        except Exception:
-            self.commit_sha = None
-            self.cache_dir = None
-
-    @staticmethod
-    def _prune_disk_cache(current_dir: Path) -> None:
-        """Remove expired and excess cache entries without disturbing active writes."""
-        cache_root = current_dir.parent
-        try:
-            entries = [entry for entry in cache_root.iterdir() if entry.is_dir() and entry != current_dir]
-        except OSError:
-            return
-
-        now = time.time()
-        candidates: list[tuple[float, int, Path]] = []
-        for entry in entries:
-            try:
-                # NamedTemporaryFile uses a ``tmp`` prefix. Its presence means another
-                # indexer may be between writing and atomically replacing symbols.json.
-                if XRayIndexer._has_active_cache_temp(entry, now):
-                    continue
-                modified = entry.stat().st_mtime
-                size = sum(
-                    child.stat().st_size for child in entry.rglob("*") if child.is_file() and not child.is_symlink()
-                )
-            except OSError:
-                # Concurrent creation/removal and partially readable entries are benign.
-                continue
-            candidates.append((modified, size, entry))
-
-        retained: list[tuple[float, int, Path]] = []
-        for modified, size, entry in candidates:
-            if now - modified > CACHE_MAX_AGE_SECONDS:
-                if not XRayIndexer._remove_cache_entry(entry, now):
-                    retained.append((modified, size, entry))
-            else:
-                retained.append((modified, size, entry))
-
-        total_size = sum(size for _, size, _ in retained)
-        for _, size, entry in sorted(retained):
-            if total_size <= CACHE_MAX_BYTES:
-                break
-            if not XRayIndexer._remove_cache_entry(entry, now):
-                continue
-            total_size -= size
-
-    @staticmethod
-    def _has_active_cache_temp(cache_dir: Path, now: float) -> bool:
-        """Return whether a recently touched atomic-write temp file exists."""
-        return any(
-            child.name.startswith("tmp") and now - child.stat().st_mtime <= CACHE_ACTIVE_TEMP_SECONDS
-            for child in cache_dir.iterdir()
-        )
-
-    @staticmethod
-    def _remove_cache_entry(cache_dir: Path, now: float) -> bool:
-        """Remove one entry after rechecking for a concurrent atomic write."""
-        try:
-            if XRayIndexer._has_active_cache_temp(cache_dir, now):
-                return False
-            shutil.rmtree(cache_dir)
-        except OSError:
-            return False
-        return True
-
-    def _load_cache(self):
-        """Load cache from disk if available."""
-        if not self.cache_dir:
-            return
-
-        cache_file = self.cache_dir / CACHE_FILENAME
-        if cache_file.exists():
-            try:
-                with open(cache_file, encoding="utf-8") as f:
-                    self._cache = self._coerce_symbol_cache(json.load(f))
-            except Exception:
-                self._cache = OrderedDict()
-
-    def _save_cache(self):
-        """Save cache to disk."""
-        if not self.cache_dir:
-            return
-
-        self._prune_symbol_cache()
-        cache_file = self.cache_dir / CACHE_FILENAME
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile("w", dir=self.cache_dir, delete=False, encoding="utf-8") as f:
-                json.dump(self._cache, f, separators=(",", ":"), sort_keys=True)
-                f.flush()
-                os.fsync(f.fileno())
-                temp_path = Path(f.name)
-            os.replace(temp_path, cache_file)
-        except Exception:
-            if temp_path is not None:
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    pass
-            pass
-
-    def _coerce_symbol_cache(self, value: Any) -> OrderedDict[str, list[SymbolSkeleton]]:
-        """Return a bounded cache containing only the symbol skeleton shape XRAY writes."""
-        cache: OrderedDict[str, list[SymbolSkeleton]] = OrderedDict()
-        if not isinstance(value, dict):
-            return cache
-
-        for key, symbols in value.items():
-            if not isinstance(key, str) or not isinstance(symbols, list):
-                continue
-
-            clean_symbols: list[SymbolSkeleton] = []
-            for symbol in symbols:
-                if not isinstance(symbol, dict):
-                    continue
-                signature = symbol.get("signature", "")
-                doc = symbol.get("doc", "")
-                if isinstance(signature, str) and isinstance(doc, str):
-                    clean_symbol: SymbolSkeleton = {"signature": signature, "doc": doc}
-                    name = symbol.get("name")
-                    symbol_type = symbol.get("type")
-                    if isinstance(name, str) and isinstance(symbol_type, str):
-                        clean_symbol.update({"name": name, "type": symbol_type})
-                    clean_symbols.append(clean_symbol)
-
-            if clean_symbols:
-                cache[key] = clean_symbols
-
-        while len(cache) > MAX_SYMBOL_CACHE_ENTRIES:
-            cache.popitem(last=False)
-        return cache
-
-    def _get_cached_symbols(self, cache_key: str) -> list[SymbolSkeleton] | None:
-        """Return cached symbols and mark the entry as recently used."""
-        symbols = self._cache.get(cache_key)
-        if symbols is not None:
-            self._cache.move_to_end(cache_key)
-        return symbols
-
-    def _set_cached_symbols(self, cache_key: str, symbols: list[SymbolSkeleton]) -> None:
-        """Store symbols while bounding long-running MCP memory use."""
-        self._cache[cache_key] = symbols
-        self._cache.move_to_end(cache_key)
-        self._prune_symbol_cache()
-
-    def _prune_symbol_cache(self) -> None:
-        """Drop least-recently-used symbol entries past the configured cap."""
-        while len(self._cache) > MAX_SYMBOL_CACHE_ENTRIES:
-            self._cache.popitem(last=False)
-
-    def _get_cache_key(self, file_path: Path) -> str:
-        """Generate cache key for a file."""
-        try:
-            stat = file_path.stat()
-            return f"{file_path}:{stat.st_mtime_ns}:{stat.st_size}"
-        except OSError:
-            return str(file_path)
-
-    def _resolve_repo_path(self, path: str, *, require_file: bool = False) -> Path:
-        """Resolve a user path inside the repository and optionally require a file."""
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute():
-            candidate = self.root_path / candidate
-        candidate = candidate.resolve()
-        try:
-            candidate.relative_to(self.root_path)
-        except ValueError as exc:
-            raise ValueError(f"Path '{path}' is outside repository root '{self.root_path}'.") from exc
-        if not candidate.exists():
-            raise ValueError(f"Path '{path}' does not exist.")
-        if require_file and not candidate.is_file():
-            raise ValueError(f"Path '{path}' is not a file.")
-        return candidate
-
-    def _operation_scopes(self, paths: Sequence[str] | None) -> tuple[list[Path], list[str]]:
-        """Return contained absolute operation paths and stable relative identities."""
-        resolved: list[Path] = []
-        relative: list[str] = []
-        for value in paths or ():
-            candidate = self._resolve_repo_path(value)
-            if candidate in resolved:
-                continue
-            resolved.append(candidate)
-            relative.append("." if candidate == self.root_path else candidate.relative_to(self.root_path).as_posix())
-        return resolved, relative
-
-    @staticmethod
-    def _validate_globs(globs: Sequence[str] | None) -> list[str]:
-        """Validate ast-grep glob filters without changing their ordered meaning."""
-        result: list[str] = []
-        for value in globs or ():
-            if not value or "\x00" in value:
-                raise ValueError("Glob filters must be non-empty and must not contain NUL bytes.")
-            result.append(value)
-        return result
-
-    @staticmethod
-    def _contains_hidden_path(paths: Sequence[str]) -> bool:
-        """Return whether an explicit relative scope contains a hidden component."""
-        return any(part.startswith(".") for path in paths if path != "." for part in Path(path).parts)
-
-    @staticmethod
-    def _rule_selection(relative_paths: list[str], normalized_globs: list[str]) -> dict[str, Any]:
-        """Describe effective ast-grep rule input selection."""
-        return {
-            "paths": relative_paths,
-            "globs": normalized_globs,
-            "default_root": not relative_paths,
-            "ignore_policy": "ast_grep_defaults",
-            "explicit_hidden_paths": "included",
-        }
-
-    def _append_operation_scope(
-        self,
-        args: list[str],
-        paths: Sequence[str] | None,
-        globs: Sequence[str] | None,
-        *,
-        include_explicit_hidden: bool = False,
-    ) -> tuple[list[str], list[str]]:
-        """Append filters and contained positional paths, returning stable identities."""
-        resolved_paths, relative_paths = self._operation_scopes(paths)
-        normalized_globs = self._validate_globs(globs)
-        if include_explicit_hidden and self._contains_hidden_path(relative_paths):
-            args.extend(["--no-ignore", "hidden"])
-        for glob in normalized_globs:
-            args.extend(["--globs", glob])
-        args.extend(str(path) for path in (resolved_paths or [self.root_path]))
-        return relative_paths, normalized_globs
-
-    def search_pattern(
-        self,
-        pattern: str,
-        lang: str | None = None,
-        *,
-        paths: Sequence[str] | None = None,
-        globs: Sequence[str] | None = None,
-        max_results: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """Return structurally matched candidates within explicit execution bounds."""
-        if not pattern:
-            raise ValueError("Pattern must not be empty.")
-        if max_results is not None and max_results < 1:
-            raise ValueError("max_results must be 1 or greater.")
-        args = ["run", "--pattern", pattern]
-        if lang:
-            args.extend(["--lang", lang])
-        self._append_operation_scope(args, paths, globs)
-        if max_results is None:
-            args.insert(3, "--json=compact")
-            matches = parse_json_array(run_ast_grep(args).stdout)
-            total_exact = True
-        else:
-            bounded = run_ast_grep_bounded(args, max_results)
-            matches = bounded.matches
-            total_exact = bounded.total_exact
-        self.last_result_total_exact = total_exact
-        self.last_result_cap = max_results
-        return matches
-
-    def _rule_arguments(self, rule_path: str) -> tuple[list[str], str]:
-        """Resolve one contained rule or configuration path to ast-grep arguments."""
-        resolved_rule = self._resolve_repo_path(rule_path)
-        if resolved_rule.is_dir():
-            configs = [resolved_rule / "sgconfig.yml", resolved_rule / "sgconfig.yaml"]
-            config = next((candidate for candidate in configs if candidate.is_file()), None)
-            if config is None:
-                raise ValueError(f"Rule directory '{rule_path}' does not contain sgconfig.yml or sgconfig.yaml.")
-            resolved_rule = config
-            rule_args = ["--config", str(config)]
-        elif resolved_rule.name in {"sgconfig.yml", "sgconfig.yaml"}:
-            rule_args = ["--config", str(resolved_rule)]
-        else:
-            rule_args = ["--rule", str(resolved_rule)]
-        return rule_args, resolved_rule.relative_to(self.root_path).as_posix()
-
-    def _scan_rule_matches(
-        self,
-        rule_path: str,
-        *,
-        paths: Sequence[str] | None = None,
-        globs: Sequence[str] | None = None,
-        max_results: int | None = None,
-    ) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
-        """Return rule matches and the normalized contained rule identity."""
-        if max_results is not None and max_results < 1:
-            raise ValueError("max_results must be 1 or greater.")
-        rule_args, relative_rule = self._rule_arguments(rule_path)
-        args = ["scan", *rule_args, "--json=compact"]
-        if max_results is not None:
-            args.extend(["--max-results", str(max_results)])
-        relative_paths, normalized_globs = self._append_operation_scope(
-            args, paths, globs, include_explicit_hidden=True
-        )
-        matches = parse_json_array(run_ast_grep(args).stdout)
-        self.last_result_total_exact = max_results is None or len(matches) < max_results
-        self.last_result_cap = max_results
-        selection = self._rule_selection(relative_paths, normalized_globs)
-        self.last_rule_selection = selection
-        return matches, relative_rule, selection
-
-    @staticmethod
-    def _sha256(value: bytes) -> str:
-        return hashlib.sha256(value).hexdigest()
-
-    @staticmethod
-    def _canonical_json(value: Any) -> bytes:
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
-
-    @staticmethod
-    def _capture_values(match: Mapping[str, Any]) -> dict[str, Any]:
-        projected = match.get(SEMANTIC_CAPTURES_KEY)
-        if isinstance(projected, Mapping):
-            return {str(name): value for name, value in projected.items()}
-        meta = match.get("metaVariables")
-        if not isinstance(meta, Mapping):
-            return {}
-        captures: dict[str, Any] = {}
-        for group in ("single", "transformed"):
-            values = meta.get(group)
-            if isinstance(values, Mapping):
-                for name, value in values.items():
-                    if isinstance(value, Mapping) and isinstance(value.get("text"), str):
-                        captures[str(name)] = value["text"]
-        multi = meta.get("multi")
-        if isinstance(multi, Mapping):
-            for name, values in multi.items():
-                if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
-                    texts = [value["text"] for value in values if isinstance(value, Mapping) and "text" in value]
-                    if texts:
-                        captures[str(name)] = texts
-        return captures
-
-    @staticmethod
-    def _capture_range(value: Any) -> tuple[int, int, int, int] | None:
-        if isinstance(value, Mapping):
-            range_data = value.get("range", value)
-            if not isinstance(range_data, Mapping):
-                return None
-            start = range_data.get("start")
-            end = range_data.get("end")
-            if not isinstance(start, Mapping) or not isinstance(end, Mapping):
-                return None
-            coordinates = (start.get("line"), start.get("column"), end.get("line"), end.get("column"))
-        else:
-            start = getattr(value, "start", None)
-            end = getattr(value, "end", None)
-            coordinates = (
-                getattr(start, "line", None),
-                getattr(start, "column", None),
-                getattr(end, "line", None),
-                getattr(end, "column", None),
-            )
-        if not all(isinstance(coordinate, int) for coordinate in coordinates):
-            return None
-        return cast(tuple[int, int, int, int], coordinates)
-
-    @staticmethod
-    def _non_multi_capture_values(match: Mapping[str, Any]) -> dict[str, Any]:
-        meta = match.get("metaVariables")
-        captures: dict[str, Any] = {}
-        if not isinstance(meta, Mapping):
-            return captures
-        for group in ("single", "transformed"):
-            values = meta.get(group)
-            if isinstance(values, Mapping):
-                for name, value in values.items():
-                    if isinstance(value, Mapping) and isinstance(value.get("text"), str):
-                        captures[str(name)] = value["text"]
-        return captures
-
-    @staticmethod
-    def _semantic_capture_language(match: Mapping[str, Any], path: Path) -> str | None:
-        language = match.get("language")
-        if isinstance(language, str) and language in set(LANGUAGE_MAP.values()):
-            return language
-        return LANGUAGE_MAP.get(path.suffix.casefold())
-
-    def project_semantic_captures(self, matches: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
-        """Project multi-captures to verified named syntax nodes without changing raw evidence."""
-        projected = [dict(match) for match in matches]
-        by_path: dict[Path, list[dict[str, Any]]] = {}
-        warnings: list[str] = []
-        for match in projected:
-            meta = match.get("metaVariables")
-            multi = meta.get("multi") if isinstance(meta, Mapping) else None
-            if not isinstance(multi, Mapping) or not multi:
-                continue
-            file_value = match.get("file")
-            if not isinstance(file_value, str) or not file_value:
-                match[SEMANTIC_CAPTURES_KEY] = self._non_multi_capture_values(match)
-                warnings.append("Omitted unverifiable multi-captures because a result had no source path.")
-                continue
-            try:
-                path = self._resolve_repo_path(file_value, require_file=True)
-            except ValueError:
-                match[SEMANTIC_CAPTURES_KEY] = self._non_multi_capture_values(match)
-                warnings.append(
-                    f"Omitted unverifiable multi-captures for '{file_value}' because its source is unavailable."
-                )
-                continue
-            by_path.setdefault(path, []).append(match)
-
-        total_bytes = 0
-        for path in sorted(by_path, key=lambda value: value.as_posix()):
-            relative_path = path.relative_to(self.root_path).as_posix()
-            language = self._semantic_capture_language(by_path[path][0], path)
-            reason: str | None = None
-            try:
-                size = path.stat().st_size
-            except OSError:
-                size = 0
-                reason = "its source is unavailable"
-            if reason is None and language is None:
-                reason = "its language is unsupported"
-            elif reason is None and size > MAX_REPLACEMENT_FILE_BYTES:
-                reason = f"it exceeds {MAX_REPLACEMENT_FILE_BYTES} bytes"
-            elif reason is None and total_bytes + size > MAX_REPLACEMENT_TOTAL_BYTES:
-                reason = f"the projection exceeds {MAX_REPLACEMENT_TOTAL_BYTES} total bytes"
-
-            named_ranges: set[tuple[int, int, int, int]] = set()
-            if reason is None:
-                assert language is not None
-                try:
-                    source = path.read_text(encoding="utf-8")
-                    root = SgRoot(source, language).root()
-                    named_ranges = {
-                        capture_range
-                        for node in root.find_all(pattern="$A")
-                        if node.is_named()
-                        if (capture_range := self._capture_range(node.range())) is not None
-                    }
-                    total_bytes += size
-                except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
-                    reason = f"the source could not be parsed ({type(exc).__name__})"
-
-            missing_ranges = False
-            for match in by_path[path]:
-                meta = match.get("metaVariables")
-                semantic = self._non_multi_capture_values(match)
-                if isinstance(meta, Mapping):
-                    multi = meta.get("multi")
-                    if reason is None and isinstance(multi, Mapping):
-                        for name, values in multi.items():
-                            if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
-                                missing_ranges = missing_ranges or any(
-                                    isinstance(value, Mapping) and self._capture_range(value) is None
-                                    for value in values
-                                )
-                                texts = [
-                                    value["text"]
-                                    for value in values
-                                    if isinstance(value, Mapping)
-                                    and isinstance(value.get("text"), str)
-                                    and self._capture_range(value) in named_ranges
-                                ]
-                                if texts:
-                                    semantic[str(name)] = texts
-                match[SEMANTIC_CAPTURES_KEY] = semantic
-            if reason is not None:
-                warnings.append(f"Omitted unverifiable multi-captures for '{relative_path}' because {reason}.")
-            elif missing_ranges:
-                warnings.append(
-                    f"Omitted unverifiable multi-capture values for '{relative_path}' because ranges were unavailable."
-                )
-        return projected, list(dict.fromkeys(warnings))
-
-    def _replacement_candidates(
-        self,
-        *,
-        pattern: str | None,
-        replacement: str | None,
-        rule_path: str | None,
-        lang: str | None,
-        paths: Sequence[str] | None,
-        globs: Sequence[str] | None,
-        max_results: int | None,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Return replacement-bearing ast-grep candidates and normalized query identity."""
-        pattern_change = pattern is not None or replacement is not None
-        rule_change = rule_path is not None
-        if pattern_change == rule_change:
-            raise ValueError("Provide exactly one replacement source: pattern/replacement or rule_path.")
-        if rule_change and lang is not None:
-            raise ValueError("Language applies only to pattern/replacement plans, not rule_path plans.")
-        resolved_paths, relative_paths = self._operation_scopes(paths)
-        normalized_globs = self._validate_globs(globs)
-
-        if pattern_change:
-            if not pattern:
-                raise ValueError("Pattern must not be empty.")
-            if replacement is None:
-                raise ValueError("Replacement must be provided with a pattern.")
-            args = ["run", "--pattern", pattern, "--rewrite", replacement]
-            if lang:
-                args.extend(["--lang", lang])
-            for glob in normalized_globs:
-                args.extend(["--globs", glob])
-            args.extend(str(path) for path in (resolved_paths or [self.root_path]))
-            if max_results is None:
-                args.insert(5, "--json=compact")
-                matches = parse_json_array(run_ast_grep(args).stdout)
-            else:
-                matches = run_ast_grep_bounded(args, max_results).matches
-            change = {"kind": "pattern", "pattern": pattern, "replacement": replacement, "language": lang}
-        else:
-            rule_args, relative_rule = self._rule_arguments(str(rule_path))
-            args = ["scan", *rule_args, "--json=compact"]
-            if max_results is not None:
-                args.extend(["--max-results", str(max_results)])
-            if self._contains_hidden_path(relative_paths):
-                args.extend(["--no-ignore", "hidden"])
-            for glob in normalized_globs:
-                args.extend(["--globs", glob])
-            args.extend(str(path) for path in (resolved_paths or [self.root_path]))
-            matches = parse_json_array(run_ast_grep(args).stdout)
-            change = {"kind": "rule", "rule_path": relative_rule}
-
-        for match in matches:
-            if not isinstance(match.get("replacement"), str):
-                raise ValueError("Every replacement candidate must include ast-grep replacement text.")
-        return matches, {"change": change, "paths": relative_paths, "globs": normalized_globs}
-
-    @staticmethod
-    def _replacement_offsets(match: Mapping[str, Any]) -> tuple[int, int]:
-        replacement_offsets = match.get("replacementOffsets")
-        if isinstance(replacement_offsets, Mapping):
-            start = replacement_offsets.get("start")
-            end = replacement_offsets.get("end")
-        else:
-            range_data = match.get("range")
-            byte_offset = range_data.get("byteOffset") if isinstance(range_data, Mapping) else None
-            start = byte_offset.get("start") if isinstance(byte_offset, Mapping) else None
-            end = byte_offset.get("end") if isinstance(byte_offset, Mapping) else None
-        if not isinstance(start, int) or not isinstance(end, int):
-            raise ValueError("Replacement candidate is missing integer byte offsets.")
-        return start, end
-
-    def _prepare_replacement_files(
-        self, matches: Sequence[dict[str, Any]]
-    ) -> tuple[tuple[PreparedReplacementFile, ...], list[dict[str, Any]]]:
-        """Validate candidates and build every postimage without writing files."""
-        grouped: dict[Path, list[dict[str, Any]]] = {}
-        for match in matches:
-            file_value = match.get("file")
-            if not isinstance(file_value, str) or not file_value:
-                raise ValueError("Replacement candidate is missing a file path.")
-            path = self._resolve_repo_path(file_value, require_file=True)
-            grouped.setdefault(path, []).append(match)
-
-        input_bytes = 0
-        output_bytes = 0
-        files: list[PreparedReplacementFile] = []
-        preview: list[dict[str, Any]] = []
-        for path in sorted(grouped, key=lambda item: item.as_posix()):
-            original = path.read_bytes()
-            if len(original) > MAX_REPLACEMENT_FILE_BYTES:
-                raise ValueError(f"Replacement file '{path}' exceeds {MAX_REPLACEMENT_FILE_BYTES} bytes.")
-            input_bytes += len(original)
-            if input_bytes > MAX_REPLACEMENT_TOTAL_BYTES:
-                raise ValueError(f"Replacement inputs exceed {MAX_REPLACEMENT_TOTAL_BYTES} total bytes.")
-
-            edits: list[dict[str, Any]] = []
-            for match in grouped[path]:
-                start, end = self._replacement_offsets(match)
-                if start < 0 or end < start or end > len(original):
-                    raise ValueError(f"Replacement candidate has invalid byte offsets for '{path}'.")
-                replacement_text = str(match["replacement"])
-                replacement_bytes = replacement_text.encode("utf-8")
-                before_bytes = original[start:end]
-                try:
-                    before_text = before_bytes.decode("utf-8")
-                except UnicodeDecodeError as exc:
-                    raise ValueError(f"Replacement candidate splits a UTF-8 sequence in '{path}'.") from exc
-                matched_text = match.get("text")
-                if isinstance(matched_text, str) and before_text != matched_text:
-                    raise ValueError(f"Replacement candidate no longer matches source bytes in '{path}'.")
-                range_data = match.get("range")
-                start_data = range_data.get("start", {}) if isinstance(range_data, Mapping) else {}
-                edit = {
-                    "start": start,
-                    "end": end,
-                    "before": before_text,
-                    "after": replacement_text,
-                    "changed": before_bytes != replacement_bytes,
-                    "line": int(start_data.get("line", 0)) + 1 if isinstance(start_data, Mapping) else 1,
-                    "column": int(start_data.get("column", 0)) + 1 if isinstance(start_data, Mapping) else 1,
-                    "captures": self._capture_values(match),
-                    "_match": match,
-                }
-                edits.append(edit)
-
-            edits.sort(key=lambda item: (item["start"], item["end"]))
-            previous_end = -1
-            seen_ranges: set[tuple[int, int]] = set()
-            for edit in edits:
-                edit_range = (edit["start"], edit["end"])
-                if edit["start"] < previous_end or edit_range in seen_ranges:
-                    raise ValueError(f"Replacement candidates overlap in '{path}'.")
-                seen_ranges.add(edit_range)
-                previous_end = edit["end"]
-
-            postimage = original
-            for edit in reversed(edits):
-                postimage = postimage[: edit["start"]] + edit["after"].encode("utf-8") + postimage[edit["end"] :]
-            if len(postimage) > MAX_REPLACEMENT_FILE_BYTES:
-                raise ValueError(f"Replacement postimage '{path}' exceeds {MAX_REPLACEMENT_FILE_BYTES} bytes.")
-            output_bytes += len(postimage)
-            if output_bytes > MAX_REPLACEMENT_TOTAL_BYTES:
-                raise ValueError(f"Replacement outputs exceed {MAX_REPLACEMENT_TOTAL_BYTES} total bytes.")
-
-            relative_path = path.relative_to(self.root_path).as_posix()
-            for edit in edits:
-                source_match = edit.pop("_match")
-                edit["edit_id"] = self._sha256(
-                    self._canonical_json(
-                        {
-                            "path": relative_path,
-                            "preimage_sha256": self._sha256(original),
-                            "start": edit["start"],
-                            "end": edit["end"],
-                            "before_sha256": self._sha256(edit["before"].encode("utf-8")),
-                            "after_sha256": self._sha256(edit["after"].encode("utf-8")),
-                        }
-                    )
-                )
-                source_match["_xray_edit_id"] = edit["edit_id"]
-                preview.append({"path": relative_path, **edit})
-            files.append(
-                PreparedReplacementFile(
-                    path=path,
-                    relative_path=relative_path,
-                    original=original,
-                    postimage=postimage,
-                    edits=tuple(edits),
-                )
-            )
-        return tuple(files), preview
-
-    def _git_state(self, affected_paths: Sequence[str] = ()) -> tuple[str | None, bool, list[str]]:
-        """Return the Git commit, repository dirtiness, and dirty affected paths."""
-        try:
-            commit_result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=self.root_path,
-                capture_output=True,
-                check=False,
-                text=True,
-                timeout=GIT_TIMEOUT_SECONDS,
-            )
-            status_result = subprocess.run(
-                ["git", "status", "--porcelain=v1", "--untracked-files=normal"],
-                cwd=self.root_path,
-                capture_output=True,
-                check=False,
-                text=True,
-                timeout=GIT_TIMEOUT_SECONDS,
-            )
-            affected_result = subprocess.run(
-                [
-                    "git",
-                    "status",
-                    "--porcelain=v1",
-                    "-z",
-                    "--untracked-files=all",
-                    "--",
-                    *affected_paths,
-                ],
-                cwd=self.root_path,
-                capture_output=True,
-                check=False,
-                timeout=GIT_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ValueError("Timed out while determining Git dirty state for replacement safety.") from exc
-        except OSError:
-            return None, False, []
-        if commit_result.returncode != 0:
-            return None, False, []
-        if status_result.returncode != 0 or affected_result.returncode != 0:
-            raise ValueError("Could not determine Git dirty state for replacement safety.")
-        commit = commit_result.stdout.strip()
-        dirty = bool(status_result.stdout.strip())
-        dirty_affected: list[str] = []
-        if affected_paths and affected_result.returncode == 0 and affected_result.stdout:
-            records = affected_result.stdout.split(b"\0")
-            reported: set[str] = set()
-            index = 0
-            while index < len(records):
-                record = records[index]
-                index += 1
-                if not record:
-                    continue
-                if len(record) < GIT_PORCELAIN_MIN_RECORD_BYTES:
-                    reported.clear()
-                    break
-                status = record[:2]
-                reported.add(record[3:].decode("utf-8", errors="surrogateescape"))
-                if b"R" in status or b"C" in status:
-                    if index < len(records) and records[index]:
-                        reported.add(records[index].decode("utf-8", errors="surrogateescape"))
-                    index += 1
-            normalized = set(affected_paths)
-            dirty_affected = sorted(normalized & reported)
-            if not dirty_affected:
-                # An unparsed status entry must fail safe rather than overwrite user work.
-                dirty_affected = sorted(normalized)
-        return commit, dirty, dirty_affected
-
-    @staticmethod
-    def _replacement_language(relative_path: str, requested_language: str | None) -> str | None:
-        """Return the ast-grep language used to parse one affected source file."""
-        aliases = {
-            "js": "javascript",
-            "jsx": "javascript",
-            "py": "python",
-            "ts": "typescript",
-            "tsx": "typescript",
-        }
-        if requested_language:
-            normalized = requested_language.casefold()
-            return aliases.get(normalized, normalized)
-        return LANGUAGE_MAP.get(Path(relative_path).suffix.casefold())
-
-    def _syntax_snapshot(self, content: bytes, language: str | None) -> tuple[dict[str, Any], Counter[str]]:
-        """Return bounded, digestible ast-grep ERROR-node evidence for source bytes."""
-        if language is None:
-            return {"checked": False, "reason": "unsupported_language"}, Counter()
-        try:
-            source = content.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"Replacement syntax validation requires UTF-8 source for {language}.") from exc
-        diagnostics = parse_json_array(
-            run_ast_grep(
-                ["run", "--kind", "ERROR", "--stdin", "-l", language, "--json=compact"],
-                input_text=source,
-            ).stdout
-        )
-        signatures: Counter[str] = Counter()
-        samples: list[dict[str, Any]] = []
-        for diagnostic in diagnostics:
-            text = str(diagnostic.get("text", ""))
-            signature = self._sha256(self._canonical_json({"language": language, "text": text}))
-            signatures[signature] += 1
-            if len(samples) < MAX_REPLACEMENT_SYNTAX_DIAGNOSTICS:
-                range_data = diagnostic.get("range")
-                start = range_data.get("start", {}) if isinstance(range_data, Mapping) else {}
-                samples.append(
-                    {
-                        "line": int(start.get("line", 0)) + 1 if isinstance(start, Mapping) else 1,
-                        "column": int(start.get("column", 0)) + 1 if isinstance(start, Mapping) else 1,
-                        "text": text[:200],
-                        "signature": signature,
-                    }
-                )
-        expanded_signatures = sorted(signature for signature, count in signatures.items() for _ in range(count))
-        return (
-            {
-                "checked": True,
-                "parser": "ast-grep",
-                "language": language,
-                "diagnostic_count": len(diagnostics),
-                "diagnostics_returned": len(samples),
-                "diagnostics_truncated": len(samples) < len(diagnostics),
-                "diagnostic_fingerprint": self._sha256(self._canonical_json(expanded_signatures)),
-                "diagnostics": samples,
-            },
-            signatures,
-        )
-
-    def _replacement_syntax_evidence(
-        self, item: PreparedReplacementFile, requested_language: str | None
-    ) -> dict[str, Any]:
-        """Compare preimage and postimage parse errors without mutating the file."""
-        language = self._replacement_language(item.relative_path, requested_language)
-        preimage, before = self._syntax_snapshot(item.original, language)
-        postimage, after = self._syntax_snapshot(item.postimage, language)
-        new_counts = after - before
-        new_signatures = set(new_counts)
-        new_diagnostics = [
-            diagnostic
-            for diagnostic in postimage.get("diagnostics", [])
-            if isinstance(diagnostic, Mapping) and diagnostic.get("signature") in new_signatures
-        ][:MAX_REPLACEMENT_SYNTAX_DIAGNOSTICS]
-        return {
-            "checked": language is not None,
-            "language": language,
-            "parser": "ast-grep" if language is not None else None,
-            "preimage": preimage,
-            "postimage": postimage,
-            "new_diagnostic_count": sum(new_counts.values()),
-            "new_diagnostics": new_diagnostics,
-        }
-
-    @staticmethod
-    def _plan_digest_payload(plan: Mapping[str, Any]) -> dict[str, Any]:
-        """Return the complete review artifact except for its self-referential digest."""
-        return {str(key): value for key, value in plan.items() if key != "plan_digest"}
-
-    @staticmethod
-    def _replacement_diff(files: Sequence[PreparedReplacementFile]) -> str:
-        """Return a deterministic unified diff for every changed file."""
-        chunks: list[str] = []
-        for item in files:
-            if item.original == item.postimage:
-                continue
-            before = item.original.decode("utf-8").splitlines(keepends=True)
-            after = item.postimage.decode("utf-8").splitlines(keepends=True)
-            chunks.extend(
-                difflib.unified_diff(
-                    before,
-                    after,
-                    fromfile=f"a/{item.relative_path}",
-                    tofile=f"b/{item.relative_path}",
-                    lineterm="\n",
-                )
-            )
-        return "".join(chunks)
-
-    @staticmethod
-    def _replacement_next_actions(applicability_reason: str | None) -> dict[str, str]:
-        """Return only actions that can advance the current replacement-plan state."""
-        if applicability_reason == "no_candidates":
-            return {"revise_query": "Revise the pattern, language, paths, or globs and create a new plan."}
-        if applicability_reason == "noop_not_allowed":
-            return {
-                "review_noop": "Review why every candidate is unchanged.",
-                "replan": "Create a new plan with --allow-noop only when the no-op is intentional.",
-            }
-        if applicability_reason == "truncated_review_not_acknowledged":
-            return {
-                "complete_review": "Narrow the query or raise preview/diff limits until review is complete.",
-                "acknowledge": "Otherwise create a new plan with --allow-truncated-review after external review.",
-            }
-        if applicability_reason == "new_parse_errors":
-            return {
-                "revise_replacement": "Revise the replacement to remove new parse errors.",
-                "acknowledge": "Otherwise create a new plan with --allow-new-parse-errors after explicit review.",
-            }
-        if applicability_reason == "dirty_affected_files_not_acknowledged":
-            return {
-                "review_dirty_files": "Review the listed dirty_affected_paths before continuing.",
-                "acknowledge": "Create a new plan with --allow-dirty-affected only after preserving those edits.",
-            }
-        return {
-            "list_edit_ids": "jq -r '.edit_manifest[].edit_id' PLAN.json",
-            "refine": "Repeat --edit-id EDIT_ID for every selected edit.",
-            "verify": "Run xray replace verify with this complete plan and an independently copied digest.",
-            "apply": "Apply only after verify reports ready_to_apply=true and external approval is satisfied.",
-        }
-
-    def _build_replacement_plan(
-        self,
-        *,
-        pattern: str | None = None,
-        replacement: str | None = None,
-        rule_path: str | None = None,
-        lang: str | None = None,
-        paths: Sequence[str] | None = None,
-        globs: Sequence[str] | None = None,
-        max_matches: int | None = DEFAULT_REPLACEMENT_MAX_MATCHES,
-        max_files: int | None = DEFAULT_REPLACEMENT_MAX_FILES,
-        allow_noop: bool = False,
-        allow_truncated_review: bool = False,
-        allow_dirty_affected: bool = False,
-        allow_new_parse_errors: bool = False,
-        preview_limit: int = DEFAULT_REPLACEMENT_PREVIEW_LIMIT,
-        diff_limit: int = DEFAULT_REPLACEMENT_DIFF_LIMIT,
-        selected_edit_ids: Sequence[str] | None = None,
-    ) -> PreparedReplacement:
-        """Build one exact non-mutating replacement plan and its in-memory postimages."""
-        if max_matches is not None and max_matches < 1:
-            raise ValueError("max_matches must be 1 or greater.")
-        if max_files is not None and max_files < 1:
-            raise ValueError("max_files must be 1 or greater.")
-        if preview_limit < 0:
-            raise ValueError("preview_limit must be 0 or greater.")
-        if diff_limit < 0:
-            raise ValueError("diff_limit must be 0 or greater.")
-        execution_cap = max_matches + 1 if max_matches is not None else None
-        matches, query = self._replacement_candidates(
-            pattern=pattern,
-            replacement=replacement,
-            rule_path=rule_path,
-            lang=lang,
-            paths=paths,
-            globs=globs,
-            max_results=execution_cap,
-        )
-        if max_matches is not None and len(matches) > max_matches:
-            raise ValueError(f"Replacement has more than the allowed {max_matches} candidates.")
-        matches, capture_warnings = self.project_semantic_captures(matches)
-        files, preview = self._prepare_replacement_files(matches)
-        available_edit_ids = {str(edit["edit_id"]) for edit in preview}
-        normalized_selection = sorted(set(selected_edit_ids or ()))
-        if selected_edit_ids is not None:
-            unknown = sorted(set(normalized_selection) - available_edit_ids)
-            if unknown:
-                raise ValueError(f"Unknown replacement edit_id: {unknown[0]}.")
-            selected = set(normalized_selection)
-            matches = [match for match in matches if str(match.get("_xray_edit_id", "")) in selected]
-            if matches:
-                files, preview = self._prepare_replacement_files(matches)
-            else:
-                files, preview = (), []
-        if max_files is not None and len(files) > max_files:
-            raise ValueError(f"Replacement affects more than the allowed {max_files} files.")
-
-        requested_language = query["change"].get("language") if query["change"]["kind"] == "pattern" else None
-        syntax_evidence = [self._replacement_syntax_evidence(item, requested_language) for item in files]
-        file_payloads = [
-            {
-                "path": item.relative_path,
-                "preimage_sha256": self._sha256(item.original),
-                "postimage_sha256": self._sha256(item.postimage),
-                "byte_size": len(item.original),
-                "postimage_byte_size": len(item.postimage),
-                "edit_count": len(item.edits),
-                "changed_edit_count": sum(bool(edit["changed"]) for edit in item.edits),
-                "changed": item.original != item.postimage,
-                "syntax": syntax,
-                "edits": [
-                    {
-                        "edit_id": edit["edit_id"],
-                        "start": edit["start"],
-                        "end": edit["end"],
-                        "before_sha256": self._sha256(edit["before"].encode("utf-8")),
-                        "after_sha256": self._sha256(edit["after"].encode("utf-8")),
-                        "changed": edit["changed"],
-                    }
-                    for edit in item.edits
-                ],
-            }
-            for item, syntax in zip(files, syntax_evidence, strict=True)
-        ]
-        if selected_edit_ids is not None:
-            query["selected_edit_ids"] = normalized_selection
-        affected_paths = [item.relative_path for item in files]
-        commit, dirty, dirty_affected_paths = self._git_state(affected_paths)
-        fingerprint_payload = {
-            "root_path": str(self.root_path),
-            "git_commit": commit,
-            "query": query,
-            "files": [{"path": item["path"], "sha256": item["preimage_sha256"]} for item in file_payloads],
-        }
-        root_fingerprint = self._sha256(self._canonical_json(fingerprint_payload))
-        changed_candidate_count = sum(1 for item in files for edit in item.edits if bool(edit["changed"]))
-        new_parse_error_count = sum(int(item["new_diagnostic_count"]) for item in syntax_evidence)
-        edit_manifest = [
-            {
-                "edit_id": edit["edit_id"],
-                "path": edit["path"],
-                "line": edit["line"],
-                "column": edit["column"],
-                "before_sha256": self._sha256(edit["before"].encode("utf-8")),
-                "after_sha256": self._sha256(edit["after"].encode("utf-8")),
-                "changed": edit["changed"],
-                "selected": True,
-            }
-            for edit in preview
-        ]
-        warnings = list(capture_warnings)
-        if query["change"]["kind"] == "pattern" and not query["change"].get("language"):
-            warnings.append("Language was inferred; review configuration and documentation matches before apply.")
-        if dirty and not dirty_affected_paths:
-            warnings.append(
-                "Repository has unrelated worktree changes; every affected preimage remains bound by the plan digest."
-            )
-        if dirty_affected_paths and not allow_dirty_affected:
-            warnings.append("Affected files already contain Git worktree changes; acknowledge them before apply.")
-        if new_parse_error_count and not allow_new_parse_errors:
-            warnings.append("Replacement postimages introduce new parse errors; revise the replacement before apply.")
-        if matches and changed_candidate_count == 0:
-            warnings.append("Every candidate is a no-op; apply requires explicit no-op allowance.")
-        full_diff = self._replacement_diff(files)
-        preview_truncated = len(preview) > preview_limit
-        diff_truncated = len(full_diff) > diff_limit
-        review_truncated = preview_truncated or diff_truncated
-        review_complete = not review_truncated or allow_truncated_review
-        applicable = (
-            bool(matches)
-            and review_complete
-            and (changed_candidate_count > 0 or allow_noop)
-            and (not dirty_affected_paths or allow_dirty_affected)
-            and (new_parse_error_count == 0 or allow_new_parse_errors)
-        )
-        applicability_reason: str | None = None
-        if not matches:
-            applicability_reason = "no_candidates"
-        elif review_truncated and not allow_truncated_review:
-            applicability_reason = "truncated_review_not_acknowledged"
-            warnings.append("Preview or diff is truncated; acknowledge truncated review before apply.")
-        elif changed_candidate_count == 0 and not allow_noop:
-            applicability_reason = "noop_not_allowed"
-        elif new_parse_error_count and not allow_new_parse_errors:
-            applicability_reason = "new_parse_errors"
-        elif dirty_affected_paths and not allow_dirty_affected:
-            applicability_reason = "dirty_affected_files_not_acknowledged"
-        plan: dict[str, Any] = {
-            "plan_version": REPLACEMENT_PLAN_VERSION,
-            "root_path": str(self.root_path),
-            "root_fingerprint": root_fingerprint,
-            "query": query,
-            "bounds": {
-                "max_matches": max_matches,
-                "max_files": max_files,
-                "preview_limit": preview_limit,
-                "diff_limit": diff_limit,
-            },
-            "allow_noop": allow_noop,
-            "allow_truncated_review": allow_truncated_review,
-            "allow_dirty_affected": allow_dirty_affected,
-            "allow_new_parse_errors": allow_new_parse_errors,
-            "candidate_count": len(matches),
-            "changed_candidate_count": changed_candidate_count,
-            "no_op_count": len(matches) - changed_candidate_count,
-            "affected_file_count": len(files),
-            "changed_file_count": sum(item.original != item.postimage for item in files),
-            "files": file_payloads,
-            "edit_manifest": edit_manifest,
-            "dirty_affected_paths": dirty_affected_paths,
-            "syntax_validation": {
-                "parser": "ast-grep",
-                "checked_file_count": sum(bool(item["checked"]) for item in syntax_evidence),
-                "unchecked_file_count": sum(not bool(item["checked"]) for item in syntax_evidence),
-                "new_diagnostic_count": new_parse_error_count,
-                "valid": new_parse_error_count == 0,
-            },
-            "preview": preview[:preview_limit],
-            "preview_returned": min(len(preview), preview_limit),
-            "preview_total": len(preview),
-            "preview_truncated": preview_truncated,
-            "diff": full_diff[:diff_limit],
-            "diff_returned_chars": min(len(full_diff), diff_limit),
-            "diff_total_chars": len(full_diff),
-            "diff_truncated": diff_truncated,
-            "review_complete": review_complete,
-            "applicable": applicable,
-            "applicability_reason": applicability_reason,
-            "warnings": warnings,
-            "next_actions": self._replacement_next_actions(applicability_reason),
-        }
-        plan["plan_digest"] = self._sha256(self._canonical_json(self._plan_digest_payload(plan)))
-        return PreparedReplacement(plan=plan, files=files, matches=tuple(matches))
-
-    def plan_replacement(
-        self,
-        *,
-        pattern: str | None = None,
-        replacement: str | None = None,
-        rule_path: str | None = None,
-        lang: str | None = None,
-        paths: Sequence[str] | None = None,
-        globs: Sequence[str] | None = None,
-        max_matches: int = DEFAULT_REPLACEMENT_MAX_MATCHES,
-        max_files: int = DEFAULT_REPLACEMENT_MAX_FILES,
-        allow_noop: bool = False,
-        allow_truncated_review: bool = False,
-        allow_dirty_affected: bool = False,
-        allow_new_parse_errors: bool = False,
-        preview_limit: int = DEFAULT_REPLACEMENT_PREVIEW_LIMIT,
-        diff_limit: int = DEFAULT_REPLACEMENT_DIFF_LIMIT,
-    ) -> dict[str, Any]:
-        """Return an exact, bounded, non-mutating replacement plan."""
-        return self._build_replacement_plan(
-            pattern=pattern,
-            replacement=replacement,
-            rule_path=rule_path,
-            lang=lang,
-            paths=paths,
-            globs=globs,
-            max_matches=max_matches,
-            max_files=max_files,
-            allow_noop=allow_noop,
-            allow_truncated_review=allow_truncated_review,
-            allow_dirty_affected=allow_dirty_affected,
-            allow_new_parse_errors=allow_new_parse_errors,
-            preview_limit=preview_limit,
-            diff_limit=diff_limit,
-        ).plan
-
-    def refine_replacement(self, plan: Mapping[str, Any], *, edit_ids: Sequence[str]) -> dict[str, Any]:
-        """Recompute a reviewed plan and select stable edit identifiers without writing."""
-        self._validate_replacement_plan_digest(plan)
-        query, bounds, kwargs = self._replacement_plan_inputs(plan)
-        return self._build_replacement_plan(
-            **kwargs,
-            paths=query.get("paths"),
-            globs=query.get("globs"),
-            max_matches=bounds.get("max_matches"),
-            max_files=bounds.get("max_files"),
-            allow_noop=bool(plan.get("allow_noop", False)),
-            allow_truncated_review=bool(plan.get("allow_truncated_review", False)),
-            allow_dirty_affected=bool(plan.get("allow_dirty_affected", False)),
-            allow_new_parse_errors=bool(plan.get("allow_new_parse_errors", False)),
-            preview_limit=int(bounds.get("preview_limit", DEFAULT_REPLACEMENT_PREVIEW_LIMIT)),
-            diff_limit=int(bounds.get("diff_limit", DEFAULT_REPLACEMENT_DIFF_LIMIT)),
-            selected_edit_ids=edit_ids,
-        ).plan
-
-    @staticmethod
-    def _write_staged_file(item: PreparedReplacementFile, content: bytes) -> Path:
-        """Write and fsync a same-directory temporary file with the target mode."""
-        temporary_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile("wb", dir=item.path.parent, prefix=".xray-stage-", delete=False) as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-                temporary_path = Path(stream.name)
-            os.chmod(temporary_path, stat.S_IMODE(item.path.stat().st_mode))
-            return temporary_path
-        except Exception:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+                observation = cast(Callable[[], ToolchainObservation], provider)()
+        except RepositoryError:
             raise
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise _IndexerFailure(
+                "dependency_unavailable",
+                f"analysis toolchain could not be observed: {exc}",
+                action="install_dependency",
+            ) from exc
+        if not isinstance(observation, ToolchainObservation) or not observation.healthy or observation.digest is None:
+            detail = "; ".join(observation.errors) if isinstance(observation, ToolchainObservation) else ""
+            if not detail:
+                detail = "analysis toolchain is unavailable"
+            raise _IndexerFailure("dependency_unavailable", detail, action="install_dependency")
+        return observation
 
-    def _apply_prepared_replacement(self, prepared: PreparedReplacement) -> dict[str, Any]:
-        """Stage, verify, apply, and if necessary roll back one complete plan."""
-        changed_files = [item for item in prepared.files if item.original != item.postimage]
-        planned_files = {
-            str(item["path"]): item for item in prepared.plan["files"] if isinstance(item, Mapping) and "path" in item
-        }
-        requested_language = (
-            prepared.plan["query"]["change"].get("language")
-            if prepared.plan["query"]["change"]["kind"] == "pattern"
-            else None
-        )
-        staged: dict[Path, Path] = {}
-        try:
-            for item in changed_files:
-                current = item.path.read_bytes()
-                if self._sha256(current) != self._sha256(item.original):
-                    raise ReplacementApplyError(f"Source drift detected before writing '{item.relative_path}'.")
-                staged[item.path] = self._write_staged_file(item, item.postimage)
-                staged_bytes = staged[item.path].read_bytes()
-                if self._sha256(staged_bytes) != self._sha256(item.postimage):
-                    raise ReplacementApplyError(f"Staged postimage hash mismatch for '{item.relative_path}'.")
-                planned_syntax = planned_files[item.relative_path]["syntax"]
-                language = self._replacement_language(item.relative_path, requested_language)
-                staged_syntax, _signatures = self._syntax_snapshot(staged_bytes, language)
-                if staged_syntax != planned_syntax["postimage"]:
-                    raise ReplacementApplyError(f"Staged syntax evidence drifted for '{item.relative_path}'.")
-        except Exception as exc:
-            for temporary in staged.values():
-                temporary.unlink(missing_ok=True)
-            if isinstance(exc, ReplacementApplyError):
-                raise
-            raise ReplacementApplyError(f"Replacement preparation failed: {exc}") from exc
+    def _toolchain_observation(self, *, budget: OperationBudget | None = None) -> ToolchainObservation:
+        return self._active_toolchain or self._observe_toolchain(budget=budget)
 
-        replaced: list[PreparedReplacementFile] = []
+    def _toolchain_id(self) -> str:
+        observation = self._toolchain_observation()
+        if observation.digest is None:
+            raise _IndexerFailure("dependency_unavailable", "analysis toolchain has no complete identity")
+        return observation.digest
+
+    def _analyzer_id(self, language: str) -> str:
+        observation = self._toolchain_observation()
         try:
-            for item in changed_files:
-                if self._sha256(item.path.read_bytes()) != self._sha256(item.original):
-                    raise ReplacementApplyError(f"Source drift detected after staging '{item.relative_path}'.")
-            for item in changed_files:
-                os.replace(staged[item.path], item.path)
-                replaced.append(item)
-            for item in changed_files:
-                if self._sha256(item.path.read_bytes()) != self._sha256(item.postimage):
-                    raise OSError(f"Postimage verification failed for '{item.relative_path}'.")
-                planned_syntax = planned_files[item.relative_path]["syntax"]
-                language = self._replacement_language(item.relative_path, requested_language)
-                final_syntax, _signatures = self._syntax_snapshot(item.path.read_bytes(), language)
-                if final_syntax != planned_syntax["postimage"]:
-                    raise OSError(f"Final syntax evidence drifted for '{item.relative_path}'.")
-        except Exception as exc:
-            rollback_count = 0
-            rollback_succeeded = True
-            for item in reversed(replaced):
-                rollback_stage: Path | None = None
-                try:
-                    rollback_stage = self._write_staged_file(item, item.original)
-                    os.replace(rollback_stage, item.path)
-                    rollback_count += 1
-                except Exception:
-                    if rollback_stage is not None:
-                        rollback_stage.unlink(missing_ok=True)
-                    rollback_succeeded = False
-            for temporary in staged.values():
-                temporary.unlink(missing_ok=True)
-            raise ReplacementApplyError(
-                f"Replacement apply failed: {exc}",
-                rollback_count=rollback_count,
-                rollback_succeeded=rollback_succeeded,
-                rollback_attempted=bool(replaced),
+            return toolchain_analyzer_id(language, observation=observation)
+        except ToolchainUnavailableError as exc:
+            raise _IndexerFailure(
+                "dependency_unavailable",
+                f"analyzer identity is unavailable for {language}",
+                action="install_dependency",
             ) from exc
 
-        return {
-            "plan_digest": prepared.plan["plan_digest"],
-            "candidate_count": prepared.plan["candidate_count"],
-            "applied_count": prepared.plan["changed_candidate_count"],
-            "changed_count": prepared.plan["changed_candidate_count"],
-            "no_op_count": prepared.plan["no_op_count"],
-            "matched_file_count": prepared.plan["affected_file_count"],
-            "file_count": len(changed_files),
-            "files_modified": [item.relative_path for item in changed_files],
-            "rollback_count": 0,
-            "rollback_succeeded": True,
-            "rollback_attempted": False,
-            "rollback_status": rollback_status(attempted=False, succeeded=True),
-            "files": [
-                {
-                    "path": item.relative_path,
-                    "preimage_sha256": self._sha256(item.original),
-                    "postimage_sha256": self._sha256(item.postimage),
-                }
-                for item in changed_files
-            ],
-        }
-
-    def _validate_replacement_plan_digest(self, plan: Mapping[str, Any]) -> str:
-        """Validate the version and complete-artifact digest of a replacement plan."""
-        version = plan.get("plan_version")
-        if version == "xray.replace.v1":
-            raise ValueError("Replacement plan xray.replace.v1 cannot attest review fields; create a new v2 plan.")
-        if version != REPLACEMENT_PLAN_VERSION:
-            raise ValueError(f"Unsupported replacement plan version: {version!r}.")
-        stored_digest = plan.get("plan_digest")
-        if not isinstance(stored_digest, str):
-            raise ValueError("Replacement plan is missing plan_digest.")
-        calculated_digest = self._sha256(self._canonical_json(self._plan_digest_payload(plan)))
-        if calculated_digest != stored_digest:
-            raise ValueError("Replacement plan digest does not match its complete review artifact.")
-        return stored_digest
-
     @staticmethod
-    def _is_legacy_v2_replacement_plan(plan: Mapping[str, Any]) -> bool:
-        """Return whether a valid v2 artifact predates additive safety evidence."""
-        return "syntax_validation" not in plan
-
-    def _legacy_v2_projection(self, current_plan: Mapping[str, Any]) -> dict[str, Any]:
-        """Project a current plan to the exact pre-0.11 v2 review artifact."""
-        projected = json.loads(json.dumps(current_plan))
-        for field in (
-            "allow_dirty_affected",
-            "allow_new_parse_errors",
-            "dirty_affected_paths",
-            "edit_manifest",
-            "syntax_validation",
-            "next_actions",
-        ):
-            projected.pop(field, None)
-        for file_data in projected.get("files", []):
-            if isinstance(file_data, dict):
-                file_data.pop("syntax", None)
-        projected["warnings"] = [
-            warning
-            for warning in projected.get("warnings", [])
-            if not warning.startswith("Affected files already contain")
-            and not warning.startswith("Replacement postimages introduce")
-        ]
-        projected["applicable"] = (
-            bool(projected.get("candidate_count"))
-            and bool(projected.get("review_complete"))
-            and (int(projected.get("changed_candidate_count", 0)) > 0 or bool(projected.get("allow_noop")))
-        )
-        projected["applicability_reason"] = None
-        if not projected.get("candidate_count"):
-            projected["applicability_reason"] = "no_candidates"
-        elif not projected.get("review_complete"):
-            projected["applicability_reason"] = "truncated_review_not_acknowledged"
-        elif not projected.get("changed_candidate_count") and not projected.get("allow_noop"):
-            projected["applicability_reason"] = "noop_not_allowed"
-        projected["plan_digest"] = self._sha256(self._canonical_json(self._plan_digest_payload(projected)))
-        return projected
-
-    @staticmethod
-    def _replacement_plan_inputs(
-        plan: Mapping[str, Any],
-    ) -> tuple[Mapping[str, Any], Mapping[str, Any], dict[str, Any]]:
-        """Extract validated plan inputs used for canonical recomputation."""
-        query = plan.get("query")
-        bounds = plan.get("bounds")
-        if not isinstance(query, Mapping) or not isinstance(query.get("change"), Mapping):
-            raise ValueError("Replacement plan query is invalid.")
-        if not isinstance(bounds, Mapping):
-            raise ValueError("Replacement plan bounds are invalid.")
-        change = query["change"]
-        kind = change.get("kind")
-        if kind == "pattern":
-            kwargs = {
-                "pattern": change.get("pattern"),
-                "replacement": change.get("replacement"),
-                "lang": change.get("language"),
-            }
-        elif kind == "rule":
-            kwargs = {"rule_path": change.get("rule_path")}
-        else:
-            raise ValueError("Replacement plan change kind is invalid.")
-        return query, bounds, kwargs
-
-    def _verify_replacement_plan(
-        self, plan: Mapping[str, Any], *, expected_digest: str
-    ) -> tuple[PreparedReplacement, bool]:
-        """Recompute every non-mutating apply guard for a serialized plan."""
-        stored_digest = self._validate_replacement_plan_digest(plan)
-        if expected_digest != stored_digest:
-            raise ValueError("expected_digest does not confirm this replacement plan.")
-        if Path(str(plan.get("root_path", ""))).resolve() != self.root_path:
-            raise ValueError("Replacement plan root does not match the requested repository root.")
-        query, bounds, kwargs = self._replacement_plan_inputs(plan)
-        self._validate_replacement_source_snapshot(plan, query=query)
-        prepared = self._build_replacement_plan(
-            **kwargs,
-            paths=query.get("paths"),
-            globs=query.get("globs"),
-            max_matches=bounds.get("max_matches"),
-            max_files=bounds.get("max_files"),
-            allow_noop=bool(plan.get("allow_noop", False)),
-            allow_truncated_review=bool(plan.get("allow_truncated_review", False)),
-            allow_dirty_affected=bool(plan.get("allow_dirty_affected", False)),
-            allow_new_parse_errors=bool(plan.get("allow_new_parse_errors", False)),
-            preview_limit=int(bounds.get("preview_limit", DEFAULT_REPLACEMENT_PREVIEW_LIMIT)),
-            diff_limit=int(bounds.get("diff_limit", DEFAULT_REPLACEMENT_DIFF_LIMIT)),
-            selected_edit_ids=query.get("selected_edit_ids"),
-        )
-        legacy_v2 = self._is_legacy_v2_replacement_plan(plan)
-        comparable_plan = self._legacy_v2_projection(prepared.plan) if legacy_v2 else prepared.plan
-        if comparable_plan != dict(plan):
-            raise ReplacementApplyError("Replacement plan no longer matches the repository source snapshot.")
-        if not prepared.plan["applicable"]:
-            if prepared.plan["applicability_reason"] == "noop_not_allowed":
-                raise ValueError("Replacement plan contains no byte-changing edits; allow_noop was not recorded.")
-            raise ValueError(f"Replacement plan is not applicable: {prepared.plan['applicability_reason']}.")
-        return prepared, legacy_v2
-
-    def _validate_replacement_source_snapshot(self, plan: Mapping[str, Any], *, query: Mapping[str, Any]) -> None:
-        """Report affected-source drift before candidate or selection recomputation."""
-        files = plan.get("files")
-        if not isinstance(files, Sequence) or isinstance(files, (str, bytes)):
-            raise ValueError("Replacement plan files are invalid.")
-        changed: list[dict[str, str]] = []
-        current_files: list[dict[str, str]] = []
-        affected_paths: list[str] = []
-        for item in files:
-            if not isinstance(item, Mapping) or not isinstance(item.get("path"), str):
-                raise ValueError("Replacement plan file entry is invalid.")
-            relative = str(item["path"])
-            expected = item.get("preimage_sha256")
-            if not isinstance(expected, str):
-                raise ValueError(f"Replacement plan file '{relative}' is missing preimage_sha256.")
-            try:
-                target = self._resolve_repo_path(relative, require_file=True)
-            except (OSError, RuntimeError, ValueError) as exc:
-                raise ReplacementDriftError(
-                    "Replacement source snapshot changed before candidate selection was recomputed.",
-                    details={
-                        "changed_paths": [{"path": relative, "expected_sha256": expected, "state": "unavailable"}]
-                    },
-                ) from exc
-            normalized = target.relative_to(self.root_path).as_posix()
-            current = self._sha256(target.read_bytes())
-            affected_paths.append(normalized)
-            current_files.append({"path": normalized, "sha256": current})
-            if normalized != relative or current != expected:
-                changed.append({"path": relative, "expected_sha256": expected, "current_sha256": current})
-        commit, _dirty, _dirty_affected = self._git_state(affected_paths)
-        current_fingerprint = self._sha256(
-            self._canonical_json(
-                {
-                    "root_path": str(self.root_path),
-                    "git_commit": commit,
-                    "query": dict(query),
-                    "files": current_files,
-                }
-            )
-        )
-        expected_fingerprint = plan.get("root_fingerprint")
-        if changed or current_fingerprint != expected_fingerprint:
-            raise ReplacementDriftError(
-                "Replacement source snapshot changed before candidate selection was recomputed.",
-                details={
-                    "changed_paths": changed,
-                    "expected_root_fingerprint": expected_fingerprint,
-                    "current_root_fingerprint": current_fingerprint,
-                },
-            )
-
-    def verify_replacement(self, plan: Mapping[str, Any], *, expected_digest: str) -> dict[str, Any]:
-        """Perform every non-mutating apply guard and summarize readiness."""
-        prepared, legacy_v2 = self._verify_replacement_plan(plan, expected_digest=expected_digest)
+    def _record_payload(record: DeclarationRecord) -> dict[str, Any]:
         return {
-            "verified": True,
-            "ready_to_apply": True,
-            "plan_digest": expected_digest,
-            "plan_version": plan["plan_version"],
-            "legacy_v2": legacy_v2,
-            "candidate_count": prepared.plan["candidate_count"],
-            "affected_file_count": prepared.plan["affected_file_count"],
-            "selected_edit_ids": [item["edit_id"] for item in prepared.plan["edit_manifest"]],
-            "syntax_validation": prepared.plan["syntax_validation"],
-            "dirty_affected_paths": prepared.plan["dirty_affected_paths"],
+            "root_id": record.root_id,
+            "path": record.path,
+            "file_digest": record.file_digest,
+            "language": record.language,
+            "analyzer_id": record.analyzer_id,
+            "kind": record.kind,
+            "name": record.name,
+            "owner_chain": list(record.owner_chain),
+            "qualified_name": record.qualified_name,
+            "start": record.start,
+            "end": record.end,
+            "defining_start": record.defining_start,
+            "defining_end": record.defining_end,
+            "signature": record.signature,
+            "visibility": record.visibility,
+            "documentation": record.documentation,
+            "parent_id": record.parent_id,
+            "expandable": record.expandable,
+            "symbol_id": record.symbol_id,
         }
-
-    def apply_replacement(self, plan: Mapping[str, Any], *, expected_digest: str) -> dict[str, Any]:
-        """Recompute and apply a serialized plan only when every guard still matches."""
-        prepared, legacy_v2 = self._verify_replacement_plan(plan, expected_digest=expected_digest)
-        result = self._apply_prepared_replacement(prepared)
-        result["plan_digest"] = expected_digest
-        result["legacy_v2"] = legacy_v2
-        result["syntax_validation"] = prepared.plan["syntax_validation"]
-        return result
-
-    def rewrite_pattern(self, pattern: str, replacement: str, lang: str | None = None) -> dict[str, Any]:
-        """Apply the legacy all-match rewrite through the staged writer."""
-        prepared = self._build_replacement_plan(
-            pattern=pattern,
-            replacement=replacement,
-            lang=lang,
-            max_matches=None,
-            max_files=None,
-            allow_noop=True,
-            allow_dirty_affected=True,
-            allow_new_parse_errors=True,
-            preview_limit=0,
-        )
-        applied = self._apply_prepared_replacement(prepared)
-        return {
-            "matches": list(prepared.matches),
-            "match_count": applied["candidate_count"],
-            "changed_match_count": applied["changed_count"],
-            "no_op_count": applied["no_op_count"],
-            "matched_file_count": applied["matched_file_count"],
-            "matched_files": [str(item.path) for item in prepared.files],
-            "files_modified": [str(self.root_path / path) for path in applied["files_modified"]],
-            "file_count": applied["file_count"],
-            "rollback_count": applied["rollback_count"],
-            "rollback_succeeded": applied["rollback_succeeded"],
-            "rollback_attempted": applied["rollback_attempted"],
-            "rollback_status": applied["rollback_status"],
-        }
-
-    def scan_rules(
-        self,
-        rule_path: str,
-        fix: bool = False,
-        *,
-        paths: Sequence[str] | None = None,
-        globs: Sequence[str] | None = None,
-        max_results: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """Run bounded rule diagnostics or legacy all-match staged fixes."""
-        if not fix:
-            matches, _relative_rule, _selection = self._scan_rule_matches(
-                rule_path,
-                paths=paths,
-                globs=globs,
-                max_results=max_results,
-            )
-            return matches
-        _resolved_paths, relative_paths = self._operation_scopes(paths)
-        normalized_globs = self._validate_globs(globs)
-        self.last_rule_selection = self._rule_selection(relative_paths, normalized_globs)
-        prepared = self._build_replacement_plan(
-            rule_path=rule_path,
-            paths=paths,
-            globs=globs,
-            max_matches=None,
-            max_files=None,
-            allow_noop=True,
-            preview_limit=0,
-        )
-        self.last_mutation_summary = self._apply_prepared_replacement(prepared)
-        return list(prepared.matches)
-
-    def check_rules(
-        self,
-        rule_path: str,
-        *,
-        paths: Sequence[str] | None = None,
-        globs: Sequence[str] | None = None,
-        max_results: int = 100,
-    ) -> dict[str, Any]:
-        """Validate and scan one contained ast-grep rule source without mutation."""
-        matches, relative_rule, selection = self._scan_rule_matches(
-            rule_path, paths=paths, globs=globs, max_results=max_results
-        )
-        return {
-            "rule_path": relative_rule,
-            "valid": True,
-            "matches": matches,
-            "returned": len(matches),
-            "total_exact": self.last_result_total_exact,
-            "truncated": not self.last_result_total_exact,
-            "selection": selection,
-        }
-
-    def explain_rules(
-        self,
-        rule_path: str,
-        *,
-        source_limit: int = 32_000,
-        paths: Sequence[str] | None = None,
-        globs: Sequence[str] | None = None,
-    ) -> dict[str, Any]:
-        """Return bounded source plus upstream validation and inspection evidence."""
-        if source_limit < 1:
-            raise ValueError("source_limit must be 1 or greater.")
-        rule_args, relative_rule = self._rule_arguments(rule_path)
-        resolved = self._resolve_repo_path(relative_rule)
-        source_path = resolved
-        if resolved.is_dir():
-            source_path = next(
-                path for path in (resolved / "sgconfig.yml", resolved / "sgconfig.yaml") if path.is_file()
-            )
-        source = source_path.read_text(encoding="utf-8")
-        args = ["scan", *rule_args, "--inspect=summary", "--json=compact", "--max-results", "1"]
-        relative_paths, normalized_globs = self._append_operation_scope(
-            args, paths, globs, include_explicit_hidden=True
-        )
-        result = run_ast_grep(args, cwd=self.root_path)
-        return {
-            "rule_path": relative_rule,
-            "valid": True,
-            "source": source[:source_limit],
-            "source_chars": min(len(source), source_limit),
-            "source_total_chars": len(source),
-            "source_truncated": len(source) > source_limit,
-            "inspection": result.stderr.strip(),
-            "inspection_lines": result.stderr.strip().splitlines(),
-            "selection": self._rule_selection(relative_paths, normalized_globs),
-        }
-
-    def test_rules(
-        self,
-        *,
-        test_dir: str = ".",
-        config_path: str | None = None,
-    ) -> dict[str, Any]:
-        """Run contained ast-grep rule tests without snapshots or interactive behavior."""
-        resolved_test_dir = self._resolve_repo_path(test_dir)
-        if not resolved_test_dir.is_dir():
-            raise ValueError("test_dir must be a directory.")
-        args = [
-            "test",
-            "--test-dir",
-            str(resolved_test_dir),
-            "--skip-snapshot-tests",
-            "--color",
-            "never",
-        ]
-        relative_config: str | None = None
-        if config_path is not None:
-            resolved_config = self._resolve_repo_path(config_path, require_file=True)
-            relative_config = resolved_config.relative_to(self.root_path).as_posix()
-            args.extend(["--config", str(resolved_config)])
-        result = run_ast_grep(args, cwd=self.root_path)
-        return {
-            "ok": True,
-            "test_dir": (
-                "." if resolved_test_dir == self.root_path else resolved_test_dir.relative_to(self.root_path).as_posix()
-            ),
-            "config_path": relative_config,
-            "output": result.stdout.strip(),
-            "diagnostics": result.stderr.strip(),
-        }
-
-    def capabilities(self, *, include_repository: bool = True) -> dict[str, Any]:
-        """Report stable product contracts and effective local dependency health."""
-
-        def version(command: str) -> str | None:
-            executable = shutil.which(command)
-            if executable is None:
-                return None
-            try:
-                completed = subprocess.run(
-                    [executable, "--version"], capture_output=True, check=False, text=True, timeout=GIT_TIMEOUT_SECONDS
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                return None
-            output = (completed.stdout or completed.stderr).strip().splitlines()
-            return output[0] if completed.returncode == 0 and output else None
-
-        ast_grep_version = version("ast-grep")
-        try:
-            mcp_cache_limit = max(1, int(os.environ.get("XRAY_MCP_INDEXER_CACHE_LIMIT", "32")))
-        except ValueError:
-            mcp_cache_limit = 32
-        cli_read_only = [
-            "explore",
-            "find",
-            "interface",
-            "read-symbol",
-            "symbol-at",
-            "impact",
-            "search",
-            "scan",
-            "imports",
-            "exports",
-            "rules-check",
-            "rules-explain",
-            "rules-test",
-            "replace-plan",
-            "replace-refine",
-            "replace-verify",
-            "capabilities",
-        ]
-        cli_mutating = ["rewrite", "scan-fix", "replace-apply"]
-        mcp_read_only = [
-            "explore_repo",
-            "find_symbol",
-            "read_interface",
-            "read_interface_structured",
-            "read_symbol",
-            "symbol_at",
-            "what_breaks",
-            "search_pattern",
-            "plan_replacement",
-            "refine_replacement",
-            "verify_replacement",
-            "scan_rules",
-            "check_rules",
-            "explain_rules",
-            "test_rules",
-            "xray_capabilities",
-            "file_imports",
-            "file_exports",
-        ]
-        mcp_mutating = ["apply_replacement", "apply_rule_fixes", "rewrite_pattern"]
-        payload: dict[str, Any] = {
-            "product": {"name": "xray-cli", "version": __version__},
-            "schemas": ["xray.cli.v1", "xray.cli.v2", "xray.cli.v3"],
-            "schema_contracts": {
-                "cli_default": "xray.cli.v3",
-                "cli_legacy": ["xray.cli.v2"],
-                "cli_full": "xray.cli.v1",
-                "replacement_plan": REPLACEMENT_PLAN_VERSION,
-                "mcp_default": "v3",
-                "mcp_legacy": ["v2"],
-            },
-            "replacement_plan_versions": [REPLACEMENT_PLAN_VERSION],
-            "replacement_semantics": {
-                "root_fingerprint_inputs": [
-                    "normalized_root",
-                    "git_commit_when_available",
-                    "query_including_selection",
-                    "affected_source_preimages",
-                ],
-                "selection_refinement_changes_root_fingerprint": True,
-                "rollback_status": {
-                    "primary": True,
-                    "values": ["not_attempted", "succeeded", "failed"],
-                    "legacy_fields": ["rollback_attempted", "rollback_succeeded", "rollback_count"],
-                },
-            },
-            "rule_selection": {
-                "default": "repository root with ast-grep ignore defaults",
-                "scopes": ["contained_paths", "ordered_globs"],
-                "explicit_hidden_paths": "included",
-            },
-            "paging": {
-                "continuable_min_limit": 1,
-                "adaptive_page_size": True,
-                "cursor_identity": ["command", "root", "query_scopes", "projection", "source_snapshot"],
-            },
-            "languages": sorted(set(LANGUAGE_MAP.values())),
-            "extensions": dict(sorted(LANGUAGE_MAP.items())),
-            "operations": {
-                "read_only": cli_read_only,
-                "destructive": cli_mutating,
-            },
-            "bounds": {
-                "inventory_files": MAX_INVENTORY_FILES,
-                "inventory_symbols": MAX_INVENTORY_SYMBOLS,
-                "impact_raw_results": MAX_IMPACT_RAW_RESULTS,
-                "replacement_matches": DEFAULT_REPLACEMENT_MAX_MATCHES,
-                "replacement_files": DEFAULT_REPLACEMENT_MAX_FILES,
-                "ast_grep_timeout_seconds": get_ast_grep_timeout(),
-                "ast_grep_output_chars": get_ast_grep_output_limit(),
-                "ripgrep_output_chars": MAX_RG_OUTPUT_CHARS,
-                "interface_file_bytes": MAX_SKELETON_FILE_BYTES,
-                "inventory_source_bytes": MAX_INVENTORY_SOURCE_BYTES,
-                "source_argument_chars": MAX_SOURCE_ARGUMENT_CHARS,
-                "replacement_file_bytes": MAX_REPLACEMENT_FILE_BYTES,
-                "replacement_total_bytes": MAX_REPLACEMENT_TOTAL_BYTES,
-            },
-            "surfaces": {
-                "cli": {
-                    "operations": {"read_only": cli_read_only, "mutating": cli_mutating},
-                    "aliases": {"map": "explore", "doctor": "capabilities"},
-                    "administrative": ["skill-install"],
-                    "defaults": {
-                        "explore": {"max_depth": 2, "max_entries": 5000, "max_symbols_per_file": 5},
-                        "find": {"limit": 10, "min_score": 60},
-                        "interface": {"limit": 50, "member_depth": 1, "max_members": 20},
-                        "read_symbol": {"context_lines": 0, "max_lines": 200, "max_bytes": 65536},
-                        "impact": {"limit": 50, "context_lines": 2},
-                        "structural_page": {"limit": 50},
-                    },
-                    "maximums": {
-                        "explore": {"max_entries": None},
-                        "find": {"indexed_symbols": MAX_INVENTORY_SYMBOLS, "limit": None},
-                        "interface": {"file_bytes": MAX_SKELETON_FILE_BYTES, "limit": None},
-                        "read_symbol": {"max_lines": None, "max_bytes": None, "symbol_json_chars": 1024 * 1024},
-                        "impact": {"raw_results": MAX_IMPACT_RAW_RESULTS, "limit": None},
-                        "structural_page": {"limit": None, "subprocess_output_chars": get_ast_grep_output_limit()},
-                    },
-                },
-                "mcp": {
-                    "operations": {"read_only": mcp_read_only, "mutating": mcp_mutating},
-                    "defaults": {
-                        "explore_repo": {"max_depth": 2, "max_entries": 5000, "max_symbols_per_file": 5},
-                        "find_symbol": {"limit": 10, "min_score": 60},
-                        "read_interface_structured": {
-                            "limit": 50,
-                            "member_depth": 1,
-                            "max_members": 20,
-                            "schema": "v3",
-                        },
-                        "read_symbol": {"context_lines": 0, "max_lines": 200, "max_bytes": 65536},
-                        "what_breaks": {"limit": 50, "detail": "compact", "schema": "v3"},
-                        "structural_page": {"limit": 50},
-                        "tool_search": {"limit": 10, "maximum": 50},
-                    },
-                    "maximums": {
-                        "explore_repo": {"max_entries": None},
-                        "find_symbol": {"indexed_symbols": MAX_INVENTORY_SYMBOLS, "limit": None},
-                        "read_interface_structured": {"file_bytes": MAX_SKELETON_FILE_BYTES, "limit": None},
-                        "read_symbol": {"max_lines": None, "max_bytes": None},
-                        "what_breaks": {"raw_results": MAX_IMPACT_RAW_RESULTS, "limit": None},
-                        "structural_page": {"limit": None, "subprocess_output_chars": get_ast_grep_output_limit()},
-                        "tool_search": {"limit": 50},
-                    },
-                    "cache": {
-                        "indexers": {"effective_limit": mcp_cache_limit, "environment": "XRAY_MCP_INDEXER_CACHE_LIMIT"}
-                    },
-                    "discovery_tools": ["search_tools", "call_tool"],
-                    "resources": ["xray://workflow", "skill://xray-progressive-discovery/SKILL.md"],
-                    "resource_templates": ["skill://xray-progressive-discovery/{path*}"],
-                    "prompts": ["xray_discovery_plan"],
-                },
-            },
-            "mutation_classes": {
-                "guarded": {
-                    "cli": ["replace-apply"],
-                    "mcp": ["apply_replacement", "apply_rule_fixes"],
-                },
-                "direct_legacy": {
-                    "cli": ["rewrite", "scan-fix"],
-                    "mcp": ["rewrite_pattern"],
-                },
-                "administrative": {"cli": ["skill-install"], "mcp": []},
-            },
-            "cache": {
-                "directory": str(self.cache_dir) if self.cache_dir is not None else None,
-                "files": [CACHE_FILENAME, INVENTORY_CACHE_FILENAME],
-                "snapshot_bound": True,
-                "disk_max_age_seconds": CACHE_MAX_AGE_SECONDS,
-                "disk_max_bytes": CACHE_MAX_BYTES,
-                "memory_symbol_entries": MAX_SYMBOL_CACHE_ENTRIES,
-            },
-            "workflow_resources": [
-                "xray://workflow",
-                "xray_discovery_plan",
-                "skill://xray-progressive-discovery/SKILL.md",
-            ],
-            "dependencies": {
-                "ast_grep": {"required": True, "available": ast_grep_version is not None, "version": ast_grep_version},
-                "git": {"required": False, "available": shutil.which("git") is not None, "version": version("git")},
-                "ripgrep": {"required": False, "available": shutil.which("rg") is not None, "version": version("rg")},
-            },
-            "healthy": ast_grep_version is not None,
-        }
-        if include_repository:
-            payload["repository"] = {
-                "root_path": str(self.root_path),
-                "snapshot": self.repository_snapshot_fingerprint(),
-            }
-        return payload
-
-    def file_outline_items(self, file_path: str, item: str) -> list[dict[str, Any]]:
-        """Return imports or exports reported by ast-grep outline for one repository file."""
-        if item not in {"imports", "exports"}:
-            raise ValueError("Outline item must be 'imports' or 'exports'.")
-        resolved_file = self._resolve_repo_path(file_path, require_file=True)
-        result = run_ast_grep(["outline", f"--items={item}", "--json=compact", str(resolved_file)])
-        return parse_json_array(result.stdout)
-
-    def explore_repo(
-        self,
-        max_depth: int | None = None,
-        include_symbols: bool = False,
-        focus_dirs: list[str] | None = None,
-        max_symbols_per_file: int = 5,
-        symbol_types: list[str] | None = None,
-        max_entries: int = 5000,
-        use_default_exclusions: bool = True,
-        include_root_context: bool = True,
-    ) -> str:
-        """
-        Build a visual file tree with optional symbol skeletons.
-
-        Args:
-            max_depth: Limit directory traversal depth
-            include_symbols: Include symbol skeletons in output
-            focus_dirs: Only include these top-level directories
-            max_symbols_per_file: Max symbols to show per file
-            symbol_types: Optional ast-grep outline symbol types to include
-
-        Returns:
-            Formatted tree string
-        """
-        return self.explore_repo_data(
-            max_depth=max_depth,
-            include_symbols=include_symbols,
-            focus_dirs=focus_dirs,
-            include_root_context=include_root_context,
-            max_symbols_per_file=max_symbols_per_file,
-            symbol_types=symbol_types,
-            max_entries=max_entries,
-            use_default_exclusions=use_default_exclusions,
-        )["tree_text"]
-
-    def explore_repo_data(
-        self,
-        max_depth: int | None = None,
-        include_symbols: bool = False,
-        focus_dirs: list[str] | None = None,
-        max_symbols_per_file: int = 5,
-        symbol_types: list[str] | None = None,
-        max_entries: int = 5000,
-        use_default_exclusions: bool = True,
-        include_root_context: bool = True,
-    ) -> ExploreRepoData:
-        """
-        Build structured repository map data for CLI and automation.
-
-        The text tree remains available through explore_repo and structured payloads include entries for automation.
-        """
-        normalized_focus: list[str] = []
-        for value in focus_dirs or ():
-            candidate = self._resolve_repo_path(value)
-            relative = "." if candidate == self.root_path else candidate.relative_to(self.root_path).as_posix()
-            if relative not in normalized_focus:
-                normalized_focus.append(relative)
-        gitignore_patterns = self._parse_gitignore(use_default_exclusions=use_default_exclusions)
-        tree_lines: list[str] = []
-        entries: list[ExploreEntry] = []
-        truncated = self._build_tree_recursive_enhanced(
-            self.root_path,
-            tree_lines,
-            "",
-            gitignore_patterns,
-            current_depth=0,
-            max_depth=max_depth,
-            include_symbols=include_symbols,
-            focus_dirs=normalized_focus,
-            include_root_context=include_root_context,
-            max_symbols_per_file=max_symbols_per_file,
-            symbol_types=symbol_types,
-            is_last=True,
-            entries=entries,
-            max_entries=max_entries,
-        )
-
-        if include_symbols:
-            self._save_cache()
-
-        return {
-            "root_path": str(self.root_path),
-            "tree_text": "\n".join(tree_lines),
-            "entries": entries,
-            "truncated": truncated,
-            "options": {
-                "max_depth": max_depth,
-                "include_symbols": include_symbols,
-                "focus_dirs": normalized_focus,
-                "include_root_context": include_root_context,
-                "focus_mode": "root_context" if include_root_context else "strict",
-                "max_symbols_per_file": max_symbols_per_file,
-                "symbol_types": symbol_types or [],
-                "max_entries": max_entries,
-                "use_default_exclusions": use_default_exclusions,
-            },
-        }
-
-    def _parse_gitignore(self, *, use_default_exclusions: bool = True) -> IgnorePolicy:
-        """Compile root and nested .gitignore files with directory-relative semantics."""
-        rule_sets: list[IgnoreRuleSet] = []
-        try:
-            ignore_files = sorted(
-                (path for path in self.root_path.rglob(".gitignore") if path.is_file() and not path.is_symlink()),
-                key=lambda path: (len(path.relative_to(self.root_path).parts), path.as_posix()),
-            )
-        except OSError:
-            ignore_files = []
-        for ignore_file in ignore_files:
-            try:
-                lines = ignore_file.read_text(encoding="utf-8").splitlines()
-                rule_sets.append(IgnoreRuleSet(ignore_file.parent, GitIgnoreSpec.from_lines(lines)))
-            except (OSError, UnicodeError, ValueError) as exc:
-                self.last_warnings.append(f"Could not parse {ignore_file.relative_to(self.root_path)}: {exc}")
-        return IgnorePolicy(tuple(rule_sets), use_default_exclusions=use_default_exclusions)
-
-    def _should_exclude(self, path: Path, gitignore_patterns: IgnorePolicy) -> bool:
-        """Return whether built-in policy or ordered Git-ignore rules exclude a path."""
-
-        if path != self.root_path and not self._is_inside_root(path):
-            return True
-
-        # Avoid following symlinked directories, which can escape the root or cycle.
-        if path.is_symlink() and path.is_dir():
-            return True
-        if path == self.root_path:
-            return False
-
-        relative = path.relative_to(self.root_path).as_posix()
-        match_path = f"{relative}/" if path.is_dir() else relative
-        if gitignore_patterns.use_default_exclusions:
-            default_result = DEFAULT_EXCLUSION_SPEC.check_file(match_path)
-            if default_result.include is True:
-                return True
-
-        ignored = False
-        for rule_set in gitignore_patterns.rules:
-            try:
-                rule_relative = path.relative_to(rule_set.base).as_posix()
-            except ValueError:
-                continue
-            rule_match_path = f"{rule_relative}/" if path.is_dir() else rule_relative
-            result = rule_set.spec.check_file(rule_match_path)
-            if result.include is not None:
-                ignored = result.include
-        return ignored
-
-    def _is_inside_root(self, path: Path) -> bool:
-        """Return whether a path resolves inside the repository root."""
-        try:
-            path.resolve().relative_to(self.root_path)
-            return True
-        except ValueError:
-            return False
-
-    def _focus_relationship(self, path: Path, focus_dirs: list[str] | None) -> tuple[bool, int | None]:
-        """Return whether a path is a focus ancestor and its nearest descendant depth."""
-        if not focus_dirs:
-            return False, None
-        relative = "." if path == self.root_path else path.relative_to(self.root_path).as_posix()
-        relative_parts = () if relative == "." else tuple(relative.split("/"))
-        ancestor = False
-        descendant_depths: list[int] = []
-        for focus in focus_dirs:
-            focus_parts = () if focus == "." else tuple(focus.split("/"))
-            if relative_parts[: len(focus_parts)] == focus_parts:
-                descendant_depths.append(len(relative_parts) - len(focus_parts))
-            elif focus_parts[: len(relative_parts)] == relative_parts:
-                ancestor = True
-        return ancestor, min(descendant_depths) if descendant_depths else None
-
-    def _should_include_dir(self, path: Path, focus_dirs: list[str] | None) -> bool:
-        """Retain focused descendants and their complete repository ancestor chain."""
-        if not focus_dirs:
-            return True
-        ancestor, descendant_depth = self._focus_relationship(path, focus_dirs)
-        return ancestor or descendant_depth is not None
-
-    def _should_include_focused_path(
-        self, path: Path, focus_dirs: list[str] | None, include_root_context: bool
-    ) -> bool:
-        """Include root context files plus selected files and descendant subtrees."""
-        if not focus_dirs or path == self.root_path:
-            return True
-        if path.is_dir():
-            return self._should_include_dir(path, focus_dirs)
-        relative = path.relative_to(self.root_path).as_posix()
-        _ancestor, descendant_depth = self._focus_relationship(path, focus_dirs)
-        if descendant_depth is not None:
-            return True
-        return include_root_context and "/" not in relative
-
-    def _should_emit_focused_path(self, path: Path, focus_dirs: list[str] | None, include_root_context: bool) -> bool:
-        """Emit strict-focus descendants while retaining ancestors only for traversal."""
-        if not focus_dirs or include_root_context:
-            return True
-        _ancestor, descendant_depth = self._focus_relationship(path, focus_dirs)
-        return descendant_depth is not None
-
-    def _within_explore_depth(
-        self,
-        path: Path,
-        *,
-        current_depth: int,
-        max_depth: int | None,
-        focus_dirs: list[str] | None,
-        include_root_context: bool,
-    ) -> bool:
-        """Apply absolute depth normally and focus-relative depth for focused maps."""
-        if max_depth is None:
-            return True
-        if not focus_dirs:
-            return current_depth <= max_depth
-        ancestor, descendant_depth = self._focus_relationship(path, focus_dirs)
-        if ancestor:
-            return True
-        if descendant_depth is not None:
-            return descendant_depth <= max_depth
-        if include_root_context and path.is_file() and path.parent == self.root_path:
-            return True
-        return False
-
-    def _get_file_symbol_data(
-        self, file_path: Path, max_symbols: int, symbol_types: list[str] | None = None
-    ) -> list[ExploreSymbol]:
-        """Return structured symbol skeleton data for a source file."""
-        cache_key = self._get_skeleton_cache_key(file_path, symbol_types)
-        if self._get_cached_symbols(cache_key) is None:
-            self._get_file_skeleton_enhanced(file_path, max_symbols, symbol_types)
-
-        symbols = self._get_cached_symbols(cache_key) or []
-        structured_symbols: list[ExploreSymbol] = []
-        for symbol in symbols[:max_symbols]:
-            signature = symbol.get("signature", "")
-            structured_symbols.append(
-                {
-                    "name": symbol.get("name") or self._extract_symbol_name(signature) or signature,
-                    "type": symbol.get("type") or self._infer_symbol_type(signature),
-                    "signature": signature,
-                    "doc": symbol.get("doc", ""),
-                }
-            )
-
-        if len(symbols) > max_symbols:
-            structured_symbols.append(
-                {
-                    "name": "...",
-                    "type": "truncated",
-                    "signature": f"... and {len(symbols) - max_symbols} more",
-                    "doc": "",
-                }
-            )
-
-        return structured_symbols
-
-    def _infer_symbol_type(self, signature: str) -> str:
-        """Infer a symbol type from a skeleton signature."""
-        if signature.startswith("class "):
-            return "class"
-        if signature.startswith(("def ", "async def ", "function ", "const ", "let ", "var ")):
-            return "function"
-        if signature.startswith("func "):
-            return "function"
-        if signature.startswith("type ") and " struct" in signature:
-            return "struct"
-        if signature.startswith("type ") and " interface" in signature:
-            return "interface"
-        return "symbol"
-
-    def _build_tree_recursive_enhanced(
-        self,
-        path: Path,
-        tree_lines: list[str],
-        prefix: str,
-        gitignore_patterns: IgnorePolicy,
-        current_depth: int,
-        max_depth: int | None,
-        include_symbols: bool,
-        focus_dirs: list[str] | None,
-        include_root_context: bool,
-        max_symbols_per_file: int,
-        symbol_types: list[str] | None,
-        is_last: bool = False,
-        entries: list[ExploreEntry] | None = None,
-        max_entries: int = 5000,
-    ) -> bool:
-        """Recursively build the tree representation with enhanced features."""
-        if self._should_exclude(path, gitignore_patterns):
-            return False
-
-        if not self._should_include_focused_path(path, focus_dirs, include_root_context):
-            return False
-
-        if not self._within_explore_depth(
-            path,
-            current_depth=current_depth,
-            max_depth=max_depth,
-            focus_dirs=focus_dirs,
-            include_root_context=include_root_context,
-        ):
-            return False
-
-        if path.is_dir() and not self._should_include_dir(path, focus_dirs):
-            return False
-
-        emit = self._should_emit_focused_path(path, focus_dirs, include_root_context)
-        if emit and entries is not None and len(entries) >= max_entries:
-            return True
-
-        if emit and entries is not None:
-            relative_path = "." if path == self.root_path else path.relative_to(self.root_path).as_posix()
-            entry: ExploreEntry = {
-                "path": relative_path,
-                "abs_path": str(path),
-                "name": path.name if path != self.root_path else self.root_path.name,
-                "kind": "directory" if path.is_dir() else "file",
-                "depth": current_depth,
-            }
-            language = LANGUAGE_MAP.get(path.suffix.lower()) if path.is_file() else None
-            if language:
-                entry["language"] = language
-            if path.is_file() and include_symbols and language:
-                entry["symbols"] = self._get_file_symbol_data(path, max_symbols_per_file, symbol_types)
-            entries.append(entry)
-
-        # Add current item
-        name = path.name if path != self.root_path else str(path)
-        connector = "└── " if is_last else "├── "
-
-        # For files, add skeleton if requested
-        if emit and path.is_file() and include_symbols and path.suffix.lower() in LANGUAGE_MAP:
-            skeleton = self._get_file_skeleton_enhanced(path, max_symbols_per_file, symbol_types)
-            if skeleton:
-                # Format with indented skeleton
-                if path == self.root_path:
-                    tree_lines.append(name)
-                else:
-                    tree_lines.append(prefix + connector + name)
-
-                # Add skeleton lines
-                for i, skel_line in enumerate(skeleton):
-                    is_last_skel = i == len(skeleton) - 1
-                    skel_prefix = prefix + ("    " if is_last else "│   ")
-                    skel_connector = "└── " if is_last_skel else "├── "
-                    tree_lines.append(skel_prefix + skel_connector + skel_line)
-            # No skeleton, just show filename
-            elif path == self.root_path:
-                tree_lines.append(name)
-            else:
-                tree_lines.append(prefix + connector + name)
-        # Directory or file without symbols
-        elif emit and path == self.root_path:
-            tree_lines.append(name)
-        elif emit:
-            tree_lines.append(prefix + connector + name)
-
-        # Only recurse into directories
-        if path.is_dir():
-            # Get children and sort them
-            try:
-                children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-                # Filter out excluded items
-                children = [c for c in children if not self._should_exclude(c, gitignore_patterns)]
-
-                for i, child in enumerate(children):
-                    is_last_child = i == len(children) - 1
-                    extension = "    " if is_last else "│   "
-                    new_prefix = prefix + extension if emit and path != self.root_path else prefix
-
-                    truncated = self._build_tree_recursive_enhanced(
-                        child,
-                        tree_lines,
-                        new_prefix,
-                        gitignore_patterns,
-                        current_depth + 1,
-                        max_depth,
-                        include_symbols,
-                        focus_dirs,
-                        include_root_context,
-                        max_symbols_per_file,
-                        symbol_types,
-                        is_last_child,
-                        entries,
-                        max_entries,
-                    )
-                    if truncated:
-                        return True
-            except PermissionError:
-                pass
-        return False
-
-    @staticmethod
-    def _python_visibility(name: str) -> str:
-        """Return conventional Python public/private visibility."""
-        return "private" if name.startswith("_") and not (name.startswith("__") and name.endswith("__")) else "public"
 
     @classmethod
-    def _inventory_visibility(cls, name: str, language: str, is_public: Any, is_exported: Any) -> str:
-        """Normalize language-specific visibility when ast-grep does not supply it."""
+    def _artifact_payload(
+        cls,
+        artifact: DeclarationArtifact,
+        *,
+        toolchain_id: str | None = None,
+    ) -> dict[str, Any]:
+        values: dict[str, Any] = {
+            "schema": _CACHE_ARTIFACT_SCHEMA,
+            "root_id": artifact.root_id,
+            "path": artifact.path,
+            "file_digest": artifact.file_digest,
+            "language": artifact.language,
+            "analyzer_id": artifact.analyzer_id,
+            "source_size": artifact.source_size,
+            "declarations": [cls._record_payload(item) for item in artifact.declarations],
+            "coverage": artifact.coverage.to_payload(),
+        }
+        if toolchain_id is not None:
+            values["toolchain"] = toolchain_id
+        return values
+
+    def _rebind_artifact(self, artifact: DeclarationArtifact, path: str) -> DeclarationArtifact:
+        if artifact.path == path:
+            return artifact
+        declarations = tuple(
+            DeclarationRecord(
+                root_id=self.root.id,
+                path=path,
+                file_digest=item.file_digest,
+                language=item.language,
+                analyzer_id=item.analyzer_id,
+                kind=item.kind,
+                name=item.name,
+                owner_chain=item.owner_chain,
+                qualified_name=item.qualified_name,
+                start=item.start,
+                end=item.end,
+                defining_start=item.defining_start,
+                defining_end=item.defining_end,
+                signature=item.signature,
+                visibility=item.visibility,
+                documentation=item.documentation,
+                parent_id=item.parent_id,
+                expandable=item.expandable,
+                symbol_id=item.symbol_id,
+            )
+            for item in artifact.declarations
+        )
+        coverage = artifact.coverage
+        if coverage.reasons:
+            coverage = coverage.model_copy(
+                update={
+                    "reasons": [
+                        reason.model_copy(update={"path": path}) if reason.path == artifact.path else reason
+                        for reason in coverage.reasons
+                    ]
+                }
+            )
+        return DeclarationArtifact(
+            root_id=self.root.id,
+            path=path,
+            file_digest=artifact.file_digest,
+            language=artifact.language,
+            analyzer_id=artifact.analyzer_id,
+            declarations=declarations,
+            coverage=coverage,
+            source_size=artifact.source_size,
+        )
+
+    def _decode_cached_artifact(
+        self,
+        payload: bytes,
+        captured_file: CapturedFile,
+        *,
+        analyzer_id: str,
+        toolchain_id: str,
+    ) -> DeclarationArtifact | None:
+        language = captured_file.language
+        if language not in {"python", "javascript", "typescript", "go"}:
+            return None
+        try:
+            value = json.loads(payload.decode("utf-8"))
+            if not isinstance(value, dict):
+                return None
+            required = {
+                "schema",
+                "root_id",
+                "path",
+                "file_digest",
+                "language",
+                "analyzer_id",
+                "toolchain",
+                "source_size",
+                "declarations",
+                "coverage",
+            }
+            if set(value) != required or value["schema"] != _CACHE_ARTIFACT_SCHEMA:
+                return None
+            if (
+                value["root_id"] != self.root.id
+                or value["file_digest"] != captured_file.digest
+                or value["language"] != captured_file.language
+                or value["analyzer_id"] != analyzer_id
+                or value["toolchain"] != toolchain_id
+                or value["source_size"] != captured_file.size
+                or not isinstance(value["path"], str)
+                or not isinstance(value["declarations"], list)
+            ):
+                return None
+            raw_declarations = value["declarations"]
+            declarations: list[DeclarationRecord] = []
+            fields = set(DeclarationRecord.__dataclass_fields__)
+            for raw in raw_declarations:
+                if not isinstance(raw, dict) or set(raw) != fields:
+                    return None
+                owner_chain = raw["owner_chain"]
+                if not isinstance(owner_chain, list) or any(not isinstance(item, str) for item in owner_chain):
+                    return None
+                if raw["root_id"] != self.root.id or raw["file_digest"] != captured_file.digest:
+                    return None
+                if raw["path"] != value["path"] or raw["language"] != captured_file.language:
+                    return None
+                if raw["analyzer_id"] != analyzer_id:
+                    return None
+                if not all(
+                    isinstance(raw[field], int) and not isinstance(raw[field], bool)
+                    for field in ("start", "end", "defining_start", "defining_end")
+                ):
+                    return None
+                if any(raw[field] < 0 for field in ("start", "end", "defining_start", "defining_end")):
+                    return None
+                declarations.append(
+                    DeclarationRecord(
+                        root_id=raw["root_id"],
+                        path=raw["path"],
+                        file_digest=raw["file_digest"],
+                        language=raw["language"],
+                        analyzer_id=raw["analyzer_id"],
+                        kind=raw["kind"],
+                        name=raw["name"],
+                        owner_chain=tuple(owner_chain),
+                        qualified_name=raw["qualified_name"],
+                        start=raw["start"],
+                        end=raw["end"],
+                        defining_start=raw["defining_start"],
+                        defining_end=raw["defining_end"],
+                        signature=raw["signature"],
+                        visibility=raw["visibility"],
+                        documentation=raw["documentation"],
+                        parent_id=raw["parent_id"],
+                        expandable=raw["expandable"],
+                        symbol_id=raw["symbol_id"],
+                    )
+                )
+            coverage = Coverage.model_validate(value["coverage"])
+            artifact = DeclarationArtifact(
+                root_id=self.root.id,
+                path=value["path"],
+                file_digest=captured_file.digest,
+                language=language,
+                analyzer_id=analyzer_id,
+                declarations=tuple(declarations),
+                coverage=coverage,
+                source_size=captured_file.size,
+            )
+            expected_order = sorted(
+                artifact.declarations,
+                key=lambda item: (
+                    item.start,
+                    item.end,
+                    item.defining_start,
+                    item.owner_chain,
+                    item.name,
+                    item.kind,
+                ),
+            )
+            if tuple(expected_order) != artifact.declarations:
+                return None
+            symbols = {item.symbol_id for item in declarations}
+            for item in declarations:
+                if item.end < item.start or item.defining_end < item.defining_start:
+                    return None
+                if item.parent_id is not None and item.parent_id not in symbols:
+                    return None
+                expected_id = symbol_digest(
+                    captured_file.digest,
+                    analyzer_id,
+                    item.language,
+                    item.kind,
+                    list(item.owner_chain),
+                    item.name,
+                    item.start,
+                    item.end,
+                )
+                if item.symbol_id != expected_id:
+                    return None
+            return self._rebind_artifact(artifact, captured_file.path)
+        except Exception:
+            return None
+
+    def _cache_for(self, enabled: bool) -> DerivedCache | None:
+        if not enabled:
+            return None
+        return self._cache if self._cache is not None else DerivedCache(self.root.id, enabled=True)
+
+    def _declarations_for(
+        self,
+        captured_file: CapturedFile,
+        *,
+        cache: DerivedCache | None = None,
+        geometry: _SourceGeometry | None = None,
+        budget: OperationBudget | None = None,
+    ) -> DeclarationArtifact:
+        if budget is not None:
+            budget.check_deadline()
+        owned_toolchain = self._active_toolchain is None
+        if owned_toolchain:
+            self._active_toolchain = self._observe_toolchain(budget=budget)
+        try:
+            if cache is None or captured_file.language not in {"python", "javascript", "typescript", "go"}:
+                return self.declarations_for(captured_file, geometry=geometry, budget=budget)
+            analyzer = self._analyzer_id(captured_file.language)
+            toolchain = self._toolchain_id()
+            key = cache.key(
+                _CACHE_ARTIFACT_SCHEMA,
+                "declarations",
+                captured_file.digest,
+                captured_file.language,
+                analyzer,
+                toolchain,
+            )
+            try:
+                encoded = cache.get(key, budget=budget)
+            except RepositoryError:
+                raise
+            except Exception:
+                encoded = None
+            if encoded is not None:
+                artifact = self._decode_cached_artifact(
+                    encoded,
+                    captured_file,
+                    analyzer_id=analyzer,
+                    toolchain_id=toolchain,
+                )
+                if artifact is not None:
+                    if budget is not None:
+                        budget.check_deadline()
+                    return artifact
+            artifact = self.declarations_for(captured_file, geometry=geometry, budget=budget)
+            try:
+                cache.put(
+                    key,
+                    canonical_bytes(self._artifact_payload(artifact, toolchain_id=toolchain)),
+                    budget=budget,
+                )
+            except RepositoryError:
+                raise
+            except Exception:
+                pass
+            return artifact
+        finally:
+            if owned_toolchain:
+                self._active_toolchain = None
+
+    # ------------------------------------------------------------------
+    # Capture and declaration artifacts
+
+    def _provider_for(self, paths: Iterable[str]) -> RepositoryProvider:
+        normalized = sorted(set(paths), key=lambda value: value.encode("utf-8"))
+        if not normalized:
+            raise _IndexerFailure("invalid_request", "read requires at least one target")
+        return RepositoryProvider(self.root, Selection(paths=normalized, exclusions="default"))
+
+    @staticmethod
+    def _target_path(target: ReadTarget) -> str:
+        return target.path
+
+    def _validate_target_roots(self, targets: Sequence[ReadTarget]) -> None:
+        for target in targets:
+            root_id = getattr(target, "root_id", None)
+            if root_id is not None and root_id != self.root.id:
+                raise _IndexerFailure(
+                    "invalid_reference",
+                    "reference root does not match the requested root",
+                    path=target.path,
+                    action="refresh_reference",
+                )
+
+    def _capture_targets(
+        self,
+        targets: Sequence[ReadTarget],
+        *,
+        budget: OperationBudget | None = None,
+    ) -> RepositoryCapture:
+        self._validate_target_roots(targets)
+        provider = self._provider_for(self._target_path(target) for target in targets)
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        try:
+            capture = provider.capture(
+                include_namespace=False,
+                budget=local_budget,
+                capture_domain=REGULAR_TEXT_DOMAIN,
+            )
+        except RepositoryError:
+            raise
+        if len(capture.files) != len({self._target_path(target) for target in targets}):
+            raise _IndexerFailure("source_changed", "captured target set does not contain every requested file")
+        return capture
+
+    @staticmethod
+    def _captured_text(captured: CapturedFile) -> str:
+        if not captured.is_text:
+            raise _IndexerFailure(
+                "invalid_encoding",
+                "exact reads require valid UTF-8 text without NUL bytes",
+                path=captured.path,
+                action="correct_input",
+            )
+        try:
+            return captured.content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _IndexerFailure("invalid_encoding", "captured source is not valid UTF-8", path=captured.path) from exc
+
+    def declarations_for(
+        self,
+        captured_file: CapturedFile,
+        *,
+        geometry: _SourceGeometry | None = None,
+        budget: OperationBudget | None = None,
+    ) -> DeclarationArtifact:
+        """Extract declarations from exactly ``captured_file.content``.
+
+        This method intentionally accepts a captured value rather than a path;
+        parsing it cannot observe or capture another source file.
+        """
+
+        if budget is not None:
+            budget.check_deadline()
+        relative = Path(captured_file.path).as_posix()
+        parts = Path(relative).parts
+        if (
+            not relative
+            or relative == "."
+            or Path(relative).is_absolute()
+            or "\\" in relative
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise _IndexerFailure(
+                "path_outside_root",
+                "captured declaration path is not a contained relative file",
+                path=captured_file.path,
+            )
+        if captured_file.language not in {"python", "javascript", "typescript", "go"}:
+            raise _IndexerFailure(
+                "unsupported_file", "captured file has no supported declaration language", path=captured_file.path
+            )
+        text = self._captured_text(captured_file)
+        geometry = geometry or _SourceGeometry.from_text(text, data=captured_file.content)
+        language = cast(str, captured_file.language)
+        analyzer_id = self._analyzer_id(language)
         if language == "python":
-            return cls._python_visibility(name)
+            raw, parse_diagnostic = self._python_declarations(text, geometry, budget=budget)
+        else:
+            raw, parse_diagnostic = self._tree_declarations(text, geometry, language, budget=budget)
+        declarations = self._materialize_declarations(captured_file, analyzer_id, raw, budget=budget)
+        if parse_diagnostic:
+            reason = CoverageReason(code="parse_diagnostics", path=captured_file.path)
+            coverage = Coverage(state="partial", basis="supported_declarations", reasons=[reason])
+        else:
+            coverage = Coverage(state="complete", basis="supported_declarations")
+        if budget is not None:
+            budget.check_deadline()
+        return DeclarationArtifact(
+            root_id=self.root.id,
+            path=captured_file.path,
+            file_digest=captured_file.digest,
+            language=language,
+            analyzer_id=analyzer_id,
+            declarations=declarations,
+            coverage=coverage,
+            source_size=captured_file.size,
+        )
+
+    def _materialize_declarations(
+        self,
+        captured_file: CapturedFile,
+        analyzer_id: str,
+        raw: Sequence[_RawDeclaration],
+        *,
+        budget: OperationBudget | None = None,
+    ) -> tuple[DeclarationRecord, ...]:
+        ordered = sorted(
+            raw,
+            key=lambda item: (
+                item.start,
+                item.end,
+                item.defining_start,
+                item.owner_chain,
+                item.name,
+                item.kind,
+            ),
+        )
+        records: list[DeclarationRecord] = []
+        by_qualified: dict[str, list[DeclarationRecord]] = {}
+        for item in ordered:
+            if budget is not None:
+                budget.check_deadline()
+            symbol_id = symbol_digest(
+                captured_file.digest,
+                analyzer_id,
+                item.language,
+                item.kind,
+                list(item.owner_chain),
+                item.name,
+                item.start,
+                item.end,
+            )
+            qualified = ".".join((*item.owner_chain, item.name))
+            parent_id: str | None = None
+            if item.owner_chain:
+                owner_name = ".".join(item.owner_chain)
+                parent_candidates = [
+                    record
+                    for record in by_qualified.get(owner_name, ())
+                    if record.start <= item.start and record.end >= item.end
+                ]
+                if parent_candidates:
+                    parent_id = min(
+                        parent_candidates,
+                        key=lambda record: (record.end - record.start, record.start, record.symbol_id),
+                    ).symbol_id
+            record = DeclarationRecord(
+                root_id=self.root.id,
+                path=captured_file.path,
+                file_digest=captured_file.digest,
+                language=item.language,
+                analyzer_id=analyzer_id,
+                kind=item.kind,
+                name=item.name,
+                owner_chain=item.owner_chain,
+                qualified_name=qualified,
+                start=item.start,
+                end=item.end,
+                defining_start=item.defining_start,
+                defining_end=item.defining_end,
+                signature=item.signature,
+                visibility=item.visibility,
+                documentation=item.documentation,
+                parent_id=parent_id,
+                expandable=item.expandable,
+                symbol_id=symbol_id,
+            )
+            records.append(record)
+            by_qualified.setdefault(qualified, []).append(record)
+        return tuple(records)
+
+    # ------------------------------------------------------------------
+    # Python declaration extraction
+
+    @staticmethod
+    def _python_visibility(name: str) -> Literal["public", "private"]:
+        return "private" if name.startswith("_") and not (name.startswith("__") and name.endswith("__")) else "public"
+
+    @staticmethod
+    def _python_node_bytes(node: ast.AST, geometry: _SourceGeometry) -> tuple[int, int]:
+        start_line = int(getattr(node, "lineno", 1))
+        start_col = int(getattr(node, "col_offset", 0))
+        end_line = int(getattr(node, "end_lineno", start_line))
+        end_col = int(getattr(node, "end_col_offset", start_col))
+        if (
+            start_line < 1
+            or end_line < start_line
+            or start_line > geometry.line_count
+            or end_line > geometry.line_count
+        ):
+            raise _IndexerFailure("unsupported_syntax", "Python declaration range is outside the captured source")
+        start = geometry.line_starts[start_line - 1] + start_col
+        end = geometry.line_starts[end_line - 1] + end_col
+        return start, end
+
+    @staticmethod
+    def _python_name_bytes(node: ast.AST, geometry: _SourceGeometry, start: int, end: int) -> tuple[int, int]:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            target = node.target if isinstance(node, ast.AnnAssign) else (node.targets[0] if node.targets else None)
+            if isinstance(target, ast.Name):
+                return XRayIndexer._python_node_bytes(target, geometry)
+        snippet = geometry.decode(start, end)
+        match = re.search(r"(?:async\s+def|def|class)\s+([\w]+)", snippet)
+        if match is None:
+            return start, min(end, start + len(node.__class__.__name__.encode("utf-8")))
+        name_start = start + len(snippet[: match.start(1)].encode("utf-8"))
+        name_end = name_start + len(match.group(1).encode("utf-8"))
+        return name_start, name_end
+
+    @staticmethod
+    def _python_signature(node: ast.AST, name: str, geometry: _SourceGeometry, start: int, end: int) -> str:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+            try:
+                value = f"{prefix} {name}({ast.unparse(node.args)})"
+                if node.returns is not None:
+                    value += f" -> {ast.unparse(node.returns)}"
+                return value + ":"
+            except Exception:
+                return geometry.decode(start, end).splitlines()[0].strip()
+        if isinstance(node, ast.ClassDef):
+            try:
+                bases = [ast.unparse(base) for base in node.bases]
+                bases.extend(ast.unparse(keyword) for keyword in node.keywords)
+                suffix = f"({', '.join(bases)})" if bases else ""
+                return f"class {name}{suffix}:"
+            except Exception:
+                return geometry.decode(start, end).splitlines()[0].strip()
+        return geometry.decode(start, end).splitlines()[0].strip()
+
+    def _python_declarations(
+        self,
+        text: str,
+        geometry: _SourceGeometry,
+        *,
+        budget: OperationBudget | None = None,
+    ) -> tuple[list[_RawDeclaration], bool]:
+        if budget is not None:
+            budget.check_deadline()
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return [], True
+        raw: list[_RawDeclaration] = []
+
+        def add(node: ast.AST, owners: tuple[str, ...], role: str) -> None:
+            if budget is not None:
+                budget.check_deadline()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = node.name
+                kind = "method" if owners and role == "member" else "function"
+                expandable = True
+                documentation = ast.get_docstring(node, clean=False)
+            elif isinstance(node, ast.ClassDef):
+                name = node.name
+                kind = "class"
+                expandable = True
+                documentation = ast.get_docstring(node, clean=False)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                name = node.target.id
+                kind = "field" if owners else "variable"
+                expandable = False
+                documentation = None
+            elif isinstance(node, ast.Assign):
+                targets = [target for target in node.targets if isinstance(target, ast.Name)]
+                if not targets:
+                    return
+                start, end = self._python_node_bytes(node, geometry)
+                for target in targets:
+                    name_value = target.id
+                    defining_start, defining_end = self._python_node_bytes(target, geometry)
+                    raw.append(
+                        _RawDeclaration(
+                            language="python",
+                            kind="field" if owners else "variable",
+                            name=name_value,
+                            owner_chain=owners,
+                            start=start,
+                            end=end,
+                            defining_start=defining_start,
+                            defining_end=defining_end,
+                            signature=geometry.decode(start, end).splitlines()[0].strip(),
+                            visibility=self._python_visibility(name_value),
+                            documentation=None,
+                            expandable=False,
+                        )
+                    )
+                return
+            else:
+                return
+            start, end = self._python_node_bytes(node, geometry)
+            defining_start, defining_end = self._python_name_bytes(node, geometry, start, end)
+            raw.append(
+                _RawDeclaration(
+                    language="python",
+                    kind=kind,
+                    name=name,
+                    owner_chain=owners,
+                    start=start,
+                    end=end,
+                    defining_start=defining_start,
+                    defining_end=defining_end,
+                    signature=self._python_signature(node, name, geometry, start, end),
+                    visibility=self._python_visibility(name),
+                    documentation=documentation,
+                    expandable=expandable,
+                )
+            )
+
+        def visit_statement(node: ast.stmt, owners: tuple[str, ...], in_function: bool) -> None:
+            if budget is not None:
+                budget.check_deadline()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                role = "member" if owners and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else "item"
+                add(node, owners, role)
+                child_owners = (*owners, node.name)
+                child_in_function = in_function or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                for child in node.body:
+                    visit_statement(child, child_owners, child_in_function)
+                return
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and not in_function:
+                add(node, owners, "member" if owners else "item")
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.stmt):
+                    visit_statement(child, owners, in_function)
+
+        for statement in tree.body:
+            visit_statement(statement, (), False)
+        if budget is not None:
+            budget.check_deadline()
+        return raw, False
+
+    # ------------------------------------------------------------------
+    # ast-grep declaration extraction for JavaScript, TypeScript and Go
+
+    @staticmethod
+    def _node_kind(node: Any) -> str:
+        try:
+            return str(node.kind())
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _node_parent(node: Any) -> Any | None:
+        try:
+            return node.parent()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _node_field(node: Any, field: str) -> Any | None:
+        try:
+            return node.field(field)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _node_text(node: Any) -> str:
+        try:
+            return str(node.text())
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _node_range(node: Any, geometry: _SourceGeometry) -> tuple[int, int]:
+        try:
+            value = node.range()
+            return geometry.char_index_to_byte(int(value.start.index)), geometry.char_index_to_byte(
+                int(value.end.index)
+            )
+        except Exception as exc:
+            raise _IndexerFailure("unsupported_syntax", "parser returned an invalid declaration range") from exc
+
+    @staticmethod
+    def _tree_declaration_kinds(language: str) -> set[str]:
+        if language == "javascript":
+            return {
+                "class_declaration",
+                "function_declaration",
+                "method_definition",
+                "variable_declarator",
+                "property_definition",
+            }
+        if language == "typescript":
+            return {
+                "abstract_class_declaration",
+                "class_declaration",
+                "function_declaration",
+                "method_definition",
+                "method_signature",
+                "variable_declarator",
+                "property_definition",
+                "public_field_definition",
+                "interface_declaration",
+                "property_signature",
+                "type_alias_declaration",
+                "enum_declaration",
+                "enum_member",
+                "internal_module",
+            }
+        return {
+            "type_spec",
+            "field_declaration",
+            "function_declaration",
+            "method_declaration",
+            "const_spec",
+            "var_spec",
+        }
+
+    @staticmethod
+    def _tree_is_owner(node: Any, language: str) -> bool:
+        kind = XRayIndexer._node_kind(node)
+        if language in {"javascript", "typescript"}:
+            return (
+                kind
+                in {
+                    "abstract_class_declaration",
+                    "class_declaration",
+                    "function_declaration",
+                    "method_definition",
+                    "interface_declaration",
+                    "internal_module",
+                    "enum_declaration",
+                    "variable_declarator",
+                }
+                and XRayIndexer._node_name(node, language) is not None
+            )
+        return kind in {"type_spec", "function_declaration", "method_declaration"}
+
+    @staticmethod
+    def _node_name(node: Any, language: str) -> tuple[str, Any] | None:
+        value = XRayIndexer._node_field(node, "name")
+        if value is not None:
+            text = XRayIndexer._node_text(value)
+            if text and re.fullmatch(r"[\w$#]+", text, flags=re.UNICODE):
+                return text, value
+        kind = XRayIndexer._node_kind(node)
+        if language == "go" and kind == "field_declaration":
+            for child in getattr(node, "children", lambda: [])():
+                if XRayIndexer._node_kind(child) == "field_identifier":
+                    text = XRayIndexer._node_text(child)
+                    if text:
+                        return text, child
+        return None
+
+    @staticmethod
+    def _tree_kind(node: Any, language: str) -> str:
+        kind = XRayIndexer._node_kind(node)
+        if kind in {"class_declaration", "abstract_class_declaration"}:
+            return "class"
+        if kind in {"function_declaration"}:
+            return "function"
+        if kind in {"method_definition", "method_signature", "method_declaration"}:
+            return "method"
+        if kind in {"interface_declaration"}:
+            return "interface"
+        if kind in {"type_alias_declaration", "type_spec"}:
+            type_node = XRayIndexer._node_field(node, "type")
+            type_kind = XRayIndexer._node_kind(type_node) if type_node is not None else ""
+            if language == "go" and type_kind in {"struct_type", "interface_type"}:
+                return "struct" if type_kind == "struct_type" else "interface"
+            return "type"
+        if kind in {"enum_declaration"}:
+            return "enum"
+        if kind in {"enum_member"}:
+            return "enum_member"
+        if kind in {"property_signature", "property_definition", "public_field_definition", "field_declaration"}:
+            return "field"
+        if kind in {"const_spec"}:
+            return "constant"
+        if kind in {"var_spec", "variable_declarator"}:
+            value = XRayIndexer._node_field(node, "value")
+            value_kind = XRayIndexer._node_kind(value) if value is not None else ""
+            return "function" if value_kind in {"arrow_function", "function", "function_expression"} else "variable"
+        return "symbol"
+
+    @staticmethod
+    def _tree_expandable(kind: str) -> bool:
+        return kind in {"class", "function", "method", "interface", "struct", "enum", "type"}
+
+    @staticmethod
+    def _tree_visibility(node: Any, name: str, language: str) -> Literal["public", "private", "unknown"]:
         if language == "go":
             return "public" if name[:1].isupper() else "private"
-        if language in {"javascript", "typescript"} and name.startswith("#"):
+        if name.startswith("#"):
             return "private"
-        if is_public is True:
-            return "public"
-        if is_public is False:
-            return "private"
-        if language in {"javascript", "typescript"} and is_exported is True:
-            return "public"
+        parent = XRayIndexer._node_parent(node)
+        for _ in range(8):
+            if parent is None:
+                break
+            if XRayIndexer._node_kind(parent) == "export_statement":
+                return "public"
+            parent = XRayIndexer._node_parent(parent)
         return "unknown"
 
     @staticmethod
-    def _python_function_signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
-        prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
-        signature = f"{prefix} {node.name}({ast.unparse(node.args)})"
-        if node.returns is not None:
-            signature += f" -> {ast.unparse(node.returns)}"
-        return f"{signature}:"
+    def _tree_owner_chain(node: Any, language: str) -> tuple[str, ...]:
+        owners: list[str] = []
+        parent = XRayIndexer._node_parent(node)
+        while parent is not None:
+            if XRayIndexer._tree_is_owner(parent, language):
+                info = XRayIndexer._node_name(parent, language)
+                if info is not None:
+                    owners.append(info[0])
+            parent = XRayIndexer._node_parent(parent)
+        if language == "go" and XRayIndexer._node_kind(node) == "method_declaration":
+            receiver = None
+            try:
+                children = node.children()
+            except Exception:
+                children = []
+            for child in children:
+                if XRayIndexer._node_kind(child) != "parameter_list":
+                    continue
+                for parameter in getattr(child, "children", lambda: [])():
+                    type_node = XRayIndexer._node_field(parameter, "type")
+                    if type_node is not None:
+                        receiver = XRayIndexer._node_text(type_node).lstrip("*")
+                        break
+                if receiver:
+                    break
+            if receiver:
+                owners.insert(0, receiver)
+        owners.reverse()
+        return tuple(owners)
 
     @staticmethod
-    def _python_class_signature(node: ast.ClassDef) -> str:
-        arguments = [ast.unparse(base) for base in node.bases]
-        arguments.extend(ast.unparse(keyword) for keyword in node.keywords)
-        suffix = f"({', '.join(arguments)})" if arguments else ""
-        return f"class {node.name}{suffix}:"
+    def _tree_exported(node: Any) -> bool:
+        parent = XRayIndexer._node_parent(node)
+        for _ in range(8):
+            if parent is None:
+                return False
+            if XRayIndexer._node_kind(parent) == "export_statement":
+                return True
+            parent = XRayIndexer._node_parent(parent)
+        return False
 
-    def _python_interface_symbol(self, node: ast.AST, *, role: str) -> dict[str, Any] | None:
-        """Project one Python definition without retaining implementation bodies."""
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            name = node.name
-            signature = self._python_function_signature(node)
-            symbol_type = "method" if role == "member" else "function"
-            members: list[dict[str, Any]] = []
-        elif isinstance(node, ast.ClassDef):
-            name = node.name
-            signature = self._python_class_signature(node)
-            symbol_type = "class"
-            members = [
-                symbol
-                for child in node.body
-                if (symbol := self._python_interface_symbol(child, role="member")) is not None
-            ]
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            name = node.target.id
-            signature = f"{name}: {ast.unparse(node.annotation)}"
-            symbol_type = "field"
-            members = []
-        else:
-            return None
-        return {
-            "name": name,
-            "type": symbol_type,
-            "signature": signature,
-            "start_line": int(getattr(node, "lineno", 1)),
-            "end_line": int(getattr(node, "end_lineno", getattr(node, "lineno", 1))),
-            "visibility": self._python_visibility(name),
-            "role": role,
-            "documentation": ast.get_docstring(node, clean=False)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-            else None,
-            "members": members,
-        }
+    @staticmethod
+    def _tree_signature(node: Any, geometry: _SourceGeometry, start: int, end: int) -> str:
+        text = geometry.decode(start, end).strip()
+        if "{" in text:
+            return text[: text.find("{")].rstrip()
+        return text.splitlines()[0].strip() if text.splitlines() else text
 
-    def _python_interface(self, target_path: Path) -> tuple[list[dict[str, Any]], list[str]]:
-        """Parse a Python file into ordered top-level contracts and direct class members."""
-        try:
-            source = target_path.read_text(encoding="utf-8")
-            tree = ast.parse(source, filename=str(target_path))
-        except (OSError, UnicodeError, SyntaxError) as exc:
-            raise InterfaceReadError("parse_error", f"Could not parse Python interface: {exc}") from exc
-        symbols = [
-            symbol for node in tree.body if (symbol := self._python_interface_symbol(node, role="item")) is not None
-        ]
-        return symbols, []
-
-    def _outline_interface_symbol(self, item: Mapping[str, Any], warnings: list[str]) -> dict[str, Any] | None:
-        """Preserve upstream outline hierarchy for non-Python languages."""
-        name = item.get("name")
-        if not isinstance(name, str) or not name:
-            warnings.append("An upstream outline item had no name and was omitted.")
-            return None
-        range_data = item.get("range")
-        start = range_data.get("start", {}) if isinstance(range_data, Mapping) else {}
-        end = range_data.get("end", {}) if isinstance(range_data, Mapping) else {}
-        signature = item.get("signature")
-        if not isinstance(signature, str) or not signature:
-            signature = name
-            warnings.append(f"Signature for '{name}' was incomplete in ast-grep outline output.")
-        members = item.get("members")
-        structured_members = (
-            [
-                structured
-                for member in members
-                if isinstance(members, list) and isinstance(member, Mapping)
-                if (structured := self._outline_interface_symbol(member, warnings)) is not None
-            ]
-            if isinstance(members, list)
-            else []
-        )
-        is_public = item.get("isPublic")
-        return {
-            "name": name,
-            "type": str(item.get("symbolType") or "symbol"),
-            "signature": signature,
-            "start_line": self._normalize_ast_grep_line(start.get("line") if isinstance(start, Mapping) else None),
-            "end_line": self._normalize_ast_grep_line(end.get("line") if isinstance(end, Mapping) else None),
-            "visibility": "public" if is_public is True else "private" if is_public is False else "unknown",
-            "role": str(item.get("role") or "item"),
-            "documentation": None,
-            "members": structured_members,
-        }
-
-    def _outline_interface(self, target_path: Path) -> tuple[list[dict[str, Any]], list[str]]:
-        warnings: list[str] = []
-        try:
-            result = run_ast_grep(["outline", "--json=compact", "--view=expanded", str(target_path)])
-            outlines = parse_json_array(result.stdout)
-        except (AstGrepCommandError, AstGrepNotFoundError, json.JSONDecodeError, ValueError) as exc:
-            raise InterfaceReadError("upstream_error", f"ast-grep interface extraction failed: {exc}") from exc
-        symbols: list[dict[str, Any]] = []
-        for outline in outlines:
-            items = outline.get("items")
-            if not isinstance(items, list):
-                continue
-            for item in items:
-                if isinstance(item, Mapping):
-                    structured = self._outline_interface_symbol(item, warnings)
-                    if structured is not None:
-                        symbols.append(structured)
-        if not symbols:
-            warnings.append("No interface symbols were reported for this supported file.")
-        return symbols, warnings
-
-    def read_interface_structured(
+    def _tree_declarations(
         self,
-        file_path: str,
+        text: str,
+        geometry: _SourceGeometry,
+        language: str,
         *,
-        symbol_names: Sequence[str] | None = None,
-        visibility: Sequence[str] | None = None,
-        symbol_types: Sequence[str] | None = None,
-        member_depth: int | None = 1,
-        max_symbols: int | None = 50,
-        max_members: int | None = 20,
-        exact_symbol: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Return a bounded, filterable hierarchical interface contract."""
-        bounds = (("member_depth", member_depth), ("max_symbols", max_symbols), ("max_members", max_members))
-        for label, value in bounds:
-            if value is not None and value < 0:
-                raise InterfaceReadError("invalid_bound", f"{label} must be 0 or greater.")
+        budget: OperationBudget | None = None,
+    ) -> tuple[list[_RawDeclaration], bool]:
+        if budget is not None:
+            budget.check_deadline()
         try:
-            target_path = self._resolve_file_inside_root(file_path)
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise InterfaceReadError("path_outside_root", str(exc)) from exc
-        if not target_path.exists() or not target_path.is_file():
-            raise InterfaceReadError("not_found", f"File '{file_path}' was not found or is not a file.")
-        language = LANGUAGE_MAP.get(target_path.suffix.lower())
-        if language is None:
-            raise InterfaceReadError("unsupported_file", f"File type '{target_path.suffix}' is not supported.")
-        try:
-            size = target_path.stat().st_size
-        except OSError as exc:
-            raise InterfaceReadError("read_error", f"Could not inspect '{file_path}': {exc}") from exc
-        if size > MAX_SKELETON_FILE_BYTES:
-            raise InterfaceReadError("file_too_large", f"File '{file_path}' exceeds {MAX_SKELETON_FILE_BYTES} bytes.")
-        if language == "python":
-            symbols, warnings = self._python_interface(target_path)
-        else:
-            symbols, warnings = self._outline_interface(target_path)
-        warning_details: list[dict[str, Any]] = [
-            {"code": "source_incomplete", "message": warning} for warning in warnings
-        ]
-        if exact_symbol is not None:
-            target_name = str(exact_symbol.get("name") or "")
-            owner_name = str(exact_symbol.get("owner") or "").split(".")[-1]
-            target_line = exact_symbol.get("start_line")
-            if not target_name:
-                raise InterfaceReadError("invalid_symbol", "exact_symbol.name must be non-empty.")
-
-            def select_member(items: list[dict[str, Any]], depth: int = 0) -> dict[str, Any] | None:
-                for item in items:
-                    if str(item.get("name")) == target_name and (
-                        not isinstance(target_line, int) or target_line < 1 or item.get("start_line") == target_line
-                    ):
-                        return dict(item) if depth == 0 else {**item, "members": []}
-                    members = item.get("members")
-                    if isinstance(members, list):
-                        selected = select_member(members, depth + 1)
-                        if selected is not None:
-                            return {**item, "members": [selected]}
-                return None
-
-            candidate_items = symbols
-            if owner_name:
-                candidate_items = [item for item in symbols if str(item.get("name")) == owner_name]
-            selected = select_member(candidate_items)
-            if selected is None:
-                raise InterfaceReadError(
-                    "symbol_not_found", f"Exact symbol '{target_name}' was not found in interface '{file_path}'."
-                )
-            symbols = [selected]
-        names = {value for value in symbol_names or ()}
-        visibilities = {value.lower() for value in visibility or ()}
-        types = {value.lower() for value in symbol_types or ()}
-        if visibilities - {"public", "private", "unknown"}:
-            raise InterfaceReadError("invalid_filter", "visibility filters must be public, private, or unknown.")
-        symbols = [
-            symbol
-            for symbol in symbols
-            if (not names or str(symbol.get("name")) in names)
-            and (not visibilities or str(symbol.get("visibility", "unknown")).lower() in visibilities)
-            and (not types or str(symbol.get("type", "symbol")).lower() in types)
-        ]
-        complete = not warnings
-        total_symbols = len(symbols)
-        if max_symbols is not None and len(symbols) > max_symbols:
-            symbols = symbols[:max_symbols]
-            complete = False
-            message = f"Interface symbols truncated at {max_symbols} of {total_symbols} top-level symbols."
-            warnings.append(message)
-            warning_details.append({"code": "symbol_truncated", "message": message})
-
-        def bound_members(items: list[dict[str, Any]], depth: int, top_level: str | None = None) -> None:
-            nonlocal complete
-            for symbol in items:
-                current_top_level = top_level or str(symbol.get("name", ""))
-                members = symbol.get("members")
-                if not isinstance(members, list):
-                    symbol["members"] = []
-                    continue
-                if member_depth is not None and depth >= member_depth:
-                    if members:
-                        complete = False
-                        message = f"Members for '{symbol.get('name', '')}' truncated at depth {member_depth}."
-                        warnings.append(message)
-                        warning_details.append(
-                            {
-                                "code": "member_truncated",
-                                "message": message,
-                                "symbol": str(symbol.get("name", "")),
-                                "top_level": current_top_level,
-                            }
-                        )
-                    symbol["members"] = []
-                    continue
-                if max_members is not None and len(members) > max_members:
-                    complete = False
-                    message = f"Members for '{symbol.get('name', '')}' truncated at {max_members} of {len(members)}."
-                    warnings.append(message)
-                    warning_details.append(
-                        {
-                            "code": "member_truncated",
-                            "message": message,
-                            "symbol": str(symbol.get("name", "")),
-                            "top_level": current_top_level,
-                        }
-                    )
-                    members = members[:max_members]
-                    symbol["members"] = members
-                bound_members(members, depth + 1, current_top_level)
-
-        bound_members(symbols, 0)
-        return {
-            "path": target_path.relative_to(self.root_path).as_posix(),
-            "language": language,
-            "symbols": symbols,
-            "complete": complete,
-            "total_symbols": total_symbols,
-            "returned_symbols": len(symbols),
-            "exact_symbol_selected": exact_symbol is not None,
-            "warnings": warnings,
-            "warning_details": warning_details,
-        }
-
-    @staticmethod
-    def render_interface(interface: Mapping[str, Any]) -> str:
-        """Render a structured interface hierarchy without implementation bodies."""
-        lines: list[str] = []
-
-        def append_symbols(symbols: Any, depth: int) -> None:
-            if not isinstance(symbols, list):
-                return
-            for symbol in symbols:
-                if not isinstance(symbol, Mapping):
-                    continue
-                lines.append(f"{'    ' * depth}{symbol.get('signature', symbol.get('name', ''))}")
-                documentation = symbol.get("documentation")
-                if isinstance(documentation, str) and documentation:
-                    for line in documentation.splitlines():
-                        lines.append(f"{'    ' * (depth + 1)}# {line}")
-                append_symbols(symbol.get("members"), depth + 1)
-
-        append_symbols(interface.get("symbols"), 0)
-        return "\n".join(lines) if lines else "No symbols found in file."
-
-    def read_interface(self, file_path: str) -> str:
-        """Preserve the legacy string interface projection and string errors."""
-        try:
-            return self.render_interface(
-                self.read_interface_structured(
-                    file_path,
-                    member_depth=None,
-                    max_symbols=None,
-                    max_members=None,
+            root = SgRoot(text, language).root()
+            nodes = [
+                node
+                for node in root.find_all(pattern="$A")
+                if self._node_kind(node) in self._tree_declaration_kinds(language)
+            ]
+            all_nodes = list(root.find_all(pattern="$A"))
+            parse_diagnostic = any(self._node_kind(node) == "ERROR" for node in all_nodes)
+        except Exception:
+            return [], True
+        raw: list[_RawDeclaration] = []
+        seen: set[tuple[str, str, int, int, int, int]] = set()
+        for node in nodes:
+            if budget is not None:
+                budget.check_deadline()
+            info = self._node_name(node, language)
+            if info is None:
+                continue
+            name, name_node = info
+            kind = self._tree_kind(node, language)
+            start, end = self._node_range(node, geometry)
+            parent = self._node_parent(node)
+            if self._node_kind(node) == "variable_declarator" and self._node_kind(parent) in {
+                "lexical_declaration",
+                "variable_declaration",
+            }:
+                start, end = self._node_range(parent, geometry)
+            elif self._node_kind(node) in {"type_spec", "const_spec", "var_spec"} and self._node_kind(parent) in {
+                "type_declaration",
+                "const_declaration",
+                "var_declaration",
+            }:
+                start, end = self._node_range(parent, geometry)
+            defining_start, defining_end = self._node_range(name_node, geometry)
+            key = (kind, name, start, end, defining_start, defining_end)
+            if key in seen:
+                continue
+            seen.add(key)
+            owners = self._tree_owner_chain(node, language)
+            visibility = self._tree_visibility(node, name, language)
+            if language in {"javascript", "typescript"} and self._tree_exported(node):
+                visibility = "public"
+            raw.append(
+                _RawDeclaration(
+                    language=language,
+                    kind=kind,
+                    name=name,
+                    owner_chain=owners,
+                    start=start,
+                    end=end,
+                    defining_start=defining_start,
+                    defining_end=defining_end,
+                    signature=self._tree_signature(node, geometry, start, end),
+                    visibility=visibility,
+                    documentation=None,
+                    expandable=self._tree_expandable(kind),
                 )
             )
-        except InterfaceReadError as exc:
-            return f"Error reading interface: {exc}"
+        if budget is not None:
+            budget.check_deadline()
+        return raw, parse_diagnostic
 
-    def read_symbol(
+    def _capture_namespace(
         self,
-        symbol: Mapping[str, Any],
+        selection: Selection,
+        *,
+        budget: OperationBudget | None = None,
+        horizon: NamespaceHorizon | Mapping[str, Any] | None = None,
+    ) -> RepositoryCapture:
+        """Capture namespace metadata without reading selected source bodies."""
+        provider = RepositoryProvider(self.root, selection)
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        rules_cache: dict[str, Any] = {}
+        namespace, _files, _directories, config = provider._collect_namespace(
+            budget=local_budget,
+            rules_cache=rules_cache,
+            horizon=horizon,
+        )
+        manifest = provider._manifest(namespace=namespace, config=config, sources=(), budget=local_budget)
+        return RepositoryCapture(namespace, manifest)
+
+    @staticmethod
+    def _path_is_descendant(path: str, parent: str) -> bool:
+        return path == parent or (parent == "." and path != ".") or path.startswith(f"{parent}/")
+
+    @staticmethod
+    def _namespace_parts(path: str) -> tuple[str, ...]:
+        return () if path == "." else tuple(path.split("/"))
+
+    @classmethod
+    def _ancestor_paths(cls, path: str) -> tuple[str, ...]:
+        parts = cls._namespace_parts(path)
+        return tuple("/".join(parts[:index]) or "." for index in range(1, len(parts) + 1))
+
+    def _map_projection(
+        self,
+        capture: RepositoryCapture,
+        query: Any,
+        *,
+        budget: OperationBudget | None = None,
+    ) -> _MapProjection:
+        if capture.namespace is None:
+            raise _IndexerFailure("internal_error", "map capture did not include namespace metadata")
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        focus_specs = tuple(
+            (parts, len(parts)) for scope in tuple(query.focus) for parts in (self._namespace_parts(scope),)
+        )
+        ancestor_membership = frozenset(
+            ancestor for scope in tuple(query.focus) for ancestor in self._ancestor_paths(scope)
+        )
+        finite_depth = query.depth != "all"
+        depth = int(query.depth) if finite_depth else None
+        projected: list[_MapRow] = []
+        for entry in capture.namespace.entries:
+            local_budget.check_deadline()
+            if entry.path == ".":
+                continue
+            entry_parts = self._namespace_parts(entry.path)
+            best_distance: int | None = None
+            for scope_parts, scope_depth in focus_specs:
+                if entry_parts[:scope_depth] != scope_parts:
+                    continue
+                distance = len(entry_parts) - scope_depth
+                if best_distance is None or distance < best_distance:
+                    best_distance = distance
+            if best_distance is None:
+                if query.context != "ancestors" or entry.path not in ancestor_membership:
+                    continue
+                frontier = False
+            elif depth is not None and best_distance > depth:
+                continue
+            else:
+                frontier = bool(depth is not None and entry.kind == "directory" and best_distance == depth)
+            row_id = digest(
+                [
+                    _MAP_ROW_SCHEMA,
+                    entry.path,
+                    entry.kind,
+                    entry.language,
+                    frontier,
+                ]
+            )
+            projected.append(_MapRow(entry=entry, frontier=frontier, row_id=row_id))
+        return _MapProjection(projected)
+
+    def _map_items(
+        self,
+        capture: RepositoryCapture,
+        query: Any,
+        *,
+        budget: OperationBudget | None = None,
+    ) -> list[MapItem]:
+        projection = self._map_projection(capture, query, budget=budget)
+        return list(projection)
+
+    @staticmethod
+    def _map_row_id(item: MapItem) -> str:
+        return digest(
+            [
+                _MAP_ROW_SCHEMA,
+                item.path,
+                item.kind,
+                item.language,
+                bool(item.frontier),
+            ]
+        )
+
+    def _capture_sources(
+        self,
+        selection: Selection | None,
+        *,
+        capture_domain: CaptureDomain = SUPPORTED_SOURCE_DOMAIN,
+        budget: OperationBudget | None = None,
+    ) -> RepositoryCapture:
+        provider = RepositoryProvider(self.root, selection)
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        return provider.capture(
+            include_namespace=False,
+            budget=local_budget,
+            capture_domain=capture_domain,
+        )
+
+    @staticmethod
+    def _coverage_for_artifacts(
+        artifacts: Iterable[DeclarationArtifact],
+        *,
+        non_text: Iterable[str] = (),
+    ) -> Coverage:
+        reasons: list[CoverageReason] = []
+        for artifact in artifacts:
+            if artifact.coverage.state == "partial":
+                reasons.extend(artifact.coverage.reasons or [])
+        reasons.extend(CoverageReason(code="non_text_input", path=path) for path in non_text)
+        unique = {(reason.code, reason.path or "", reason.count or 0): reason for reason in reasons}
+        if not unique:
+            return Coverage(state="complete", basis="supported_declarations")
+        ordered = sorted(
+            unique.values(),
+            key=lambda reason: (reason.code.encode("utf-8"), (reason.path or "").encode("utf-8"), reason.count or 0),
+        )
+        return Coverage(state="partial", basis="supported_declarations", reasons=ordered)
+
+    def _validate_cursor_identity(
+        self,
+        page_cursor: str,
+        *,
+        op: Literal["map", "find", "interface", "search", "impact", "read"],
+        query_digest: str,
+        selection: str,
+        snapshot: str,
+        toolchain: str,
+    ) -> RepositoryCursor:
+        """Decode a cursor and apply the shared identity precedence.
+
+        Cursor shape is validated before semantic identity. Operation/root
+        differences are query mismatches, while a changed captured/toolchain
+        identity is stale. The checkpoint is intentionally left to each
+        projection because membership is the final validation step.
+        """
+
+        try:
+            cursor = decode_cursor(page_cursor)
+        except Exception as exc:
+            raise _IndexerFailure("invalid_cursor", "cursor is malformed", action="restart_query") from exc
+        if cursor is None:
+            raise _IndexerFailure("invalid_cursor", "cursor is malformed", action="restart_query")
+        if cursor.op != op or cursor.root != self.root.id:
+            raise _IndexerFailure("cursor_query_mismatch", "cursor does not match this request", action="restart_query")
+        if cursor.selection != selection or cursor.snapshot != snapshot or cursor.toolchain != toolchain:
+            raise _IndexerFailure(
+                "stale_cursor",
+                "cursor does not match the captured source set",
+                action="restart_query",
+            )
+        if cursor.query != query_digest:
+            raise _IndexerFailure("cursor_query_mismatch", "cursor does not match this request", action="restart_query")
+        return cursor
+
+    def _seek_collection(
+        self,
+        page_cursor: str | None,
+        *,
+        op: Literal["map", "find", "interface"],
+        query_digest: str,
+        capture: RepositoryCapture,
+        row_ids: Sequence[str],
+        budget: OperationBudget | None = None,
+    ) -> int:
+        if budget is not None:
+            budget.check_deadline()
+        if page_cursor is None:
+            return 0
+        cursor = self._validate_cursor_identity(
+            page_cursor,
+            op=op,
+            query_digest=query_digest,
+            selection=capture.manifest.selection_digest,
+            snapshot=capture.manifest.snapshot_digest,
+            toolchain=self._toolchain_id(),
+        )
+        checkpoint = cursor.checkpoint
+        expected_kind = {"map": "namespace", "find": "rank", "interface": "interface"}[op]
+        if checkpoint.kind != expected_kind:
+            raise _IndexerFailure("invalid_cursor", "cursor has the wrong checkpoint kind", action="restart_query")
+        after = getattr(checkpoint, "after", None)
+        if after is None:
+            raise _IndexerFailure(
+                "invalid_cursor",
+                "cursor checkpoint does not identify a result row",
+                action="restart_query",
+            )
+        for index, row_id in enumerate(row_ids):
+            if budget is not None:
+                budget.check_deadline()
+            if row_id == after:
+                return index + 1
+        raise _IndexerFailure(
+            "invalid_cursor",
+            "cursor checkpoint does not identify a result row",
+            action="restart_query",
+        )
+
+    def _collection_result(
+        self,
+        *,
+        op: Literal["map", "find", "interface"],
+        capture: RepositoryCapture,
+        provenance: RepositoryProvenance,
+        coverage: Coverage,
+        page: Any,
+        rows: Sequence[Any],
+        start: int,
+        row_ids: Sequence[str],
+        data_factory: Any,
+        owners: Sequence[InterfaceOwner] | None = None,
+        budget: OperationBudget | None = None,
+    ) -> Success:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        remaining = max(len(rows) - start, 0)
+        requested = min(page.limit, remaining)
+        checkpoint_kind = {"map": "namespace", "find": "rank", "interface": "interface"}[op]
+
+        def cursor_for(after: str) -> str:
+            return encode_cursor(
+                RepositoryCursor(
+                    version=1,
+                    op=op,
+                    root=self.root.id,
+                    query=provenance.query,
+                    selection=provenance.selection,
+                    snapshot=provenance.snapshot,
+                    toolchain=self._toolchain_id(),
+                    checkpoint=cast(Any, {"kind": checkpoint_kind, "after": after}),
+                )
+            )
+
+        def build(values: Sequence[Any], next_cursor: str | None) -> Success:
+            local_budget.check_deadline()
+            data = data_factory(list(values), owners)
+            page_result = (
+                PageResult(total=len(rows))
+                if next_cursor is None
+                else PageResult(next_cursor=next_cursor, total=len(rows))
+            )
+            return Success(
+                schema="xray.v1",
+                ok=True,
+                op=op,
+                root=capture.root,
+                scope=capture.selection,
+                provenance=provenance,
+                data=data,
+                page=page_result,
+                coverage=coverage,
+            )
+
+        if requested == 0:
+            result = build([], None)
+            minimum = len(canonical_bytes(result))
+            if minimum <= page.max_bytes:
+                return result
+            raise _IndexerFailure(
+                "budget_too_small",
+                f"{op} result cannot fit the requested byte budget (minimum {minimum} bytes)",
+                action="narrow_query",
+            )
+
+        values: list[Any] = []
+        row_sizes: list[int] = []
+        for offset in range(requested):
+            local_budget.check_deadline()
+            value = rows[start + offset]
+            values.append(value)
+            row_sizes.append(len(canonical_bytes(value)))
+
+        terminal_base = len(canonical_bytes(build([], None)))
+        placeholder_cursor = cursor_for("0" * 64)
+        continuation_base = len(canonical_bytes(build([], placeholder_cursor)))
+        best = 0
+        accumulated = 0
+        for count, row_size in enumerate(row_sizes, start=1):
+            local_budget.check_deadline()
+            accumulated += row_size
+            base = terminal_base if start + count == len(rows) else continuation_base
+            candidate_size = base + accumulated + count - 1
+            if candidate_size <= page.max_bytes:
+                best = count
+
+        if best == 0:
+            minimum = len(canonical_bytes(build([values[0]], cursor_for(row_ids[start]))))
+            raise _IndexerFailure(
+                "budget_too_small",
+                f"{op} result cannot fit the requested byte budget (minimum {minimum} bytes)",
+                action="narrow_query",
+            )
+
+        while best > 0:
+            local_budget.check_deadline()
+            next_cursor = None if start + best >= len(rows) else cursor_for(row_ids[start + best - 1])
+            result = build(values[:best], next_cursor)
+            if len(canonical_bytes(result)) <= page.max_bytes:
+                return result
+            best -= 1
+        raise _IndexerFailure(
+            "budget_too_small",
+            f"{op} result cannot fit the requested byte budget",
+            action="narrow_query",
+        )
+
+    @staticmethod
+    def _find_match(
+        text: str,
+        declaration: DeclarationRecord,
+        *,
+        match: str,
+    ) -> tuple[str, int] | None:
+        query = text
+        folded = query.casefold()
+        qualified = declaration.qualified_name
+        name = declaration.name
+        path_contexts = {
+            f"{declaration.path}:{qualified}",
+            f"{declaration.path}::{qualified}",
+            f"{declaration.path}/{qualified}",
+        }
+        if query == qualified:
+            return "exact_qualified_name", 700
+        if query == name:
+            return "exact_name", 680
+        if query in path_contexts:
+            return "exact_path_context", 670
+        if match == "exact":
+            return None
+        if folded == qualified.casefold() or folded == name.casefold():
+            return "normalized_name", 560
+        if qualified.startswith(query) or name.startswith(query):
+            return "prefix", 460
+        name_tokens = set(re.findall(r"[A-Za-z0-9_$]+", qualified))
+        if query in name_tokens or folded in {token.casefold() for token in name_tokens}:
+            return "token", 360
+        if match != "fuzzy":
+            return None
+        if folded and all(character in qualified.casefold() for character in folded):
+            return "fuzzy", 260
+        return None
+
+    @staticmethod
+    def _find_sort_key(candidate: _FindCandidate) -> tuple[Any, ...]:
+        precedence = {
+            "exact_qualified_name": 0,
+            "exact_name": 1,
+            "exact_path_context": 2,
+            "normalized_name": 3,
+            "prefix": 4,
+            "token": 5,
+            "fuzzy": 6,
+        }
+        declaration = candidate.declaration
+        return (
+            -candidate.rank,
+            precedence[candidate.match_kind],
+            declaration.qualified_name.encode("utf-8"),
+            declaration.qualified_name,
+            declaration.path.encode("utf-8"),
+            declaration.start,
+            declaration.end,
+            declaration.symbol_id,
+            candidate.row_id,
+        )
+
+    def _find_items(
+        self,
+        capture: RepositoryCapture,
+        query: Any,
+        *,
+        cache: DerivedCache | None,
+        budget: OperationBudget | None = None,
+    ) -> tuple[Sequence[FindItem], Coverage]:
+        local_budget = budget or OperationBudget()
+        candidates: list[_FindCandidate] = []
+        artifacts: list[DeclarationArtifact] = []
+        non_text: list[str] = []
+        geometries: dict[str, _SourceGeometry] = {}
+        total_declarations = 0
+        for captured in capture.files:
+            local_budget.check_deadline()
+            if captured.language not in {"python", "javascript", "typescript", "go"}:
+                continue
+            if not captured.is_text:
+                non_text.append(captured.path)
+                continue
+            geometry = _SourceGeometry.from_text(self._captured_text(captured), data=captured.content)
+            geometries[captured.path] = geometry
+            artifact = self._declarations_for(captured, cache=cache, geometry=geometry, budget=local_budget)
+            artifacts.append(artifact)
+            total_declarations += len(artifact.declarations)
+            if total_declarations > _MAX_FIND_DECLARATIONS:
+                raise _IndexerFailure(
+                    "analysis_limit",
+                    "find declaration population exceeds the bounded limit",
+                    action="narrow_query",
+                )
+            if len(artifact.declarations) > _MAX_FIND_CANDIDATES_PER_FILE:
+                raise _IndexerFailure(
+                    "analysis_limit",
+                    "find candidates per file exceed the bounded limit",
+                    path=captured.path,
+                )
+            for declaration in artifact.declarations:
+                local_budget.check_deadline()
+                if query.kinds is not None and declaration.kind not in query.kinds:
+                    continue
+                if query.visibility is not None and declaration.visibility not in query.visibility:
+                    continue
+                match = self._find_match(query.text, declaration, match=query.match)
+                if match is None:
+                    continue
+                match_kind, rank = match
+                row_id = find_row_digest(
+                    declaration.path,
+                    declaration.start,
+                    declaration.end,
+                    declaration.symbol_id,
+                )
+                candidates.append(_FindCandidate(declaration, cast(Any, match_kind), rank, row_id))
+        candidates.sort(key=self._find_sort_key)
+        row_ids = [candidate.row_id for candidate in candidates]
+        if len(row_ids) != len(set(row_ids)):
+            raise _IndexerFailure("internal_error", "find row identities are not unique")
+        local_budget.check_deadline()
+        return _FindProjection(candidates, geometries), self._coverage_for_artifacts(artifacts, non_text=non_text)
+
+    @staticmethod
+    def _python_tokens(
+        text: str,
+        geometry: _SourceGeometry,
+        node: ast.AST,
+    ) -> tuple[tuple[Any, int, int], ...]:
+        import io
+        import tokenize
+
+        start, end = XRayIndexer._python_node_bytes(node, geometry)
+        start_char = geometry.byte_index_to_char(start)
+        end_char = geometry.byte_index_to_char(end)
+
+        def absolute(line: int, column: int) -> int:
+            if line < 1 or line > geometry.line_count:
+                return -1
+            line_char = geometry.byte_index_to_char(geometry.line_starts[line - 1])
+            return line_char + column
+
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+            values: list[tuple[Any, int, int]] = []
+            for token in tokens:
+                token_start = absolute(*token.start)
+                token_end = absolute(*token.end)
+                if token_start < start_char or token_end > end_char or token_end < token_start:
+                    continue
+                if token.type in {
+                    tokenize.ENCODING,
+                    tokenize.ENDMARKER,
+                    tokenize.INDENT,
+                    tokenize.DEDENT,
+                    tokenize.NL,
+                    tokenize.NEWLINE,
+                    tokenize.COMMENT,
+                }:
+                    continue
+                values.append((token, token_start, token_end))
+            return tuple(values)
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            return ()
+
+    @staticmethod
+    def _python_alias_spans(
+        text: str,
+        geometry: _SourceGeometry,
+        node: ast.Import | ast.ImportFrom,
+    ) -> tuple[tuple[ast.alias, int, int], ...]:
+        tokens = XRayIndexer._python_tokens(text, geometry, node)
+        if not tokens:
+            return ()
+        import_index = next(
+            (index for index, (token, _start, _end) in enumerate(tokens) if token.string == "import"), None
+        )
+        if import_index is None:
+            return ()
+        cursor = import_index + 1
+        values: list[tuple[ast.alias, int, int]] = []
+        for alias in node.names:
+            parts = ["*"] if alias.name == "*" else alias.name.split(".")
+            match_start: int | None = None
+            match_end: int | None = None
+            position = cursor
+            for part_index, part in enumerate(parts):
+                while position < len(tokens) and tokens[position][0].string in {"(", ")", ","}:
+                    position += 1
+                if position >= len(tokens) or tokens[position][0].string != part:
+                    match_start = None
+                    break
+                if match_start is None:
+                    match_start = tokens[position][1]
+                match_end = tokens[position][2]
+                position += 1
+                if part_index + 1 < len(parts):
+                    if position >= len(tokens) or tokens[position][0].string != ".":
+                        match_start = None
+                        break
+                    position += 1
+            if match_start is None or match_end is None:
+                return ()
+            if alias.asname is not None:
+                while position < len(tokens) and tokens[position][0].string == "as":
+                    position += 1
+                    break
+                if position >= len(tokens) or tokens[position][0].string != alias.asname:
+                    return ()
+                match_end = tokens[position][2]
+                position += 1
+            values.append((alias, match_start, match_end))
+            cursor = position
+        return tuple(values)
+
+    @staticmethod
+    def _observation_span(
+        geometry: _SourceGeometry,
+        start_char: int,
+        end_char: int,
+    ) -> tuple[int, int]:
+        return geometry.char_index_to_byte(start_char), geometry.char_index_to_byte(end_char)
+
+    @staticmethod
+    def _contained_span(
+        span: tuple[int, int],
+        containers: Iterable[tuple[int, int]],
+    ) -> bool:
+        start, end = span
+        return any(container_start <= start and end <= container_end for container_start, container_end in containers)
+
+    @staticmethod
+    def _python_observations(text: str, geometry: _SourceGeometry) -> list[_SyntaxObservation]:
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return []
+        observations: list[_SyntaxObservation] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            aliases = XRayIndexer._python_alias_spans(text, geometry, node)
+            if not aliases:
+                continue
+            module = None if isinstance(node, ast.Import) else "." * node.level + (node.module or "")
+            for alias, start_char, end_char in aliases:
+                start, end = XRayIndexer._observation_span(geometry, start_char, end_char)
+                observations.append(
+                    _SyntaxObservation(
+                        section="imports",
+                        start=start,
+                        end=end,
+                        module_text=module or alias.name,
+                        imported_name=alias.name,
+                        local_name=alias.asname,
+                    )
+                )
+        return observations
+
+    @staticmethod
+    def _tree_string_value(node: Any) -> str | None:
+        if node is None:
+            return None
+        for child in getattr(node, "children", lambda: [])():
+            if XRayIndexer._node_kind(child) in {"string_fragment", "interpreted_string_literal_content"}:
+                return XRayIndexer._node_text(child)
+        value = XRayIndexer._node_text(node)
+        if len(value) >= _MIN_QUOTED_STRING_LENGTH and value[0] in {"'", '"', "`"} and value[-1] == value[0]:
+            return value[1:-1]
+        return value or None
+
+    @staticmethod
+    def _tree_descendants(node: Any) -> Iterable[Any]:
+        for child in getattr(node, "children", lambda: [])():
+            yield child
+            yield from XRayIndexer._tree_descendants(child)
+
+    def _tree_observations(self, text: str, geometry: _SourceGeometry, language: str) -> list[_SyntaxObservation]:
+        try:
+            root = SgRoot(text, language).root()
+            statements = [
+                node
+                for node in root.find_all(pattern="$A")
+                if self._node_kind(node) in {"import_statement", "import_declaration", "export_statement"}
+            ]
+        except Exception:
+            return []
+        observations: list[_SyntaxObservation] = []
+
+        def span(node: Any) -> tuple[int, int]:
+            return self._node_range(node, geometry)
+
+        def add_import(statement: Any) -> None:
+            module = self._tree_string_value(self._node_field(statement, "source"))
+            clause = next(
+                (
+                    child
+                    for child in getattr(statement, "children", lambda: [])()
+                    if self._node_kind(child) == "import_clause"
+                ),
+                None,
+            )
+            if clause is None:
+                start, end = span(statement)
+                observations.append(_SyntaxObservation("imports", start, end, module_text=module))
+                return
+            emitted = False
+            for child in getattr(clause, "children", lambda: [])():
+                kind = self._node_kind(child)
+                if kind == "identifier":
+                    start, end = span(child)
+                    observations.append(
+                        _SyntaxObservation(
+                            "imports",
+                            start,
+                            end,
+                            module_text=module,
+                            imported_name="default",
+                            local_name=self._node_text(child),
+                        )
+                    )
+                    emitted = True
+                elif kind == "namespace_import":
+                    local = next(
+                        (
+                            grandchild
+                            for grandchild in getattr(child, "children", lambda: [])()
+                            if self._node_kind(grandchild) == "identifier"
+                        ),
+                        None,
+                    )
+                    start, end = span(child)
+                    observations.append(
+                        _SyntaxObservation(
+                            "imports",
+                            start,
+                            end,
+                            module_text=module,
+                            imported_name="*",
+                            local_name=self._node_text(local) if local is not None else None,
+                        )
+                    )
+                    emitted = True
+                elif kind == "named_imports":
+                    for specifier in getattr(child, "children", lambda: [])():
+                        if self._node_kind(specifier) != "import_specifier":
+                            continue
+                        imported = self._node_field(specifier, "name")
+                        alias = self._node_field(specifier, "alias")
+                        start, end = span(specifier)
+                        observations.append(
+                            _SyntaxObservation(
+                                "imports",
+                                start,
+                                end,
+                                module_text=module,
+                                imported_name=self._node_text(imported) if imported is not None else None,
+                                local_name=self._node_text(alias) if alias is not None else None,
+                            )
+                        )
+                        emitted = True
+            if not emitted:
+                start, end = span(statement)
+                observations.append(_SyntaxObservation("imports", start, end, module_text=module))
+
+        def add_export(statement: Any) -> None:
+            module = self._tree_string_value(self._node_field(statement, "source"))
+            children = list(getattr(statement, "children", lambda: [])())
+            descendants = [*children, *self._tree_descendants(statement)]
+            if any(
+                self._node_kind(node) in {"namespace_export", "namespace_export_clause", "wildcard_export"}
+                or (
+                    self._node_text(node) == "*"
+                    and self._node_kind(node) not in {"comment", "line_comment", "block_comment"}
+                )
+                for node in descendants
+            ):
+                start, end = span(statement)
+                observations.append(_SyntaxObservation("exports", start, end, module_text=module, kind="star"))
+                return
+            for child in children:
+                kind = self._node_kind(child)
+                if kind == "export_clause":
+                    for specifier in getattr(child, "children", lambda: [])():
+                        if self._node_kind(specifier) != "export_specifier":
+                            continue
+                        name_node = self._node_field(specifier, "name")
+                        alias_node = self._node_field(specifier, "alias")
+                        start, end = span(specifier)
+                        observations.append(
+                            _SyntaxObservation(
+                                "exports",
+                                start,
+                                end,
+                                module_text=module,
+                                name=(
+                                    self._node_text(alias_node)
+                                    if alias_node is not None
+                                    else self._node_text(name_node) or None
+                                ),
+                                kind="reexport" if module is not None else "named",
+                            )
+                        )
+                    return
+                if kind == "namespace_export":
+                    start, end = span(child)
+                    observations.append(_SyntaxObservation("exports", start, end, module_text=module, kind="star"))
+                    return
+                if kind in {"function_declaration", "class_declaration", "lexical_declaration", "variable_declaration"}:
+                    name = None
+                    for descendant in (child, *self._tree_descendants(child)):
+                        info = self._node_name(descendant, language)
+                        if info is not None:
+                            name = info[0]
+                            break
+                    start, end = span(statement)
+                    observations.append(
+                        _SyntaxObservation(
+                            "exports",
+                            start,
+                            end,
+                            module_text=module,
+                            name=name,
+                            kind="default" if any(self._node_kind(item) == "default" for item in children) else "named",
+                        )
+                    )
+                    return
+            start, end = span(statement)
+            observations.append(
+                _SyntaxObservation(
+                    "exports",
+                    start,
+                    end,
+                    module_text=module,
+                    kind="default" if any(self._node_kind(item) == "default" for item in children) else "unknown",
+                )
+            )
+
+        for statement in statements:
+            if self._node_kind(statement) in {"import_statement", "import_declaration"}:
+                if language in {"javascript", "typescript"}:
+                    add_import(statement)
+                else:
+                    for specifier in self._tree_descendants(statement):
+                        if self._node_kind(specifier) != "import_spec":
+                            continue
+                        path_node = self._node_field(specifier, "path")
+                        alias_node = self._node_field(specifier, "name")
+                        start, end = span(specifier)
+                        observations.append(
+                            _SyntaxObservation(
+                                "imports",
+                                start,
+                                end,
+                                module_text=self._tree_string_value(path_node) or "",
+                                local_name=self._node_text(alias_node) if alias_node is not None else None,
+                            )
+                        )
+            elif language in {"javascript", "typescript"}:
+                add_export(statement)
+        observations.sort(key=lambda item: (_SECTION_ORDER[item.section], item.start, item.end, item.name or ""))
+        return observations
+
+    def _observations(
+        self,
+        captured_file: CapturedFile,
+        geometry: _SourceGeometry,
+    ) -> list[_SyntaxObservation]:
+        text = self._captured_text(captured_file)
+        if captured_file.language == "python":
+            return self._python_observations(text, geometry)
+        if captured_file.language in {"javascript", "typescript", "go"}:
+            return self._tree_observations(text, geometry, captured_file.language)
+        return []
+
+    def _interface_observation_items(
+        self,
+        captured_file: CapturedFile,
+        geometry: _SourceGeometry,
+        sections: Sequence[str],
+    ) -> list[Import | Export]:
+        selected = set(sections)
+        values: list[Import | Export] = []
+        for observation in self._observations(captured_file, geometry):
+            if observation.section not in selected:
+                continue
+            occurrence = OccurrenceRef(
+                kind="occurrence",
+                root_id=self.root.id,
+                path=captured_file.path,
+                file_digest=captured_file.digest,
+                start=observation.start,
+                end=observation.end,
+                occurrence_id=occurrence_digest(
+                    captured_file.path,
+                    captured_file.digest,
+                    observation.start,
+                    observation.end,
+                ),
+            )
+            if observation.section == "imports":
+                import_values: dict[str, Any] = {
+                    "section": "imports",
+                    "ref": occurrence,
+                    "module_text": observation.module_text or "",
+                }
+                if observation.imported_name is not None:
+                    import_values["imported_name"] = observation.imported_name
+                if observation.local_name is not None:
+                    import_values["local_name"] = observation.local_name
+                values.append(Import(**import_values))
+            else:
+                export_values: dict[str, Any] = {
+                    "section": "exports",
+                    "ref": occurrence,
+                    "kind": observation.kind,
+                }
+                if observation.name is not None:
+                    export_values["name"] = observation.name
+                if observation.module_text is not None:
+                    export_values["module_text"] = observation.module_text
+                values.append(Export(**export_values))
+        values.sort(
+            key=lambda item: (
+                _SECTION_ORDER[item.section],
+                item.ref.start,
+                item.ref.end,
+                item.ref.occurrence_id,
+            )
+        )
+        return values
+
+    @staticmethod
+    def _interface_row_id(item: Any) -> str:
+        if isinstance(item, Declaration):
+            return digest(
+                [
+                    "xray.interface.row.v1",
+                    "symbols",
+                    item.ref.path,
+                    item.ref.start,
+                    item.ref.end,
+                    item.ref.symbol_id,
+                ]
+            )
+        return digest(
+            [
+                "xray.interface.row.v1",
+                item.section,
+                item.ref.path,
+                item.ref.start,
+                item.ref.end,
+                item.ref.occurrence_id,
+            ]
+        )
+
+    @staticmethod
+    def _declaration_value(record: DeclarationRecord, *, documentation: bool) -> Declaration:
+        signature, signature_clipped = XRayIndexer._clip_text(record.signature, 2048)
+        documentation_value: str | None = None
+        documentation_clipped = False
+        if documentation and record.documentation is not None:
+            documentation_value, documentation_clipped = XRayIndexer._clip_text(record.documentation, 512)
+        values: dict[str, Any] = {
+            "section": "symbols",
+            "ref": record.ref,
+            "name": record.name,
+            "kind": record.kind,
+            "qualified_name": record.qualified_name,
+            "signature": signature,
+            "visibility": record.visibility,
+        }
+        if record.parent_id is not None:
+            values["parent_id"] = record.parent_id
+        if record.expandable:
+            values["expandable"] = True
+        if documentation_value is not None:
+            values["documentation"] = documentation_value
+        clipped: list[Literal["signature", "documentation", "text", "captures"]] = []
+        if signature_clipped:
+            clipped.append("signature")
+        if documentation_clipped:
+            clipped.append("documentation")
+        if clipped:
+            values["disclosure"] = Disclosure(clipped=clipped)
+        return Declaration(**values)
+
+    def _owner_values(self, artifact: DeclarationArtifact, record: DeclarationRecord) -> list[InterfaceOwner]:
+        by_id = {item.symbol_id: item for item in artifact.declarations}
+        chain: list[DeclarationRecord] = []
+        parent_id = record.parent_id
+        while parent_id is not None and parent_id in by_id:
+            parent = by_id[parent_id]
+            chain.append(parent)
+            parent_id = parent.parent_id
+        chain.reverse()
+        return [InterfaceOwner(ref=item.ref, name=item.name, kind=item.kind) for item in chain]
+
+    def _interface_file_rows(
+        self,
+        captured_file: CapturedFile,
+        query: InterfaceFileQuery,
+        *,
+        cache: DerivedCache | None,
+        budget: OperationBudget | None = None,
+    ) -> tuple[list[Any], Coverage]:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        if not captured_file.is_text:
+            return [], Coverage(
+                state="partial",
+                basis="supported_declarations",
+                reasons=[CoverageReason(code="non_text_input", path=captured_file.path)],
+            )
+        geometry = _SourceGeometry.from_text(self._captured_text(captured_file), data=captured_file.content)
+        artifact = self._declarations_for(captured_file, cache=cache, geometry=geometry, budget=local_budget)
+        declarations = list(artifact.declarations)
+        seeds = declarations
+        if query.kinds is not None:
+            seeds = [item for item in seeds if item.kind in query.kinds]
+        if query.visibility is not None:
+            seeds = [item for item in seeds if item.visibility in query.visibility]
+        seed_ids = {item.symbol_id for item in seeds}
+        selected_ids = set(seed_ids)
+        if query.member_depth == 1:
+            selected_ids.update(item.symbol_id for item in declarations if item.parent_id in seed_ids)
+        declaration_items = [
+            self._declaration_value(item, documentation=query.documentation)
+            for item in declarations
+            if item.symbol_id in selected_ids
+        ]
+        observations = self._interface_observation_items(captured_file, geometry, query.sections)
+        values: list[Any] = []
+        if "symbols" in query.sections:
+            values.extend(declaration_items)
+        values.extend(item for item in observations if item.section in query.sections)
+        values.sort(
+            key=lambda item: (
+                _SECTION_ORDER[item.section],
+                item.ref.start,
+                item.ref.end,
+                item.ref.symbol_id if isinstance(item, Declaration) else item.ref.occurrence_id,
+            )
+        )
+        local_budget.check_deadline()
+        coverage = self._coverage_for_artifacts([artifact])
+        return values, coverage
+
+    def _interface_symbol_rows(
+        self,
+        capture: RepositoryCapture,
+        query: InterfaceSymbolQuery,
+        *,
+        cache: DerivedCache | None,
+        budget: OperationBudget | None = None,
+    ) -> tuple[list[Any], list[InterfaceOwner] | None, Coverage]:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        if query.sections != ["symbols"]:
+            raise _IndexerFailure("invalid_request", "exact symbol interfaces permit only the symbols section")
+        ref = query.target
+        if ref.root_id != self.root.id:
+            raise _IndexerFailure("invalid_reference", "symbol reference is outside the captured root", path=ref.path)
+        captured = self._captured_map(capture).get(ref.path)
+        if captured is None:
+            raise _IndexerFailure("invalid_reference", "symbol reference file was not captured", path=ref.path)
+        geometry = _SourceGeometry.from_text(self._captured_text(captured), data=captured.content)
+        artifact = self._declarations_for(captured, cache=cache, geometry=geometry, budget=local_budget)
+        record = self.resolve_symbol(capture, ref, artifact=artifact, geometry=geometry, budget=local_budget)
+        values = [self._declaration_value(record, documentation=query.documentation)]
+        owners: list[InterfaceOwner] | None = None
+        if record.expandable and query.member_depth == 1:
+            values.extend(
+                self._declaration_value(item, documentation=query.documentation)
+                for item in artifact.declarations
+                if item.parent_id == record.symbol_id
+            )
+        elif not record.expandable:
+            owners = self._owner_values(artifact, record)
+        values.sort(key=lambda item: (item.ref.start, item.ref.end, item.ref.symbol_id))
+        local_budget.check_deadline()
+        return values, owners, self._coverage_for_artifacts([artifact])
+
+    @staticmethod
+    def _coverage_for_reasons(
+        basis: Literal["pattern_matches", "rule_diagnostics", "literal_occurrences", "name_occurrences"],
+        reasons: Iterable[CoverageReason],
+    ) -> Coverage:
+        unique = {(item.code, item.path or "", item.count or 0): item for item in reasons}
+        if not unique:
+            return Coverage(state="complete", basis=basis)
+        ordered = sorted(
+            unique.values(),
+            key=lambda item: (
+                item.code.encode("utf-8"),
+                (item.path or "").encode("utf-8"),
+                item.count or 0,
+            ),
+        )
+        return Coverage(state="partial", basis=basis, reasons=ordered)
+
+    @staticmethod
+    def _source_ref_for(
+        root_id: str,
+        captured: CapturedFile,
+        start: int,
+        end: int,
+    ) -> SourceRef:
+        return SourceRef(
+            kind="source",
+            root_id=root_id,
+            path=captured.path,
+            file_digest=captured.digest,
+            start=start,
+            end=end,
+        )
+
+    def _occurrence_ref_for(self, captured: CapturedFile, start: int, end: int) -> OccurrenceRef:
+        return OccurrenceRef(
+            kind="occurrence",
+            root_id=self.root.id,
+            path=captured.path,
+            file_digest=captured.digest,
+            start=start,
+            end=end,
+            occurrence_id=occurrence_digest(captured.path, captured.digest, start, end),
+        )
+
+    @staticmethod
+    def _search_row_digest(item: SearchItem) -> str:
+        return digest(
+            [
+                "xray.search.row.v1",
+                item.ref.path,
+                item.ref.start,
+                item.ref.end,
+                item.ref.occurrence_id,
+                item.rule_id,
+                [capture.to_payload() for capture in item.captures or ()],
+            ]
+        )
+
+    @staticmethod
+    def _impact_row_digest(item: ImpactItem) -> str:
+        return digest(
+            [
+                "xray.impact.row.v1",
+                item.ref.path,
+                item.ref.start,
+                item.ref.end,
+                item.kind,
+                item.evidence,
+                item.ref.occurrence_id,
+            ]
+        )
+
+    @staticmethod
+    def _captured_result_path(value: Any, files: Mapping[str, CapturedFile]) -> str:
+        if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+            raise _IndexerFailure("internal_error", "ast-grep returned an invalid captured path")
+        try:
+            path = PurePosixPath(value)
+        except Exception as exc:
+            raise _IndexerFailure("internal_error", "ast-grep returned an invalid captured path") from exc
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            raise _IndexerFailure("internal_error", "ast-grep returned a non-contained captured path")
+        normalized = path.as_posix()
+        if normalized not in files:
+            raise _IndexerFailure("internal_error", "ast-grep returned a path outside the captured source set")
+        return normalized
+
+    @staticmethod
+    def _ast_grep_records(result: Any) -> tuple[list[dict[str, Any]], bool]:
+        if isinstance(result, AstGrepResult):
+            try:
+                return parse_json_array(result.stdout), True
+            except Exception as exc:
+                raise _IndexerFailure("internal_error", "ast-grep returned malformed JSON") from exc
+        if isinstance(result, BoundedAstGrepResult):
+            if not result.complete:
+                raise _IndexerFailure("execution_limit", "ast-grep did not complete its bounded result")
+            if not result.total_exact:
+                return [dict(item) for item in result.matches], False
+            return [dict(item) for item in result.matches], True
+        raise _IndexerFailure("internal_error", "ast-grep returned an unsupported result value")
+
+    @staticmethod
+    def _ast_grep_failure(error: AstGrepError) -> _IndexerFailure:
+        status = getattr(error, "status", "")
+        if status == "validation_failed":
+            code = "invalid_pattern"
+            action = "correct_input"
+        elif status == "not_found":
+            code = "dependency_unavailable"
+            action = "install_dependency"
+        elif status == "timeout":
+            code = "timeout"
+            action = "narrow_query"
+        elif status == "cancelled":
+            code = "execution_limit"
+            action = "narrow_query"
+        elif status in {"stdout_overflow", "stderr_overflow", "huge_line", "temporary_overflow"}:
+            code = "execution_limit"
+            action = "narrow_query"
+        else:
+            code = "internal_error"
+            action = "report_bug"
+        return _IndexerFailure(code, str(error), action=action)
+
+    @staticmethod
+    def _record_range(
+        record: Mapping[str, Any],
+        captured: CapturedFile,
+        geometry: _SourceGeometry,
+    ) -> tuple[int, int, str]:
+        value = record.get("range")
+        if not isinstance(value, Mapping):
+            raise _IndexerFailure("internal_error", "ast-grep match has no byte range", path=captured.path)
+        byte_range = value.get("byteOffset")
+        if not isinstance(byte_range, Mapping):
+            raise _IndexerFailure("internal_error", "ast-grep match has no byte offsets", path=captured.path)
+        start = byte_range.get("start")
+        end = byte_range.get("end")
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, int)
+            or not isinstance(end, int)
+            or start < 0
+            or end < start
+        ):
+            raise _IndexerFailure("internal_error", "ast-grep match has an invalid byte range", path=captured.path)
+        XRayIndexer._validate_interval(start, end, geometry, path=captured.path)
+        text = record.get("text")
+        if not isinstance(text, str) or geometry.decode(start, end) != text:
+            raise _IndexerFailure(
+                "internal_error",
+                "ast-grep match text does not verify against captured bytes",
+                path=captured.path,
+            )
+        return start, end, text
+
+    @staticmethod
+    def _range_value(
+        value: Any,
+        captured: CapturedFile,
+        geometry: _SourceGeometry,
+    ) -> tuple[int, int, str] | None:
+        if not isinstance(value, Mapping):
+            return None
+        byte_range = value.get("range")
+        if not isinstance(byte_range, Mapping):
+            return None
+        offsets = byte_range.get("byteOffset")
+        text = value.get("text")
+        if not isinstance(offsets, Mapping) or not isinstance(text, str):
+            return None
+        start, end = offsets.get("start"), offsets.get("end")
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, int)
+            or not isinstance(end, int)
+            or start < 0
+            or end < start
+            or end > len(geometry.data)
+            or not geometry.is_boundary(start)
+            or not geometry.is_boundary(end)
+        ):
+            return None
+        if geometry.decode(start, end) != text:
+            return None
+        return start, end, text
+
+    def _capture_values(
+        self,
+        raw: Mapping[str, Any],
+        captured: CapturedFile,
+        geometry: _SourceGeometry,
+    ) -> tuple[tuple[Capture, ...], bool]:
+        values = raw.get("metaVariables")
+        if not isinstance(values, Mapping):
+            return (), True
+        output: list[Capture] = []
+        verified = True
+        for kind_key, kind in (("single", "single"), ("multi", "multi"), ("transformed", "transformed")):
+            entries = values.get(kind_key, {})
+            if not isinstance(entries, Mapping):
+                verified = False
+                continue
+            for name in sorted(entries, key=lambda item: str(item).encode("utf-8")):
+                if not isinstance(name, str) or not name:
+                    verified = False
+                    continue
+                item = entries[name]
+                if kind == "multi":
+                    if not isinstance(item, Sequence) or isinstance(item, (str, bytes, bytearray)):
+                        verified = False
+                        continue
+                    refs: list[SourceRef] = []
+                    for candidate in item:
+                        value = self._range_value(candidate, captured, geometry)
+                        if value is None:
+                            verified = False
+                            continue
+                        start, end, _text = value
+                        refs.append(self._source_ref_for(self.root.id, captured, start, end))
+                    output.append(Capture(name=name, kind="multi", refs=refs))
+                    continue
+                if kind == "single":
+                    value = self._range_value(item, captured, geometry)
+                    if value is None:
+                        verified = False
+                        continue
+                    start, end, text = value
+                    output.append(
+                        Capture(
+                            name=name,
+                            kind="single",
+                            refs=[self._source_ref_for(self.root.id, captured, start, end)],
+                            text=text,
+                        )
+                    )
+                    continue
+                transformed_text: str | None = None
+                if isinstance(item, Mapping):
+                    candidate = item.get("text")
+                    if isinstance(candidate, str):
+                        transformed_text = candidate
+                elif isinstance(item, str):
+                    transformed_text = item
+                if transformed_text is None:
+                    verified = False
+                    continue
+                output.append(Capture(name=name, kind="transformed", text=transformed_text))
+        return tuple(output), verified
+
+    @staticmethod
+    def _selected_files(
+        capture: RepositoryCapture,
+        *,
+        language: str | None = None,
+        budget: OperationBudget | None = None,
+    ) -> tuple[list[CapturedFile], list[CoverageReason]]:
+        files: list[CapturedFile] = []
+        reasons: list[CoverageReason] = []
+        for captured in capture.files:
+            if budget is not None:
+                budget.check_deadline()
+            if language is not None and captured.language != language:
+                continue
+            files.append(captured)
+            if not captured.is_text or captured.has_nul:
+                reasons.append(CoverageReason(code="non_text_input", path=captured.path))
+        return files, reasons
+
+    def _file_cursor_start(
+        self,
+        cursor_value: str | None,
+        *,
+        op: Literal["search", "impact"],
+        query_digest: str,
+        capture: RepositoryCapture,
+        eligible: Sequence[CapturedFile],
+        snapshot: str,
+        budget: OperationBudget | None = None,
+    ) -> tuple[int, str | None]:
+        if budget is not None:
+            budget.check_deadline()
+        if cursor_value is None:
+            return (0, None)
+        cursor = self._validate_cursor_identity(
+            cursor_value,
+            op=op,
+            query_digest=query_digest,
+            selection=capture.manifest.selection_digest,
+            snapshot=snapshot,
+            toolchain=self._toolchain_id(),
+        )
+        checkpoint = cursor.checkpoint
+        if not isinstance(checkpoint, FileCheckpoint):
+            raise _IndexerFailure("invalid_cursor", "cursor has the wrong checkpoint kind", action="restart_query")
+        if checkpoint.index < 0 or checkpoint.index >= len(capture.files):
+            raise _IndexerFailure(
+                "invalid_cursor",
+                "cursor file index is outside the captured source set",
+                action="restart_query",
+            )
+        current = capture.files[checkpoint.index]
+        eligible_indexes = {id(item): index for index, item in enumerate(eligible)}
+        if id(current) not in eligible_indexes:
+            raise _IndexerFailure(
+                "invalid_cursor",
+                "cursor points to a file outside the requested profile",
+                action="restart_query",
+            )
+        if budget is not None:
+            budget.check_deadline()
+        return eligible_indexes[id(current)], checkpoint.after
+
+    @staticmethod
+    def _window_files(
+        eligible: Sequence[CapturedFile],
+        start: int,
+        *,
+        budget: OperationBudget | None = None,
+    ) -> tuple[list[CapturedFile], int | None]:
+        if budget is not None:
+            budget.check_deadline()
+        if start >= len(eligible):
+            return [], None
+        values: list[CapturedFile] = []
+        total_bytes = 0
+        index = start
+        while index < len(eligible):
+            if budget is not None:
+                budget.check_deadline()
+            captured = eligible[index]
+            if len(values) >= _MAX_SEARCH_FILES or (values and total_bytes + captured.size > _MAX_SEARCH_SOURCE_BYTES):
+                return values, index
+            if captured.size > _MAX_SEARCH_SOURCE_BYTES:
+                raise _IndexerFailure(
+                    "analysis_limit",
+                    "one search unit exceeds the source-byte window",
+                    path=captured.path,
+                    action="narrow_query",
+                )
+            values.append(captured)
+            total_bytes += captured.size
+            index += 1
+        return values, None
+
+    @staticmethod
+    def _file_indexes(capture: RepositoryCapture) -> dict[str, int]:
+        return {item.path: index for index, item in enumerate(capture.files)}
+
+    def _encode_file_cursor(
+        self,
+        *,
+        op: Literal["search", "impact"],
+        query_digest: str,
+        capture: RepositoryCapture,
+        snapshot: str,
+        index: int,
+        after: str | None,
+    ) -> str:
+        checkpoint_values: dict[str, Any] = {"kind": "file", "index": index}
+        if after is not None:
+            checkpoint_values["after"] = after
+        return encode_cursor(
+            RepositoryCursor(
+                version=1,
+                op=op,
+                root=self.root.id,
+                query=query_digest,
+                selection=capture.manifest.selection_digest,
+                snapshot=snapshot,
+                toolchain=self._toolchain_id(),
+                checkpoint=FileCheckpoint(**checkpoint_values),
+            )
+        )
+
+    @staticmethod
+    def _clip_text(value: str, maximum: int) -> tuple[str, bool]:
+        encoded = value.encode("utf-8")
+        if len(encoded) <= maximum:
+            return value, False
+        clipped = encoded[:maximum].decode("utf-8", errors="ignore")
+        return clipped, True
+
+    def _literal_records(
+        self,
+        files: Sequence[CapturedFile],
+        text: str,
+        *,
+        budget: OperationBudget | None = None,
+    ) -> tuple[dict[str, list[SearchItem]], str | None]:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        if not text:
+            raise _IndexerFailure("invalid_request", "literal search text must not be empty", action="correct_input")
+        needle = text.encode("utf-8")
+        result: dict[str, list[SearchItem]] = {item.path: [] for item in files}
+        remaining = _MAX_SEARCH_RAW_CANDIDATES
+        for captured in files:
+            local_budget.check_deadline()
+            if not captured.is_text or captured.has_nul:
+                continue
+            geometry = _SourceGeometry.from_text(self._captured_text(captured), data=captured.content)
+
+            def spans() -> Iterable[tuple[int, int]]:
+                offset = 0
+                while True:
+                    local_budget.check_deadline()
+                    start = captured.content.find(needle, offset)
+                    if start < 0:
+                        return
+                    end = start + len(needle)
+                    self._validate_interval(start, end, geometry, path=captured.path)
+                    yield start, end
+                    offset = end
+
+            def make_item(span: tuple[int, int]) -> SearchItem:
+                start, end = span
+                display_text, clipped = self._clip_text(geometry.decode(start, end), _MAX_OCCURRENCE_TEXT_BYTES)
+                values: dict[str, Any] = {
+                    "ref": self._occurrence_ref_for(captured, start, end),
+                    "location": Range(start=geometry.position(start), end=geometry.position(end)),
+                    "text": display_text,
+                }
+                if clipped:
+                    values["disclosure"] = Disclosure(clipped=["text"])
+                return SearchItem(**values)
+
+            admitted = collect_complete_file_candidates(
+                spans(),
+                remaining,
+                transform=make_item,
+                budget=local_budget,
+            )
+            result[captured.path] = list(admitted.candidates)
+            if admitted.overflowed:
+                return result, captured.path
+            remaining -= admitted.raw_count
+        local_budget.check_deadline()
+        return result, None
+
+    def _ast_records_by_file(
+        self,
+        files: Sequence[CapturedFile],
+        source: PatternSearchSource | RuleSearchSource,
+        *,
+        rule_set: CapturedRuleSet | None,
+        detail: Literal["summary", "detail"],
+        budget: OperationBudget | None = None,
+    ) -> tuple[dict[str, list[SearchItem]], list[CoverageReason], bool, str | None]:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        source_files = {item.path: item for item in files}
+        inputs = {
+            item.path: item.content for item in files if item.is_text and not item.has_nul and item.language is not None
+        }
+        reasons: list[CoverageReason] = [
+            CoverageReason(code="non_text_input", path=item.path) for item in files if not item.is_text or item.has_nul
+        ]
+        by_file: dict[str, list[SearchItem]] = {item.path: [] for item in files}
+        if not inputs:
+            return by_file, reasons, True, None
+        if isinstance(source, PatternSearchSource):
+            args = [
+                "run",
+                "--pattern",
+                source.pattern,
+                "--lang",
+                source.language,
+                "--json=compact",
+                "--color",
+                "never",
+            ]
+        else:
+            if rule_set is None:
+                raise _IndexerFailure("internal_error", "rule search has no captured rule set")
+            args = [
+                "scan",
+                "--config",
+                source.input.path,
+                "--json=compact",
+                "--color",
+                "never",
+            ]
+        try:
+            observation = self._toolchain_observation()
+            executable = observation.executable
+            if not isinstance(executable, str) or not executable:
+                raise _IndexerFailure(
+                    "dependency_unavailable",
+                    "the observed ast-grep executable is unavailable",
+                    action="install_dependency",
+                )
+            executor = BoundedAstGrepExecutor(executable=executable)
+            remaining = _MAX_SEARCH_RAW_CANDIDATES
+            with captured_ast_grep_session(inputs, rule_set, budget=local_budget) as session:
+                for captured in files:
+                    local_budget.check_deadline()
+                    if captured.path not in inputs:
+                        continue
+                    result = session.execute(
+                        args,
+                        source_paths=(captured.path,),
+                        max_results=remaining,
+                        timeout=local_budget.remaining_seconds,
+                        cancel=local_budget.cancel,
+                        executor=executor,
+                    )
+                    records, exact = self._ast_grep_records(result)
+                    raw_count = result.raw_count if isinstance(result, BoundedAstGrepResult) else len(records)
+                    if not exact:
+                        return by_file, reasons, False, captured.path
+                    if raw_count > remaining:
+                        raise _IndexerFailure(
+                            "internal_error",
+                            "ast-grep exceeded its admitted raw candidate budget",
+                            path=captured.path,
+                        )
+                    remaining -= raw_count
+                    single_file = {captured.path: captured}
+                    geometries: dict[str, _SourceGeometry] = {}
+                    for raw in records:
+                        local_budget.check_deadline()
+                        if not isinstance(raw, Mapping):
+                            raise _IndexerFailure("internal_error", "ast-grep returned a non-object match")
+                        path = self._captured_result_path(raw.get("file"), single_file)
+                        current = source_files[path]
+                        geometry = geometries.get(path)
+                        if geometry is None:
+                            geometry = _SourceGeometry.from_text(self._captured_text(current), data=current.content)
+                            geometries[path] = geometry
+                        start, end, match_text = self._record_range(raw, current, geometry)
+                        display_text, text_clipped = self._clip_text(match_text, _MAX_OCCURRENCE_TEXT_BYTES)
+                        captures: tuple[Capture, ...] = ()
+                        if detail == "detail":
+                            captures, verified = self._capture_values(raw, current, geometry)
+                            if not verified:
+                                reasons.append(CoverageReason(code="capture_unverified", path=path))
+                        rule_id: str | None = None
+                        if isinstance(source, RuleSearchSource):
+                            raw_rule = raw.get("ruleId")
+                            if not isinstance(raw_rule, str) or not raw_rule:
+                                raise _IndexerFailure("internal_error", "rule match has no ruleId", path=path)
+                            rule_id = raw_rule
+                        item_values: dict[str, Any] = {
+                            "ref": self._occurrence_ref_for(current, start, end),
+                            "location": Range(start=geometry.position(start), end=geometry.position(end)),
+                            "text": display_text,
+                        }
+                        if text_clipped:
+                            item_values["disclosure"] = Disclosure(clipped=["text"])
+                        if rule_id is not None:
+                            item_values["rule_id"] = rule_id
+                        if detail == "detail":
+                            item_values["captures"] = list(captures)
+                        by_file[path].append(SearchItem(**item_values))
+                    by_file[captured.path].sort(
+                        key=lambda item: (
+                            item.ref.start,
+                            item.ref.end,
+                            (item.rule_id or "").encode("utf-8"),
+                            self._search_row_digest(item),
+                        )
+                    )
+        except AstGrepError as exc:
+            raise self._ast_grep_failure(exc) from exc
+        local_budget.check_deadline()
+        return by_file, reasons, True, None
+
+    @staticmethod
+    def _limit_search_captures(item: SearchItem) -> SearchItem:
+        if not item.captures:
+            return item
+        clipped = len(item.captures) > _MAX_CAPTURE_RECORDS
+        captures = list(item.captures[:_MAX_CAPTURE_RECORDS])
+        clipped_text = False
+        normalized: list[Capture] = []
+        for capture in captures:
+            if capture.text is None:
+                normalized.append(capture)
+                continue
+            text, was_clipped = XRayIndexer._clip_text(capture.text, _MAX_TRANSFORMED_TEXT_BYTES)
+            clipped_text = clipped_text or was_clipped
+            normalized.append(capture.model_copy(update={"text": text}))
+        clipped_fields = set(item.disclosure.clipped) if item.disclosure is not None else set()
+        if clipped or clipped_text:
+            clipped_fields.add("captures")
+        disclosure = (
+            Disclosure(clipped=sorted(clipped_fields, key=("signature", "documentation", "text", "captures").index))
+            if clipped_fields
+            else None
+        )
+        return item.model_copy(update={"captures": normalized, "disclosure": disclosure})
+
+    def _search_window_rows(
+        self,
+        capture: RepositoryCapture,
+        query: Any,
+        *,
+        source: Any = None,
+        rule_set: CapturedRuleSet | None = None,
+        start: int,
+        after: str | None,
+        cache: DerivedCache | None = None,
+        budget: OperationBudget | None = None,
+    ) -> tuple[list[SearchItem], list[CoverageReason], int | None]:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        if source is None:
+            source = query.source
+        language = source.language if isinstance(source, PatternSearchSource) else None
+        eligible, reasons = self._selected_files(capture, language=language, budget=local_budget)
+        window, pending_position = self._window_files(eligible, start, budget=local_budget)
+        if isinstance(source, LiteralSearchSource):
+            by_file, ast_overflow_path = self._literal_records(window, source.text, budget=local_budget)
+            exact = True
+        else:
+            by_file, ast_reasons, exact, ast_overflow_path = self._ast_records_by_file(
+                window,
+                source,
+                rule_set=rule_set,
+                detail=query.detail,
+                budget=local_budget,
+            )
+            reasons.extend(ast_reasons)
+            if not exact and ast_overflow_path is None and window:
+                raise _IndexerFailure("internal_error", "ast-grep overflow has no owning file")
+            if isinstance(source, PatternSearchSource):
+                for captured in window:
+                    if ast_overflow_path == captured.path:
+                        break
+                    local_budget.check_deadline()
+                    if not captured.is_text or captured.has_nul:
+                        continue
+                    geometry = _SourceGeometry.from_text(self._captured_text(captured), data=captured.content)
+                    artifact = self._declarations_for(
+                        captured,
+                        cache=cache,
+                        geometry=geometry,
+                        budget=local_budget,
+                    )
+                    if artifact.coverage.state == "partial":
+                        reasons.extend(artifact.coverage.reasons or ())
+        overflow_position: int | None = None
+        complete_end = len(window)
+        if ast_overflow_path is not None:
+            try:
+                overflow_offset = next(index for index, item in enumerate(window) if item.path == ast_overflow_path)
+            except StopIteration as exc:
+                raise _IndexerFailure(
+                    "internal_error",
+                    "search overflow path is outside the captured window",
+                    path=ast_overflow_path,
+                ) from exc
+            overflow_position = start + overflow_offset
+            if overflow_position == start:
+                raise _IndexerFailure(
+                    "analysis_limit",
+                    "search result unit exceeds the raw candidate window",
+                    path=ast_overflow_path,
+                    action="narrow_query",
+                )
+            complete_end = overflow_offset
+        display_by_file: dict[str, list[SearchItem]] = {}
+        for captured in window[:complete_end]:
+            local_budget.check_deadline()
+            file_rows = by_file.get(captured.path, [])
+            if query.detail == "detail":
+                file_rows = [self._limit_search_captures(item) for item in file_rows]
+            display_by_file[captured.path] = file_rows
+        after_offset: int | None = None
+        if after is not None:
+            if not window or complete_end == 0:
+                raise _IndexerFailure(
+                    "invalid_cursor",
+                    "cursor checkpoint does not identify a search result row",
+                    action="restart_query",
+                )
+            first_rows = display_by_file.get(window[0].path, [])
+            row_ids = [self._search_row_digest(item) for item in first_rows]
+            try:
+                after_offset = row_ids.index(after)
+            except ValueError as exc:
+                raise _IndexerFailure(
+                    "invalid_cursor",
+                    "cursor checkpoint does not identify a search result row",
+                    action="restart_query",
+                ) from exc
+        file_indexes = self._file_indexes(capture)
+        rows: list[SearchItem] = []
+        for position, captured in enumerate(window[:complete_end]):
+            local_budget.check_deadline()
+            admitted = display_by_file.get(captured.path, [])
+            if position == 0 and after_offset is not None:
+                admitted = admitted[after_offset + 1 :]
+            rows.extend(admitted)
+        if overflow_position is not None:
+            pending_position = overflow_position
+            reasons.append(CoverageReason(code="scan_pending", path=eligible[overflow_position].path))
+        elif pending_position is not None:
+            reasons.append(CoverageReason(code="scan_pending", path=eligible[pending_position].path))
+        if pending_position is None and overflow_position is None:
+            pending_cursor = None
+        else:
+            pending_index = overflow_position if overflow_position is not None else pending_position
+            pending_cursor = file_indexes[eligible[pending_index].path] if pending_index is not None else None
+        local_budget.check_deadline()
+        return rows, reasons, pending_cursor
+
+    def _execute_search(
+        self,
+        arguments: SearchArguments,
+        *,
+        budget: OperationBudget | None = None,
+        cache: DerivedCache | None = None,
+    ) -> Success:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        query = arguments.query
+        source = query.source
+        capture_domain = REGULAR_TEXT_DOMAIN if isinstance(source, LiteralSearchSource) else SUPPORTED_SOURCE_DOMAIN
+        capture = self._capture_sources(
+            query.selection,
+            capture_domain=capture_domain,
+            budget=local_budget,
+        )
+        rule_set: CapturedRuleSet | None = None
+        snapshot = capture.manifest.snapshot_digest
+        if isinstance(source, RuleSearchSource):
+            try:
+                rule_set = RepositoryProvider(self.root).capture_rule_input(source.input, budget=local_budget)
+            except RepositoryError:
+                raise
+            snapshot = digest(["xray.search.rule-snapshot.v1", snapshot, rule_set.digest])
+        provenance = self._repository_provenance(
+            op="search",
+            query=query,
+            capture=capture,
+            snapshot=snapshot,
+        )
+        page = arguments.page or PageSearch()
+        source_language = source.language if isinstance(source, PatternSearchSource) else None
+        eligible, _profile_reasons = self._selected_files(
+            capture,
+            language=source_language,
+            budget=local_budget,
+        )
+        start, after = self._file_cursor_start(
+            page.cursor,
+            op="search",
+            query_digest=provenance.query,
+            capture=capture,
+            eligible=eligible,
+            snapshot=snapshot,
+            budget=local_budget,
+        )
+        rows, reasons, pending_index = self._search_window_rows(
+            capture,
+            query,
+            source=source,
+            rule_set=rule_set,
+            start=start,
+            after=after,
+            cache=cache,
+            budget=local_budget,
+        )
+        file_indexes = self._file_indexes(capture)
+        coverage = self._coverage_for_reasons(
+            "pattern_matches"
+            if isinstance(source, PatternSearchSource)
+            else "rule_diagnostics"
+            if isinstance(source, RuleSearchSource)
+            else "literal_occurrences",
+            reasons,
+        )
+        if not rows:
+            next_cursor = (
+                self._encode_file_cursor(
+                    op="search",
+                    query_digest=provenance.query,
+                    capture=capture,
+                    snapshot=snapshot,
+                    index=pending_index,
+                    after=None,
+                )
+                if pending_index is not None
+                else None
+            )
+            page_values: dict[str, Any] = {}
+            if next_cursor is not None:
+                page_values["next_cursor"] = next_cursor
+            result = Success(
+                schema="xray.v1",
+                ok=True,
+                op="search",
+                root=capture.root,
+                scope=capture.selection,
+                provenance=provenance,
+                data=SearchData(items=[]),
+                page=PageResult(**page_values),
+                coverage=coverage,
+            )
+            local_budget.check_deadline()
+            if len(canonical_bytes(result)) > page.max_bytes:
+                raise _IndexerFailure(
+                    "budget_too_small",
+                    "search result cannot fit the requested byte budget",
+                    action="narrow_query",
+                )
+            return result
+        count = min(page.limit, len(rows))
+        while count > 0:
+            local_budget.check_deadline()
+            selected = rows[:count]
+            last = selected[-1]
+            remaining = rows[count:]
+            if remaining:
+                next_cursor = self._encode_file_cursor(
+                    op="search",
+                    query_digest=provenance.query,
+                    capture=capture,
+                    snapshot=snapshot,
+                    index=file_indexes[last.ref.path],
+                    after=self._search_row_digest(last),
+                )
+            elif pending_index is not None:
+                next_cursor = self._encode_file_cursor(
+                    op="search",
+                    query_digest=provenance.query,
+                    capture=capture,
+                    snapshot=snapshot,
+                    index=pending_index,
+                    after=None,
+                )
+            else:
+                next_cursor = None
+            page_values = {}
+            if next_cursor is not None:
+                page_values["next_cursor"] = next_cursor
+            result = Success(
+                schema="xray.v1",
+                ok=True,
+                op="search",
+                root=capture.root,
+                scope=capture.selection,
+                provenance=provenance,
+                data=SearchData(items=selected),
+                page=PageResult(**page_values),
+                coverage=coverage,
+            )
+            if len(canonical_bytes(result)) <= page.max_bytes:
+                return result
+            count -= 1
+        raise _IndexerFailure(
+            "budget_too_small",
+            "one search result cannot fit the requested byte budget",
+            action="narrow_query",
+        )
+
+    @staticmethod
+    def _identifier_char(value: str, language: str | None) -> bool:
+        if not value:
+            return False
+        if value == "$":
+            return language in {"javascript", "typescript"}
+        if value == "_":
+            return True
+        if value.isalnum():
+            return True
+        category = unicodedata.category(value)
+        return category in {"Lm", "Mc", "Mn", "Nl"}
+
+    @classmethod
+    def _identifier_spans(
+        cls,
+        text: str,
+        name: str,
+        language: str | None,
+        *,
+        budget: OperationBudget | None = None,
+    ) -> Iterable[tuple[int, int]]:
+        if not name:
+            return
+        offset = 0
+        while True:
+            if budget is not None:
+                budget.check_deadline()
+            start = text.find(name, offset)
+            if start < 0:
+                return
+            end = start + len(name)
+            before = text[start - 1] if start else ""
+            after = text[end] if end < len(text) else ""
+            if not cls._identifier_char(before, language) and not cls._identifier_char(after, language):
+                if budget is not None:
+                    budget.check_deadline()
+                yield start, end
+            offset = end
+
+    @staticmethod
+    def _python_token_name_span(
+        text: str,
+        geometry: _SourceGeometry,
+        node: ast.AST,
+        name: str,
+    ) -> tuple[int, int] | None:
+        import io
+        import tokenize
+
+        node_start, node_end = XRayIndexer._python_node_bytes(node, geometry)
+        snippet = geometry.decode(node_start, node_end)
+        line_starts = [0]
+        for index, value in enumerate(snippet):
+            if value == "\n":
+                line_starts.append(index + 1)
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(snippet).readline)
+            match: tuple[int, int] | None = None
+            base_char = geometry.byte_index_to_char(node_start)
+            for token in tokens:
+                if token.type != tokenize.NAME or token.string != name:
+                    continue
+                line, column = token.start
+                end_line, end_column = token.end
+                if line < 1 or end_line < line or line > len(line_starts) or end_line > len(line_starts):
+                    continue
+                start_char = base_char + line_starts[line - 1] + column
+                end_char = base_char + line_starts[end_line - 1] + end_column
+                match = (
+                    geometry.char_index_to_byte(start_char),
+                    geometry.char_index_to_byte(end_char),
+                )
+            return match
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            return None
+
+    @staticmethod
+    def _python_context(
+        text: str,
+        geometry: _SourceGeometry,
+        name: str,
+    ) -> tuple[set[tuple[int, int]], list[tuple[int, int]], list[tuple[int, int]], bool]:
+        import io
+        import tokenize
+
+        call_spans: set[tuple[int, int]] = set()
+        comment_spans: list[tuple[int, int]] = []
+        string_spans: list[tuple[int, int]] = []
+        parsed = True
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            tree = None
+            parsed = False
+        if tree is not None:
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                function = node.func
+                candidate: tuple[int, int] | None = None
+                if isinstance(function, ast.Name) and function.id == name:
+                    candidate = XRayIndexer._python_node_bytes(function, geometry)
+                elif isinstance(function, ast.Attribute) and function.attr == name:
+                    candidate = XRayIndexer._python_token_name_span(text, geometry, function, name)
+                if candidate is not None:
+                    call_spans.add(candidate)
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+            for token in tokens:
+                if token.type not in {tokenize.COMMENT, tokenize.STRING}:
+                    continue
+                start_line, start_column = token.start
+                end_line, end_column = token.end
+                if start_line < 1 or end_line < start_line or end_line > geometry.line_count:
+                    continue
+                line_start_char = geometry.byte_index_to_char(geometry.line_starts[start_line - 1])
+                end_line_start_char = geometry.byte_index_to_char(geometry.line_starts[end_line - 1])
+                start_char = line_start_char + start_column
+                end_char = end_line_start_char + end_column
+                if start_char < 0 or end_char < start_char or end_char > len(text):
+                    continue
+                if token.type == tokenize.COMMENT:
+                    comment_spans.append(
+                        (geometry.char_index_to_byte(start_char), geometry.char_index_to_byte(end_char))
+                    )
+                else:
+                    string_spans.append(
+                        (geometry.char_index_to_byte(start_char), geometry.char_index_to_byte(end_char))
+                    )
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            parsed = False
+        return call_spans, comment_spans, string_spans, parsed
+
+    def _tree_context(
+        self,
+        text: str,
+        geometry: _SourceGeometry,
+        language: str,
+        name: str,
+    ) -> tuple[set[tuple[int, int]], list[tuple[int, int]], list[tuple[int, int]], bool]:
+        call_spans: set[tuple[int, int]] = set()
+        comment_spans: list[tuple[int, int]] = []
+        string_spans: list[tuple[int, int]] = []
+        try:
+            root = SgRoot(text, language).root()
+            nodes = list(root.find_all(pattern="$A"))
+        except Exception:
+            return call_spans, comment_spans, string_spans, False
+        parse_ok = not any(self._node_kind(node) == "ERROR" for node in nodes)
+        identifier_kinds = {
+            "identifier",
+            "field_identifier",
+            "property_identifier",
+            "type_identifier",
+            "shorthand_property_identifier_pattern",
+            "namespace_identifier",
+        }
+        call_kinds = {"call_expression", "call", "invocation_expression", "function_call_expression"}
+        for node in nodes:
+            try:
+                start, end = self._node_range(node, geometry)
+            except _IndexerFailure:
+                continue
+            kind = self._node_kind(node)
+            if kind in {"comment", "line_comment", "block_comment"}:
+                comment_spans.append((start, end))
+            if kind in {"string", "string_fragment", "template_string", "interpreted_string_literal_content"}:
+                string_spans.append((start, end))
+            if self._node_text(node) != name or kind not in identifier_kinds:
+                continue
+            parent = self._node_parent(node)
+            while parent is not None:
+                parent_kind = self._node_kind(parent)
+                if parent_kind in call_kinds:
+                    function = self._node_field(parent, "function")
+                    if function is not None:
+                        try:
+                            function_start, function_end = self._node_range(function, geometry)
+                        except _IndexerFailure:
+                            break
+                        if function_start <= start and end <= function_end:
+                            call_spans.add((start, end))
+                    break
+                parent = self._node_parent(parent)
+        return call_spans, comment_spans, string_spans, parse_ok
+
+    def _impact_import(
+        self,
+        captured: CapturedFile,
+        geometry: _SourceGeometry,
+        span: tuple[int, int],
+        *,
+        observations: Sequence[_SyntaxObservation] | None = None,
+    ) -> ImpactImport | None:
+        for observation in observations if observations is not None else self._observations(captured, geometry):
+            if observation.section != "imports" or not (observation.start <= span[0] and span[1] <= observation.end):
+                continue
+            values: dict[str, Any] = {"module_text": observation.module_text or ""}
+            if observation.imported_name is not None:
+                values["imported_name"] = observation.imported_name
+            if observation.local_name is not None:
+                values["local_name"] = observation.local_name
+            return ImpactImport(**values)
+        return None
+
+    def _impact_file_rows(
+        self,
+        captured: CapturedFile,
+        name: str,
+        *,
+        target: DeclarationRecord,
+        mode: Literal["syntax", "lexical"],
+        cache: DerivedCache | None,
+        remaining: int,
+        budget: OperationBudget | None = None,
+    ) -> tuple[list[ImpactItem], list[CoverageReason], int, bool]:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        if not captured.is_text or captured.has_nul:
+            return [], [CoverageReason(code="non_text_input", path=captured.path)], 0, False
+        text = self._captured_text(captured)
+        admitted = collect_complete_file_candidates(
+            self._identifier_spans(text, name, captured.language, budget=local_budget),
+            remaining,
+            budget=local_budget,
+        )
+        if admitted.overflowed:
+            return [], [], admitted.raw_count, True
+        geometry = _SourceGeometry.from_text(text, data=captured.content)
+        artifact: DeclarationArtifact | None = None
+        observations: list[_SyntaxObservation] = []
+        reasons: list[CoverageReason] = []
+        call_spans: set[tuple[int, int]] = set()
+        comment_spans: list[tuple[int, int]] = []
+        string_spans: list[tuple[int, int]] = []
+        parser_ok = False
+        if mode == "syntax":
+            if captured.language == "python":
+                call_spans, comment_spans, string_spans, parser_ok = self._python_context(text, geometry, name)
+            elif captured.language in {"javascript", "typescript", "go"}:
+                call_spans, comment_spans, string_spans, parser_ok = self._tree_context(
+                    text,
+                    geometry,
+                    captured.language,
+                    name,
+                )
+            else:
+                reasons.append(CoverageReason(code="unsupported_syntax", path=captured.path))
+            if captured.language in {"python", "javascript", "typescript", "go"}:
+                observations = self._observations(captured, geometry)
+                artifact = self._declarations_for(captured, cache=cache, geometry=geometry, budget=local_budget)
+                if artifact.coverage.state == "partial":
+                    reasons.extend(artifact.coverage.reasons or ())
+                parser_ok = parser_ok and artifact.coverage.state == "complete"
+                if not parser_ok and not artifact.coverage.reasons:
+                    reasons.append(CoverageReason(code="unsupported_syntax", path=captured.path))
+        rows: list[ImpactItem] = []
+        definition_spans: set[tuple[int, int]] = set()
+        if artifact is not None:
+            definition_spans = {
+                (item.defining_start, item.defining_end) for item in artifact.declarations if item.name == name
+            }
+        target_span = (target.defining_start, target.defining_end)
+        for start_char, end_char in admitted.candidates:
+            local_budget.check_deadline()
+            start = geometry.char_index_to_byte(start_char)
+            end = geometry.char_index_to_byte(end_char)
+            span = (start, end)
+            if span == target_span and captured.path == target.path:
+                continue
+            if mode == "lexical":
+                kind: Literal["definition", "import", "call", "read", "comment", "string", "text", "unknown"] = "text"
+                evidence: Literal["ast_syntax", "lexical"] = "lexical"
+                enclosing = None
+                import_value = None
+            else:
+                import_value = self._impact_import(captured, geometry, span, observations=observations)
+                if span in definition_spans:
+                    kind = "definition"
+                elif import_value is not None:
+                    kind = "import"
+                elif self._contained_span(span, comment_spans):
+                    kind = "comment"
+                elif self._contained_span(span, string_spans):
+                    kind = "string"
+                elif span in call_spans:
+                    kind = "call"
+                elif parser_ok:
+                    kind = "read"
+                else:
+                    kind = "unknown"
+                evidence = "ast_syntax" if parser_ok else "lexical"
+                enclosing = None
+                if artifact is not None:
+                    declaration = artifact.enclosing(start, end)
+                    if declaration is not None:
+                        enclosing = EnclosingFound(state="found", ref=declaration.ref)
+                    elif artifact.coverage.state == "partial":
+                        enclosing = EnclosingUnavailable(state="unavailable", reason="parse_diagnostics")
+                    else:
+                        enclosing = EnclosingNone(state="none")
+            display_text, clipped = self._clip_text(geometry.decode(start, end), _MAX_OCCURRENCE_TEXT_BYTES)
+            disclosure = Disclosure(clipped=["text"]) if clipped else None
+            values: dict[str, Any] = {
+                "ref": self._occurrence_ref_for(captured, start, end),
+                "location": Range(start=geometry.position(start), end=geometry.position(end)),
+                "kind": kind,
+                "evidence": evidence,
+                "text": display_text,
+            }
+            if enclosing is not None:
+                values["enclosing"] = enclosing
+            if import_value is not None:
+                values["import_"] = import_value
+            if disclosure is not None:
+                values["disclosure"] = disclosure
+            rows.append(ImpactItem(**values))
+        rows.sort(
+            key=lambda item: (
+                item.ref.start,
+                item.ref.end,
+                _IMPACT_KIND_ORDER[item.kind],
+                self._impact_row_digest(item),
+            )
+        )
+        local_budget.check_deadline()
+        return rows, reasons, admitted.raw_count, False
+
+    def _execute_impact(
+        self,
+        arguments: ImpactArguments,
+        *,
+        budget: OperationBudget | None = None,
+        cache: DerivedCache | None = None,
+    ) -> Success:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        query = arguments.query
+        capture_domain = REGULAR_TEXT_DOMAIN if query.mode == "lexical" else SUPPORTED_SOURCE_DOMAIN
+        capture = self._capture_sources(
+            query.selection,
+            capture_domain=capture_domain,
+            budget=local_budget,
+        )
+        provenance = self._repository_provenance(op="impact", query=query, capture=capture)
+        page = arguments.page or PageImpact()
+        target_file = self._captured_map(capture).get(query.target.path)
+        if target_file is None:
+            raise _IndexerFailure("invalid_reference", "impact target file was not captured", path=query.target.path)
+        target_geometry = _SourceGeometry.from_text(
+            self._captured_text(target_file),
+            data=target_file.content,
+        )
+        artifact = self._declarations_for(
+            target_file,
+            cache=cache,
+            geometry=target_geometry,
+            budget=local_budget,
+        )
+        target = self.resolve_symbol(
+            capture,
+            query.target,
+            artifact=artifact,
+            geometry=target_geometry,
+            budget=local_budget,
+        )
+        eligible, initial_reasons = self._selected_files(capture, budget=local_budget)
+        start, after = self._file_cursor_start(
+            page.cursor,
+            op="impact",
+            query_digest=provenance.query,
+            capture=capture,
+            eligible=eligible,
+            snapshot=provenance.snapshot,
+            budget=local_budget,
+        )
+        window, pending_position = self._window_files(eligible, start, budget=local_budget)
+        reasons = list(initial_reasons)
+        rows: list[ImpactItem] = []
+        remaining = _MAX_SEARCH_RAW_CANDIDATES
+        after_offset: int | None = None
+        overflow_position: int | None = None
+        for position, captured in enumerate(window):
+            local_budget.check_deadline()
+            rows_for_file, file_reasons, raw_count, overflowed = self._impact_file_rows(
+                captured,
+                target.name,
+                target=target,
+                mode=query.mode,
+                cache=cache,
+                remaining=remaining,
+                budget=local_budget,
+            )
+            reasons.extend(file_reasons)
+            if overflowed:
+                overflow_position = start + position
+                if overflow_position == start:
+                    raise _IndexerFailure(
+                        "analysis_limit",
+                        "impact result unit exceeds the raw candidate window",
+                        path=captured.path,
+                        action="narrow_query",
+                    )
+                break
+            remaining -= raw_count
+            if position == 0 and after is not None:
+                row_ids = [self._impact_row_digest(item) for item in rows_for_file]
+                try:
+                    after_offset = row_ids.index(after)
+                except ValueError as exc:
+                    raise _IndexerFailure(
+                        "invalid_cursor",
+                        "cursor checkpoint does not identify an impact result row",
+                        action="restart_query",
+                    ) from exc
+                rows_for_file = rows_for_file[after_offset + 1 :]
+            rows.extend(rows_for_file)
+        if after is not None and not window:
+            raise _IndexerFailure(
+                "invalid_cursor",
+                "cursor checkpoint does not identify an impact result row",
+                action="restart_query",
+            )
+        if overflow_position is not None:
+            pending_position = overflow_position
+            reasons.append(CoverageReason(code="scan_pending", path=eligible[overflow_position].path))
+        elif pending_position is not None:
+            reasons.append(CoverageReason(code="scan_pending", path=eligible[pending_position].path))
+        file_indexes = self._file_indexes(capture)
+        pending_position_value = overflow_position if overflow_position is not None else pending_position
+        pending_index = (
+            file_indexes[eligible[pending_position_value].path] if pending_position_value is not None else None
+        )
+        coverage = self._coverage_for_reasons("name_occurrences", reasons)
+        if not rows:
+            next_cursor = (
+                self._encode_file_cursor(
+                    op="impact",
+                    query_digest=provenance.query,
+                    capture=capture,
+                    snapshot=provenance.snapshot,
+                    index=pending_index,
+                    after=None,
+                )
+                if pending_index is not None
+                else None
+            )
+            page_values: dict[str, Any] = {}
+            if next_cursor is not None:
+                page_values["next_cursor"] = next_cursor
+            result = Success(
+                schema="xray.v1",
+                ok=True,
+                op="impact",
+                root=capture.root,
+                scope=capture.selection,
+                provenance=provenance,
+                data=ImpactData(target=query.target, basis="name_occurrences", resolution="unresolved", items=[]),
+                page=PageResult(**page_values),
+                coverage=coverage,
+            )
+            if len(canonical_bytes(result)) > page.max_bytes:
+                raise _IndexerFailure("budget_too_small", "impact result cannot fit the requested byte budget")
+            return result
+        count = min(page.limit, len(rows))
+        while count > 0:
+            local_budget.check_deadline()
+            selected = rows[:count]
+            last = selected[-1]
+            if count < len(rows):
+                next_cursor = self._encode_file_cursor(
+                    op="impact",
+                    query_digest=provenance.query,
+                    capture=capture,
+                    snapshot=provenance.snapshot,
+                    index=file_indexes[last.ref.path],
+                    after=self._impact_row_digest(last),
+                )
+            elif pending_index is not None:
+                next_cursor = self._encode_file_cursor(
+                    op="impact",
+                    query_digest=provenance.query,
+                    capture=capture,
+                    snapshot=provenance.snapshot,
+                    index=pending_index,
+                    after=None,
+                )
+            else:
+                next_cursor = None
+            page_values: dict[str, Any] = {}
+            if next_cursor is not None:
+                page_values["next_cursor"] = next_cursor
+            result = Success(
+                schema="xray.v1",
+                ok=True,
+                op="impact",
+                root=capture.root,
+                scope=capture.selection,
+                provenance=provenance,
+                data=ImpactData(target=query.target, basis="name_occurrences", resolution="unresolved", items=selected),
+                page=PageResult(**page_values),
+                coverage=coverage,
+            )
+            if len(canonical_bytes(result)) <= page.max_bytes:
+                return result
+            count -= 1
+        raise _IndexerFailure("budget_too_small", "one impact result cannot fit the requested byte budget")
+
+    @staticmethod
+    def _captured_map(capture: RepositoryCapture) -> dict[str, CapturedFile]:
+        return {item.path: item for item in capture.files}
+
+    @staticmethod
+    def _validate_digest(ref_digest: str, captured: CapturedFile, path: str) -> None:
+        if ref_digest != captured.digest:
+            raise _IndexerFailure(
+                "stale_reference",
+                "reference file digest does not match the captured source",
+                path=path,
+                action="refresh_reference",
+            )
+
+    @staticmethod
+    def _validate_interval(start: int, end: int, geometry: _SourceGeometry, *, path: str) -> None:
+        if start < 0 or end < start or end > len(geometry.data):
+            raise _IndexerFailure("invalid_reference", "reference byte range is outside the captured file", path=path)
+        if not geometry.is_boundary(start) or not geometry.is_boundary(end):
+            raise _IndexerFailure(
+                "invalid_reference",
+                "reference byte range is not aligned to UTF-8 boundaries",
+                path=path,
+                action="correct_input",
+            )
+
+    def resolve_symbol(
+        self,
+        capture: RepositoryCapture,
+        ref: SymbolSourceRef,
+        *,
+        artifact: DeclarationArtifact | None = None,
+        geometry: _SourceGeometry | None = None,
+        budget: OperationBudget | None = None,
+    ) -> DeclarationRecord:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        if ref.root_id != capture.root.id or ref.path not in {item.path for item in capture.files}:
+            raise _IndexerFailure("invalid_reference", "symbol reference is outside the captured root", path=ref.path)
+        captured = self._captured_map(capture).get(ref.path)
+        if captured is None:
+            raise _IndexerFailure("invalid_reference", "symbol reference file was not captured", path=ref.path)
+        self._validate_digest(ref.file_digest, captured, ref.path)
+        geometry = geometry or _SourceGeometry.from_text(self._captured_text(captured), data=captured.content)
+        self._validate_interval(ref.start, ref.end, geometry, path=ref.path)
+        item = artifact or self.declarations_for(captured, geometry=geometry, budget=local_budget)
+        if item.root_id != capture.root.id or item.file_digest != captured.digest:
+            raise _IndexerFailure(
+                "stale_reference", "declaration artifact is not bound to the captured source", path=ref.path
+            )
+        try:
+            resolved = item.resolve(ref)
+        except _IndexerFailure:
+            raise
+        except Exception as exc:
+            raise _IndexerFailure("stale_reference", "symbol reference does not resolve", path=ref.path) from exc
+        local_budget.check_deadline()
+        return resolved
+
+    def _normalize_location(
+        self,
+        target: LocationTarget,
+        geometry: _SourceGeometry,
+    ) -> tuple[int, int]:
+        start = geometry.line_start(target.line)
+        if target.column is not None:
+            column_offset = target.column - 1
+            line_content_end = geometry.line_content_end(target.line)
+            if column_offset > line_content_end - start:
+                raise _IndexerFailure(
+                    "invalid_reference", "location column is outside the selected line", path=target.path
+                )
+            start += column_offset
+            if not geometry.is_boundary(start):
+                raise _IndexerFailure("invalid_reference", "location column is not a UTF-8 boundary", path=target.path)
+        if target.end_line is None:
+            end = len(geometry.data)
+        else:
+            end = geometry.line_end(target.end_line)
+        self._validate_interval(start, end, geometry, path=target.path)
+        return start, end
+
+    def _normalize_targets(
+        self,
+        capture: RepositoryCapture,
+        targets: Sequence[ReadTarget],
+        *,
+        cache: DerivedCache | None = None,
+        budget: OperationBudget | None = None,
+        include_enclosing: bool = True,
+    ) -> tuple[list[_TargetState], dict[str, DeclarationArtifact]]:
+        local_budget = budget or OperationBudget()
+        files = self._captured_map(capture)
+        if len(files) != len(capture.files):
+            raise _IndexerFailure("internal_error", "captured source paths are not unique")
+        artifacts: dict[str, DeclarationArtifact] = {}
+        geometries: dict[str, _SourceGeometry] = {}
+        states: list[_TargetState] = []
+        for index, target in enumerate(targets):
+            local_budget.check_deadline()
+            captured = files.get(target.path)
+            if captured is None:
+                raise _IndexerFailure("invalid_reference", "target file was not captured", path=target.path)
+            if isinstance(target, (SourceRef, SymbolSourceRef, OccurrenceRef)):
+                self._validate_digest(target.file_digest, captured, target.path)
+                if isinstance(target, OccurrenceRef):
+                    expected = occurrence_digest(target.path, target.file_digest, target.start, target.end)
+                    if target.occurrence_id != expected:
+                        raise _IndexerFailure(
+                            "invalid_reference",
+                            "occurrence identity does not match its path, digest, and range",
+                            path=target.path,
+                            action="refresh_reference",
+                        )
+            geometry = geometries.get(target.path)
+            if geometry is None:
+                geometry = _SourceGeometry.from_text(self._captured_text(captured), data=captured.content)
+                geometries[target.path] = geometry
+            artifact = artifacts.get(target.path)
+            needs_artifact = include_enclosing or isinstance(target, SymbolSourceRef)
+            if (
+                needs_artifact
+                and artifact is None
+                and captured.language
+                in (
+                    "python",
+                    "javascript",
+                    "typescript",
+                    "go",
+                )
+            ):
+                artifact = self._declarations_for(captured, cache=cache, geometry=geometry, budget=local_budget)
+                artifacts[target.path] = artifact
+            if isinstance(target, LocationTarget):
+                start, end = self._normalize_location(target, geometry)
+                declaration = None
+            elif isinstance(target, (SourceRef, SymbolSourceRef)):
+                self._validate_interval(target.start, target.end, geometry, path=target.path)
+                start, end = target.start, target.end
+                declaration = None
+                if isinstance(target, SymbolSourceRef):
+                    if artifact is None:
+                        artifact = self._declarations_for(
+                            captured,
+                            cache=cache,
+                            geometry=geometry,
+                            budget=local_budget,
+                        )
+                        artifacts[target.path] = artifact
+                    declaration = self.resolve_symbol(
+                        capture,
+                        target,
+                        artifact=artifact,
+                        geometry=geometry,
+                        budget=local_budget,
+                    )
+            elif isinstance(target, OccurrenceRef):
+                self._validate_interval(target.start, target.end, geometry, path=target.path)
+                start, end = target.start, target.end
+                declaration = None
+            else:
+                raise _IndexerFailure("invalid_reference", "unsupported read target")
+            states.append(
+                _TargetState(
+                    index=index,
+                    target=target,
+                    captured=captured,
+                    geometry=geometry,
+                    start=start,
+                    end=end,
+                    artifact=artifact,
+                    declaration=declaration,
+                )
+            )
+        local_budget.check_deadline()
+        return states, artifacts
+
+    @staticmethod
+    def _enclosing_for(state: _TargetState, include_enclosing: bool) -> Enclosing | None:
+        if not include_enclosing:
+            return None
+        if isinstance(state.target, SymbolSourceRef):
+            if state.declaration is None:
+                return EnclosingUnavailable(state="unavailable", reason="parse_diagnostics")
+            return EnclosingFound(state="found", ref=state.declaration.ref)
+        artifact = state.artifact
+        if artifact is None:
+            return EnclosingUnsupported(state="unsupported")
+        enclosing_end = state.end
+        if isinstance(state.target, LocationTarget) and state.target.end_line is not None:
+            enclosing_end = state.geometry.line_content_end(state.target.end_line)
+        declaration = artifact.enclosing(state.start, enclosing_end)
+        if declaration is not None:
+            return EnclosingFound(state="found", ref=declaration.ref)
+        if artifact.coverage.state == "partial":
+            return EnclosingUnavailable(state="unavailable", reason="parse_diagnostics")
+        return EnclosingNone(state="none")
+
+    @staticmethod
+    def _context_interval(state: _TargetState, context_lines: int) -> tuple[int, int]:
+        if context_lines < 0 or context_lines > _MAX_CONTEXT_LINES:
+            raise _IndexerFailure("invalid_request", "context_lines must be between 0 and 10")
+        if context_lines == 0:
+            return state.start, state.end
+        geometry = state.geometry
+        start_line = geometry.line_index(state.start)
+        end_line = geometry.line_index(state.end, end=True)
+        expanded_start = geometry.line_starts[max(0, start_line - context_lines)]
+        expanded_end = geometry.line_ends[min(geometry.line_count - 1, end_line + context_lines)]
+        return expanded_start, expanded_end
+
+    def _merge_segments(
+        self,
+        states: Sequence[_TargetState],
+        context_lines: int,
+        *,
+        budget: OperationBudget | None = None,
+    ) -> tuple[_Segment, ...]:
+        local_budget = budget or OperationBudget()
+        by_path: dict[str, list[tuple[int, int, int, _TargetState]]] = {}
+        for state in states:
+            local_budget.check_deadline()
+            start, end = self._context_interval(state, context_lines)
+            by_path.setdefault(state.captured.path, []).append((start, end, state.index, state))
+        merged: list[_Segment] = []
+        for path, intervals in by_path.items():
+            local_budget.check_deadline()
+            intervals.sort(key=lambda item: (item[0], item[1], item[2]))
+            current: _Segment | None = None
+            for start, end, target_index, state in intervals:
+                local_budget.check_deadline()
+                if current is None:
+                    current = _Segment(path, state.captured, state.geometry, start, end, [target_index])
+                    continue
+                if start <= current.end:
+                    current.end = max(current.end, end)
+                    if target_index not in current.targets:
+                        current.targets.append(target_index)
+                        current.targets.sort()
+                    continue
+                merged.append(current)
+                current = _Segment(path, state.captured, state.geometry, start, end, [target_index])
+            if current is not None:
+                merged.append(current)
+        merged.sort(key=lambda item: (min(item.targets), item.path.encode("utf-8"), item.start, item.end))
+        local_budget.check_deadline()
+        return tuple(merged)
+
+    @staticmethod
+    def _safe_page_end(data: bytes, start: int, proposed: int, segment_end: int) -> int:
+        end = min(segment_end, max(start, proposed))
+        while end > start and end < len(data) and (data[end] & _UTF8_CONTINUATION_MASK) == _UTF8_CONTINUATION_PREFIX:
+            end -= 1
+        # A CRLF terminator is indivisible. Never extend past the byte ceiling
+        # to include its LF; backtrack instead.
+        if end > start and end < segment_end and data[end - 1 : end + 1] == b"\r\n":
+            end -= 1
+        return end
+
+    def _page_slice(self, segment: _Segment, start: int, page: PageRead) -> tuple[int, int]:
+        if start >= segment.end:
+            return start, start
+        proposed = min(segment.end, start + page.source_bytes)
+
+        end = self._safe_page_end(segment.geometry.data, start, proposed, segment.end)
+        if page.max_lines > 0:
+            newline_count = 0
+            for index in range(start, end):
+                if segment.geometry.data[index] == _LINE_FEED:
+                    newline_count += 1
+                    if newline_count >= page.max_lines:
+                        end = index + 1
+                        break
+            end = self._safe_page_end(segment.geometry.data, start, end, segment.end)
+        return start, end
+
+    @staticmethod
+    def _represented_line_count(data: bytes, start: int, end: int) -> int:
+        """Count every source line represented by a nonempty byte slice."""
+
+        if end <= start:
+            return 0
+        newlines = data[start:end].count(bytes((_LINE_FEED,)))
+        return newlines + (1 if data[end - 1] != _LINE_FEED else 0)
+
+    def _read_items(
+        self,
+        segments: Sequence[_Segment],
+        states: Sequence[_TargetState],
+        *,
+        start_segment: int = 0,
+        start_byte: int | None = None,
+        page: PageRead | None = None,
+        end_limit: int | None = None,
+        budget: OperationBudget | None = None,
+    ) -> tuple[ReadData, tuple[_Segment, ...], int | None, int | None]:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        state_by_index = {state.index: state for state in states}
+        output: list[ReadItem] = []
+        next_segment = len(segments)
+        next_byte: int | None = None
+        source_used = 0
+        line_used = 0
+        for segment_index, segment in enumerate(segments):
+            local_budget.check_deadline()
+            if segment_index < start_segment:
+                continue
+            offset = segment.start
+            if segment_index == start_segment and start_byte is not None:
+                offset = start_byte
+                if offset < segment.start or offset > segment.end:
+                    raise _IndexerFailure("stale_cursor", "read cursor byte is outside its segment", path=segment.path)
+            empty_segment = segment.start == segment.end
+            while offset < segment.end or empty_segment:
+                local_budget.check_deadline()
+                if empty_segment:
+                    end = offset
+                elif page is None:
+                    end = segment.end
+                else:
+                    remaining_source = page.source_bytes - source_used
+                    remaining_lines = page.max_lines - line_used
+                    if remaining_source <= 0 or remaining_lines <= 0:
+                        next_segment = segment_index
+                        next_byte = offset
+                        return ReadData(items=output), tuple(segments), next_segment, next_byte
+                    window = page.model_copy(update={"source_bytes": remaining_source, "max_lines": remaining_lines})
+                    _start, end = self._page_slice(segment, offset, window)
+                    if end_limit is not None and segment_index == start_segment:
+                        end = self._safe_page_end(
+                            segment.geometry.data,
+                            offset,
+                            min(end, end_limit),
+                            segment.end,
+                        )
+                if not empty_segment and end <= offset:
+                    if output:
+                        next_segment = segment_index
+                        next_byte = offset
+                        return ReadData(items=output), tuple(segments), next_segment, next_byte
+                    raise _IndexerFailure(
+                        "budget_too_small",
+                        "read source byte budget cannot contain one UTF-8 code point or CRLF terminator",
+                        action="narrow_query",
+                        minimum_bytes=2,
+                    )
+                source = segment.geometry.decode(offset, end)
+                enclosing: list[EnclosingResult] | None = None
+                if any(state_by_index[index].enclosing is not None for index in segment.targets):
+                    enclosing = [
+                        EnclosingResult(target=index, result=cast(Enclosing, state_by_index[index].enclosing))
+                        for index in sorted(segment.targets)
+                        if state_by_index[index].enclosing is not None
+                    ]
+                item_values: dict[str, Any] = {
+                    "targets": sorted(segment.targets),
+                    "ref": SourceRef(
+                        kind="source",
+                        root_id=self.root.id,
+                        path=segment.path,
+                        file_digest=segment.captured.digest,
+                        start=offset,
+                        end=end,
+                    ),
+                    "location": Range(start=segment.geometry.position(offset), end=segment.geometry.position(end)),
+                    "source": source,
+                }
+                if enclosing is not None:
+                    item_values["enclosing"] = enclosing
+                output.append(ReadItem(**item_values))
+                if page is None:
+                    break
+                consumed = end - offset
+                source_used += consumed
+                if consumed:
+                    line_used += self._represented_line_count(segment.geometry.data, offset, end)
+                if end == segment.end:
+                    next_segment = segment_index + 1
+                    next_byte = None
+                    offset = end
+                    empty_segment = False
+                    break
+                next_segment = segment_index
+                next_byte = end
+                offset = end
+                empty_segment = False
+                if source_used >= page.source_bytes or line_used >= page.max_lines:
+                    return ReadData(items=output), tuple(segments), next_segment, next_byte
+        return ReadData(items=output), tuple(segments), next_segment, next_byte
+
+    def _read_data(
+        self,
+        capture: RepositoryCapture,
+        targets: Sequence[ReadTarget],
         *,
         context_lines: int = 0,
-        max_lines: int = 200,
-        max_bytes: int = 64 * 1024,
-    ) -> dict[str, Any]:
-        """Read one contained symbol source slice with explicit line and byte bounds."""
-        if context_lines < 0 or max_lines < 1 or max_bytes < 1:
-            raise ValueError("context_lines must be non-negative and max_lines/max_bytes must be positive.")
-        path_value = symbol.get("path") or symbol.get("abs_path")
-        if not isinstance(path_value, str):
-            raise ValueError("Symbol path is required.")
-        target = self._resolve_repo_path(path_value, require_file=True)
-        abs_path_value = symbol.get("abs_path")
-        if isinstance(abs_path_value, str) and self._resolve_repo_path(abs_path_value, require_file=True) != target:
-            raise InterfaceReadError("symbol_mismatch", "Symbol path and abs_path identify different files.")
-        relative = target.relative_to(self.root_path).as_posix()
-        start = int(symbol.get("start_line", 0))
-        end = int(symbol.get("end_line", start))
-        if start < 1 or end < start:
-            raise ValueError("Symbol start_line/end_line are invalid.")
-        identity_fields = ("name", "type", "start_line", "end_line", "qualified_name", "owner", "language")
-        candidates = [item for item in self._get_symbol_inventory() if item.get("path") == relative]
-        matched = next(
+        include_enclosing: bool = True,
+        page: PageRead | None = None,
+        query_digest: str | None = None,
+        cache: DerivedCache | None = None,
+        result_builder: Callable[[ReadData, str | None], Success] | None = None,
+        budget: OperationBudget | None = None,
+    ) -> tuple[ReadData, str | None]:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        if capture.root.id != self.root.id:
+            raise _IndexerFailure("invalid_reference", "capture root does not match this indexer")
+        if not targets or len(targets) > _MAX_READ_TARGETS:
+            raise _IndexerFailure("invalid_request", "read accepts one to eight targets")
+        states, _artifacts = self._normalize_targets(
+            capture,
+            targets,
+            cache=cache,
+            budget=local_budget,
+            include_enclosing=include_enclosing,
+        )
+        for state in states:
+            local_budget.check_deadline()
+            state.enclosing = self._enclosing_for(state, include_enclosing)
+        segments = self._merge_segments(states, context_lines, budget=local_budget)
+        start_segment = 0
+        start_byte: int | None = None
+        if page is not None and page.cursor is not None:
+            cursor = self._validate_cursor_identity(
+                page.cursor,
+                op="read",
+                query_digest=query_digest or "",
+                selection=capture.manifest.selection_digest,
+                snapshot=capture.manifest.snapshot_digest,
+                toolchain=self._toolchain_id(),
+            )
+            checkpoint = cursor.checkpoint
+            if not isinstance(checkpoint, ReadCheckpoint):
+                raise _IndexerFailure(
+                    "invalid_cursor", "read cursor has the wrong checkpoint kind", action="restart_query"
+                )
+            start_segment = checkpoint.segment
+            start_byte = checkpoint.byte
+            if start_segment < 0 or start_segment >= len(segments):
+                raise _IndexerFailure(
+                    "invalid_cursor", "read cursor segment is outside the current result", action="restart_query"
+                )
+            segment = segments[start_segment]
+            if start_byte is None or not segment.geometry.is_boundary(start_byte):
+                raise _IndexerFailure(
+                    "invalid_cursor", "read cursor byte is not a UTF-8 boundary", action="restart_query"
+                )
+            if start_byte == segment.start:
+                if start_segment == 0:
+                    raise _IndexerFailure(
+                        "invalid_cursor", "read cursor does not advance within its segment", action="restart_query"
+                    )
+            elif start_byte <= segment.start or start_byte >= segment.end:
+                raise _IndexerFailure(
+                    "invalid_cursor", "read cursor byte is outside its segment", action="restart_query"
+                )
+
+        def make_cursor(next_segment: int | None, next_byte: int | None) -> str | None:
+            if page is None or next_segment is None or next_segment >= len(segments):
+                return None
+            if query_digest is None:
+                raise _IndexerFailure("internal_error", "paged read is missing its query identity")
+            local_budget.check_deadline()
+            return encode_cursor(
+                RepositoryCursor(
+                    version=1,
+                    op="read",
+                    root=self.root.id,
+                    query=query_digest,
+                    selection=capture.manifest.selection_digest,
+                    snapshot=capture.manifest.snapshot_digest,
+                    toolchain=self._toolchain_id(),
+                    checkpoint=ReadCheckpoint(
+                        kind="read",
+                        segment=next_segment,
+                        byte=next_byte if next_byte is not None else segments[next_segment].start,
+                    ),
+                )
+            )
+
+        def read_once(end_limit: int | None = None) -> tuple[ReadData, str | None]:
+            data, _segments, next_segment, next_byte = self._read_items(
+                segments,
+                states,
+                start_segment=start_segment,
+                start_byte=start_byte,
+                page=page,
+                end_limit=end_limit,
+                budget=local_budget,
+            )
+            return data, make_cursor(next_segment, next_byte)
+
+        data, next_cursor = read_once()
+        if page is None or result_builder is None:
+            local_budget.check_deadline()
+            return data, next_cursor
+
+        def sized_result(data_value: ReadData, cursor_value: str | None) -> tuple[Success, int]:
+            local_budget.check_deadline()
+            built = result_builder(data_value, cursor_value)
+            encoded = canonical_bytes(built)
+            local_budget.check_deadline()
+            return built, len(encoded)
+
+        def continuation_for_items(items: Sequence[ReadItem]) -> str | None:
+            if not items:
+                return next_cursor
+            last = items[-1]
+            for index, segment in enumerate(segments):
+                if segment.path != last.ref.path:
+                    continue
+                if segment.start <= last.ref.start <= segment.end:
+                    if last.ref.end < segment.end:
+                        return make_cursor(index, last.ref.end)
+                    return make_cursor(index + 1, None)
+            raise _IndexerFailure("internal_error", "read result item has no source segment")
+
+        _result, result_size = sized_result(data, next_cursor)
+        if result_size <= page.max_bytes:
+            return data, next_cursor
+        if not data.items:
+            raise _IndexerFailure(
+                "budget_too_small",
+                "one read result cannot fit the requested byte budget",
+                action="narrow_query",
+                minimum_bytes=result_size,
+            )
+
+        # Drop complete trailing disjoint items before splitting a source
+        # interval. This preserves every fitting target under the shared page
+        # budgets rather than returning only the first segment.
+        for count in range(len(data.items) - 1, 0, -1):
+            local_budget.check_deadline()
+            selected = ReadData(items=list(data.items[:count]))
+            selected_cursor = continuation_for_items(selected.items)
+            _candidate_result, candidate_size = sized_result(selected, selected_cursor)
+            if candidate_size <= page.max_bytes:
+                return selected, selected_cursor
+
+        first = data.items[0]
+        first_start = first.ref.start
+        first_end = first.ref.end
+        if first_end <= first_start:
+            raise _IndexerFailure(
+                "budget_too_small",
+                "one read result cannot fit the requested byte budget",
+                action="narrow_query",
+                minimum_bytes=result_size,
+            )
+        first_index = next(
             (
-                item
-                for item in candidates
-                if all(field not in symbol or symbol.get(field) == item.get(field) for field in identity_fields)
+                index
+                for index, segment in enumerate(segments)
+                if segment.path == first.ref.path and segment.start <= first_start and first_end <= segment.end
             ),
             None,
         )
-        if matched is None:
-            raise InterfaceReadError(
-                "symbol_mismatch",
-                f"Exact symbol identity does not match the current inventory for '{relative}'.",
-            )
-        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
-        slice_start = max(1, start - context_lines)
-        slice_end = min(len(lines), end + context_lines)
-        requested_lines = lines[slice_start - 1 : slice_end]
-        line_truncated = len(requested_lines) > max_lines
-        requested_lines = requested_lines[:max_lines]
-        source = "".join(requested_lines)
-        encoded = source.encode("utf-8")
-        byte_truncated = len(encoded) > max_bytes
-        if byte_truncated:
-            source = encoded[:max_bytes].decode("utf-8", errors="ignore")
-        returned_lines = source.count("\n") + (1 if source and not source.endswith("\n") else 0)
-        return {
-            "path": relative,
-            "symbol": {
-                key: matched.get(key) for key in ("name", "type", "qualified_name") if matched.get(key) is not None
-            },
-            "start_line": slice_start,
-            "end_line": slice_start + max(0, returned_lines - 1),
-            "source": source,
-            "returned_lines": returned_lines,
-            "returned_bytes": len(source.encode("utf-8")),
-            "truncated": line_truncated or byte_truncated,
-            "line_truncated": line_truncated,
-            "byte_truncated": byte_truncated,
-        }
-
-    def symbol_at(self, file_path: str, line: int) -> dict[str, Any] | None:
-        """Return the narrowest inventory symbol containing a one-based source line."""
-        if line < 1:
-            raise ValueError("line must be 1 or greater.")
-        target = self._resolve_repo_path(file_path, require_file=True)
-        relative = target.relative_to(self.root_path).as_posix()
-        matches = [
-            symbol
-            for symbol in self._get_symbol_inventory()
-            if symbol.get("path") == relative
-            and int(symbol.get("start_line", 0)) <= line <= int(symbol.get("end_line", 0))
-        ]
-        if not matches:
-            return None
-        selected = min(
-            matches,
-            key=lambda symbol: (
-                int(symbol.get("end_line", 0)) - int(symbol.get("start_line", 0)),
-                -int(symbol.get("start_line", 0)),
-            ),
-        )
-        return cast(dict[str, Any], dict(selected))
-
-    def _resolve_file_inside_root(self, file_path: str) -> Path:
-        """Resolve a file path and require it to remain inside the repository root."""
-        target_path = Path(file_path).expanduser()
-        if not target_path.is_absolute():
-            target_path = self.root_path / target_path
-
-        target_path = target_path.resolve()
-        try:
-            target_path.relative_to(self.root_path)
-        except ValueError:
-            raise ValueError(f"File '{file_path}' is outside repository root '{self.root_path}'.")
-
-        return target_path
-
-    def _get_skeleton_cache_key(self, file_path: Path, symbol_types: list[str] | None) -> str:
-        """Include outline filters in the skeleton cache identity."""
-        types_key = ",".join(symbol_types or [])
-        return f"{self._get_cache_key(file_path)}:outline-types={types_key}"
-
-    def _get_file_skeleton_enhanced(
-        self, file_path: Path, max_symbols: int, symbol_types: list[str] | None = None
-    ) -> list[str]:
-        """Extract symbol signatures using ast-grep outline."""
-        # Check cache first
-        cache_key = self._get_skeleton_cache_key(file_path, symbol_types)
-        cached_symbols = self._get_cached_symbols(cache_key)
-        if cached_symbols is not None:
-            return self._format_enhanced_skeleton(cached_symbols, max_symbols)
-
-        language = LANGUAGE_MAP.get(file_path.suffix.lower())
-        if not language:
-            return []
-
-        try:
-            if file_path.stat().st_size > MAX_SKELETON_FILE_BYTES:
-                return []
-
-            args = ["outline", "--json=compact", "--view=expanded"]
-            if symbol_types:
-                args.extend(["--type", ",".join(symbol_types)])
-            args.append(str(file_path))
-            result = run_ast_grep(args)
-            outlines = parse_json_array(result.stdout)
-            symbols: list[SymbolSkeleton] = []
-            for outline in outlines:
-                if not isinstance(outline, Mapping):
-                    continue
-                items = outline.get("items", [])
-                if not isinstance(items, list):
-                    continue
-                for item in items:
-                    if not isinstance(item, Mapping):
-                        continue
-                    self._append_outline_symbol(symbols, item)
-
-            self._set_cached_symbols(cache_key, symbols)
-
-            return self._format_enhanced_skeleton(symbols, max_symbols)
-
-        except Exception:
-            return []
-
-    def _append_outline_symbol(self, symbols: list[SymbolSkeleton], item: Mapping[str, Any]) -> None:
-        """Append an outline item and its expanded direct members."""
-        name = item.get("name")
-        symbol_type = item.get("symbolType")
-        signature = item.get("signature")
-        if isinstance(name, str) and isinstance(symbol_type, str) and isinstance(signature, str):
-            symbols.append({"name": name, "type": symbol_type, "signature": signature, "doc": ""})
-
-        members = item.get("members", [])
-        if isinstance(members, list):
-            for member in members:
-                if isinstance(member, Mapping):
-                    self._append_outline_symbol(symbols, member)
-
-    def _format_enhanced_skeleton(self, symbols: list[SymbolSkeleton], max_symbols: int) -> list[str]:
-        """Format enhanced symbol info for display."""
-        if not symbols:
-            return []
-
-        lines = []
-        shown_count = min(len(symbols), max_symbols)
-
-        for symbol in symbols[:shown_count]:
-            line = symbol.get("signature", "")
-            doc = symbol.get("doc", "")
-            if doc:
-                line += f" # {doc}"
-            lines.append(line)
-
-        if len(symbols) > max_symbols:
-            remaining = len(symbols) - max_symbols
-            lines.append(f"... and {remaining} more")
-
-        return lines
-
-    def _supported_source_snapshot(self) -> tuple[str, list[Path]]:
-        """Return a bounded supported-source manifest and its content-sensitive identity."""
-        policy = self._parse_gitignore()
-        files: list[Path] = []
-        manifest: list[tuple[str, int, str]] = []
-        total_bytes = 0
-        argument_chars = 0
-        stack = [self.root_path]
-        while stack:
-            directory = stack.pop()
-            try:
-                children = sorted(directory.iterdir(), key=lambda path: path.as_posix(), reverse=True)
-            except OSError:
-                continue
-            for path in children:
-                if self._should_exclude(path, policy):
-                    continue
-                if path.is_dir():
-                    stack.append(path)
-                    continue
-                if not path.is_file() or path.suffix.lower() not in LANGUAGE_MAP:
-                    continue
-                try:
-                    content = path.read_bytes()
-                except OSError:
-                    continue
-                total_bytes += len(content)
-                if len(files) >= MAX_INVENTORY_FILES or total_bytes > MAX_INVENTORY_SOURCE_BYTES:
-                    raise ValueError("Supported-source inventory exceeds XRAY's repository bounds.")
-                files.append(path)
-                argument_chars += len(str(path)) + 1
-                if argument_chars > MAX_SOURCE_ARGUMENT_CHARS:
-                    raise ValueError("Supported-source paths exceed XRAY's subprocess argument bound.")
-                manifest.append((path.relative_to(self.root_path).as_posix(), len(content), self._sha256(content)))
-        fingerprint = self._sha256(
-            self._canonical_json({"inventory_schema": INVENTORY_SCHEMA_VERSION, "files": sorted(manifest)})
-        )
-        return fingerprint, files
-
-    def repository_snapshot_fingerprint(self) -> str:
-        """Return a bounded content identity for adapter continuation cursors."""
-        policy = self._parse_gitignore()
-        manifest: list[tuple[str, int, str]] = []
-        total_bytes = 0
-        stack = [self.root_path]
-        while stack:
-            directory = stack.pop()
-            try:
-                children = sorted(directory.iterdir(), key=lambda path: path.as_posix(), reverse=True)
-            except OSError:
-                continue
-            for path in children:
-                if self._should_exclude(path, policy):
-                    continue
-                if path.is_dir():
-                    stack.append(path)
-                    continue
-                if not path.is_file():
-                    continue
-                try:
-                    content = path.read_bytes()
-                except OSError:
-                    continue
-                total_bytes += len(content)
-                if len(manifest) >= MAX_INVENTORY_FILES or total_bytes > MAX_INVENTORY_SOURCE_BYTES:
-                    raise ValueError("Repository snapshot exceeds XRAY's cursor fingerprint bounds.")
-                manifest.append((path.relative_to(self.root_path).as_posix(), len(content), self._sha256(content)))
-        return self._sha256(self._canonical_json(sorted(manifest)))[:24]
-
-    def _load_inventory_cache(self, fingerprint: str) -> list[dict[str, Any]] | None:
-        """Load a validated snapshot-bound inventory from the optional disk cache."""
-        if self.cache_dir is None:
-            return None
-        cache_file = self.cache_dir / INVENTORY_CACHE_FILENAME
-        try:
-            value = json.loads(cache_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        if not isinstance(value, Mapping) or value.get("fingerprint") != fingerprint:
-            return None
-        symbols = value.get("symbols")
-        if not isinstance(symbols, list) or len(symbols) > MAX_INVENTORY_SYMBOLS:
-            return None
-        if not all(isinstance(symbol, dict) for symbol in symbols):
-            return None
-        return [dict(symbol) for symbol in symbols]
-
-    def _save_inventory_cache(self, fingerprint: str, symbols: list[dict[str, Any]]) -> None:
-        """Atomically persist a bounded symbol inventory when disk caching is available."""
-        if self.cache_dir is None:
-            return
-        temporary_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile("w", dir=self.cache_dir, delete=False, encoding="utf-8") as stream:
-                json.dump({"fingerprint": fingerprint, "symbols": symbols}, stream, separators=(",", ":"))
-                stream.flush()
-                os.fsync(stream.fileno())
-                temporary_path = Path(stream.name)
-            os.replace(temporary_path, self.cache_dir / INVENTORY_CACHE_FILENAME)
-        except (OSError, TypeError, ValueError):
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
-
-    def _append_inventory_symbol(
-        self,
-        symbols: list[dict[str, Any]],
-        item: Mapping[str, Any],
-        *,
-        path: str,
-        language: str,
-        owner: str | None = None,
-    ) -> None:
-        """Flatten one outline item while retaining owner and qualified identity."""
-        name = item.get("name")
-        if isinstance(name, str) and name:
-            range_data = item.get("range")
-            start = range_data.get("start", {}) if isinstance(range_data, Mapping) else {}
-            end = range_data.get("end", {}) if isinstance(range_data, Mapping) else {}
-            start_line = self._normalize_ast_grep_line(start.get("line") if isinstance(start, Mapping) else None)
-            end_line = self._normalize_ast_grep_line(
-                end.get("line", start_line - 1) if isinstance(end, Mapping) else start_line - 1
-            )
-            qualified_name = f"{owner}.{name}" if owner else name
-            is_public = item.get("isPublic")
-            visibility = self._inventory_visibility(name, language, is_public, item.get("isExported"))
-            symbol_type = str(item.get("symbolType") or "symbol")
-            ast_kind = str(item.get("astKind") or "")
-            signature = str(item.get("signature") or name)
-            if symbol_type == "typeParameter" and ast_kind == "type_declaration":
-                symbol_type = "type"
-            if ast_kind == "variable_declarator" and ("=>" in signature or "function" in signature):
-                symbol_type = "function"
-            symbols.append(
-                {
-                    "name": name,
-                    "type": symbol_type,
-                    "path": path,
-                    "start_line": start_line,
-                    "end_line": end_line,
-                    "language": language,
-                    "owner": owner,
-                    "qualified_name": qualified_name,
-                    "signature": signature,
-                    "role": str(item.get("role") or ("member" if owner else "item")),
-                    "visibility": visibility,
-                    "doc": "",
-                }
-            )
-            owner = qualified_name
-        members = item.get("members")
-        if isinstance(members, list):
-            for member in members:
-                if isinstance(member, Mapping):
-                    self._append_inventory_symbol(symbols, member, path=path, language=language, owner=owner)
-
-    def _get_symbol_inventory(self) -> list[dict[str, Any]]:
-        """Build one expanded outline per dirty-source snapshot and cache the result."""
-        fingerprint, source_files = self._supported_source_snapshot()
-        if fingerprint == self._inventory_fingerprint and self._inventory is not None:
-            self.last_search_succeeded = True
-            return self._inventory
-        cached = self._load_inventory_cache(fingerprint)
-        if cached is not None:
-            self._inventory_fingerprint = fingerprint
-            self._inventory = cached
-            self.last_search_succeeded = True
-            return cached
-        if not source_files:
-            self._inventory_fingerprint = fingerprint
-            self._inventory = []
-            self.last_search_succeeded = True
-            return []
-        try:
-            result = run_ast_grep(
-                ["outline", "--json=compact", "--view=expanded", *(str(path) for path in source_files)]
-            )
-            outlines = parse_json_array(result.stdout)
-        except (AstGrepCommandError, AstGrepNotFoundError, json.JSONDecodeError, ValueError) as exc:
-            self.last_warnings.append(str(exc))
-            self.last_search_succeeded = False
-            return []
-
-        source_paths = {path.relative_to(self.root_path).as_posix(): path for path in source_files}
-        symbols: list[dict[str, Any]] = []
-        for outline in outlines:
-            outline_path = outline.get("path") or outline.get("file")
-            if not isinstance(outline_path, str):
-                continue
-            candidate = Path(outline_path)
-            if candidate.is_absolute():
-                try:
-                    relative_path = candidate.resolve().relative_to(self.root_path).as_posix()
-                except ValueError:
-                    continue
-            else:
-                relative_path = candidate.as_posix()
-            source_path = source_paths.get(relative_path)
-            if source_path is None:
-                continue
-            items = outline.get("items")
-            if not isinstance(items, list):
-                continue
-            for item in items:
-                if isinstance(item, Mapping):
-                    self._append_inventory_symbol(
-                        symbols,
-                        item,
-                        path=relative_path,
-                        language=LANGUAGE_MAP[source_path.suffix.lower()],
-                    )
-                    if len(symbols) > MAX_INVENTORY_SYMBOLS:
-                        raise ValueError("Symbol inventory exceeds XRAY's result bound.")
-        self._inventory_fingerprint = fingerprint
-        self._inventory = symbols
-        self.last_search_succeeded = True
-        self._save_inventory_cache(fingerprint, symbols)
-        return symbols
-
-    @staticmethod
-    def _normalized_symbol_text(value: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", value.lower())
-
-    def _score_inventory_symbol(self, query: str, symbol: Mapping[str, Any]) -> tuple[int, str, str]:
-        """Return calibrated score, reason, and confidence without owner pollution."""
-        query_lower = query.strip().lower()
-        name = str(symbol["name"]).lower()
-        qualified_name = str(symbol.get("qualified_name") or name).lower().replace("::", ".")
-        path = str(symbol.get("path") or "").lower()
-        qualified_query = "." in query_lower or "::" in query_lower
-        path_query = "/" in query_lower or "\\" in query_lower
-        normalized_query = self._normalized_symbol_text(query_lower)
-
-        if qualified_query:
-            candidate = qualified_name
-            normalized_candidate = self._normalized_symbol_text(candidate)
-            if query_lower.replace("::", ".") == candidate:
-                return 100, "exact_qualified_name", "high"
-        elif path_query:
-            candidate = f"{path}:{qualified_name}"
-            normalized_candidate = self._normalized_symbol_text(candidate)
-            if query_lower.replace("\\", "/") in {path, f"{path}:{qualified_name}"}:
-                return 100, "exact_path_context", "high"
-        else:
-            candidate = name
-            normalized_candidate = self._normalized_symbol_text(name)
-            if query_lower == name:
-                return 100, "exact_name", "high"
-
-        if normalized_query and normalized_query == normalized_candidate:
-            return 95, "normalized_name", "high"
-        if query_lower and candidate.startswith(query_lower):
-            return 85, "prefix", "medium"
-        query_tokens = {part for part in re.split(r"[^a-z0-9]+", query_lower) if part}
-        candidate_tokens = {part for part in re.split(r"[^a-z0-9]+", candidate) if part}
-        if query_tokens and query_tokens <= candidate_tokens:
-            return 75, "token", "medium"
-        return min(int(fuzz.ratio(query_lower, candidate)), 59), "fuzzy", "low"
-
-    def find_symbol(
-        self,
-        query: str,
-        limit: int | None = 10,
-        min_score: int = 60,
-        include_scores: bool = True,
-        *,
-        paths: Sequence[str] | None = None,
-        languages: Sequence[str] | None = None,
-        symbol_types: Sequence[str] | None = None,
-        visibility: Sequence[str] | None = None,
-    ) -> list[SymbolMatch]:
-        """Find symbols by calibrated name identity after contained scope filtering."""
-        if not query.strip():
-            raise ValueError("Symbol query must not be empty.")
-        if limit is not None and limit < 0:
-            raise ValueError("limit must be 0 or greater.")
-        if not 0 <= min_score <= 100:  # noqa: PLR2004 - public score scale is defined as 0..100
-            raise ValueError("min_score must be between 0 and 100.")
-        _resolved, relative_paths = self._operation_scopes(paths)
-        normalized_languages = {value.lower() for value in languages or ()}
-        unknown_languages = normalized_languages - set(LANGUAGE_MAP.values())
-        if unknown_languages:
-            raise ValueError(f"Unsupported language filter: {sorted(unknown_languages)[0]}.")
-        normalized_types = {value.lower() for value in symbol_types or ()}
-        normalized_visibility = {value.lower() for value in visibility or ()}
-        if normalized_visibility - {"public", "private", "unknown"}:
-            raise ValueError("visibility filters must be public, private, or unknown.")
-        self.last_warnings = []
-        self.last_search_succeeded = False
-        scored: list[tuple[int, int, dict[str, Any]]] = []
-        reason_priority = {
-            "exact_qualified_name": 6,
-            "exact_path_context": 6,
-            "exact_name": 5,
-            "normalized_name": 4,
-            "prefix": 3,
-            "token": 2,
-            "fuzzy": 1,
-        }
-        for symbol in self._get_symbol_inventory():
-            symbol_path = str(symbol.get("path") or "")
-            if relative_paths and not any(
-                scope in {".", symbol_path} or symbol_path.startswith(f"{scope}/") for scope in relative_paths
-            ):
-                continue
-            if normalized_languages and str(symbol.get("language", "")).lower() not in normalized_languages:
-                continue
-            if normalized_types and str(symbol.get("type", "")).lower() not in normalized_types:
-                continue
-            if normalized_visibility and str(symbol.get("visibility", "unknown")).lower() not in normalized_visibility:
-                continue
-            score, reason, confidence = self._score_inventory_symbol(query, symbol)
-            if score < min_score:
-                continue
-            result = dict(symbol)
-            result.update({"match_reason": reason, "confidence": confidence})
-            if include_scores:
-                result["score"] = score
-            scored.append((score, reason_priority[reason], result))
-        scored.sort(
-            key=lambda value: (
-                -value[0],
-                -value[1],
-                str(value[2].get("qualified_name", "")).lower(),
-                str(value[2].get("path", "")),
-                int(value[2].get("start_line", 0)),
-            )
-        )
-        self.last_find_total = len(scored)
-        selected = scored if limit is None else scored[:limit]
-        return [cast(SymbolMatch, value[2]) for value in selected]
-
-    def _get_metavariable(self, metavars: dict[str, Any], name: str) -> dict[str, Any] | None:
-        """Return a metavariable from old or current ast-grep JSON shapes."""
-        if name in metavars:
-            value = metavars[name]
-            if isinstance(value, dict):
-                return value
-
-        single_vars = metavars.get("single", {})
-        if isinstance(single_vars, dict):
-            value = single_vars.get(name)
-            if isinstance(value, dict):
-                return value
-
-        return None
-
-    def _normalize_ast_grep_line(self, line: int | None) -> int:
-        """Convert ast-grep zero-based line values to one-based line numbers."""
-        if line is None:
-            return 1
-        return int(line) + 1
-
-    def _extract_symbol_name(self, text: str) -> str | None:
-        """Extract the symbol name from matched text."""
-        # Patterns to extract names from different definition types
-        patterns = [
-            r"(?:def|class|function|interface|type)\s+(\w+)",
-            r"(?:const|let|var)\s+(\w+)\s*=",
-            r"func\s+(?:\([^)]+\)\s+)?(\w+)",
+        if first_index is None:
+            raise _IndexerFailure("internal_error", "first read result item has no source segment")
+        first_segment = segments[first_index]
+        boundaries = [
+            offset
+            for offset in range(first_start + 1, first_end + 1)
+            if first_segment.geometry.is_boundary(offset)
+            and not (offset < first_segment.end and first_segment.geometry.data[offset - 1 : offset + 1] == b"\r\n")
         ]
 
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                return match.group(1)
-
-        return None
-
-    def what_breaks(
-        self,
-        exact_symbol: Mapping[str, Any],
-        context_lines: int = 2,
-        max_results: int | None = None,
-    ) -> ImpactResult:
-        """
-        Find likely code references to a symbol name using structural search.
-        Prioritizes ast-grep for code references, falls back to text search.
-        """
-        symbol_name = exact_symbol["name"]
-        definition_path_value = exact_symbol.get("abs_path") or exact_symbol["path"]
-        definition_path = str(Path(definition_path_value).resolve())
-        definition_start = exact_symbol.get("start_line", -1)
-        definition_end = exact_symbol.get("end_line", definition_start)
-
-        if max_results is not None and max_results < 1:
-            raise ValueError("max_results must be 1 or greater.")
-        strategy = "structural"
-        degradation_reason: str | None = None
-
-        raw_cap = max_results
-        execution_limited = False
-        structural_error: str | None = None
-        while True:
-            references, total_exact, structural_error = self._ast_grep_search(symbol_name, context_lines, raw_cap)
-            filtered_references = self._filter_impact_references(
-                references,
-                symbol_name,
-                definition_path,
-                int(definition_start),
-                int(definition_end),
-            )
-            enough = max_results is None or len(filtered_references) >= max_results
-            if enough or total_exact or raw_cap is None:
-                break
-            if raw_cap >= MAX_IMPACT_RAW_RESULTS:
-                execution_limited = True
-                break
-            raw_cap = min(MAX_IMPACT_RAW_RESULTS, max(raw_cap + 1, raw_cap * 2))
-
-        if not filtered_references:
-            strategy = "text"
-            references, total_exact = self._text_search(symbol_name, context_lines, max_results)
-            filtered_references = self._filter_impact_references(
-                references,
-                symbol_name,
-                definition_path,
-                int(definition_start),
-                int(definition_end),
-            )
-            degradation_reason = (
-                structural_error or "Structural search returned no usable candidates; used text fallback."
-            )
-
-        raw_count = len(references)
-        references = filtered_references
-        definition_count = sum(reference.get("type") == "definition" for reference in references)
-        lower_bound = "at least " if not total_exact else ""
-
-        return {
-            "references": references,
-            "total_count": len(references),
-            "raw_count": raw_count,
-            "filtered_count": raw_count - len(references),
-            "strategy": strategy,
-            "note": (
-                f"Found {lower_bound}{len(references)} name-based references using {strategy} search; "
-                f"{definition_count} same-name definitions are classified separately and are not dependents."
-            ),
-            "total_exact": total_exact,
-            "degradation_reason": degradation_reason,
-            "execution_limited": execution_limited,
-            "execution_cap": raw_cap,
-        }
-
-    def _ast_grep_search(
-        self, symbol_name: str, context_lines: int, max_results: int | None
-    ) -> tuple[list[ImpactReference], bool, str | None]:
-        """Search for symbol-name code references using ast-grep."""
-        references: list[ImpactReference] = []
-        try:
-            _fingerprint, source_files = self._supported_source_snapshot()
-            if not source_files:
-                return [], True, None
-            args = ["run", "--pattern", symbol_name, "-C", str(context_lines), *(str(path) for path in source_files)]
-            if max_results is None:
-                args.insert(3, "--json=compact")
-                matches = parse_json_array(run_ast_grep(args).stdout)
-                total_exact = True
-            else:
-                bounded = run_ast_grep_bounded(args, max_results)
-                matches = bounded.matches
-                total_exact = bounded.total_exact
-        except (AstGrepCommandError, AstGrepNotFoundError, json.JSONDecodeError, ValueError) as exc:
-            return references, True, f"Structural search failed: {exc}"
-
-        for match in matches:
-            code_snippet = (match.get("lines") or match.get("text") or "").strip()
-            matched_text = self._matched_ast_grep_line(match, symbol_name)
-            line_num = self._normalize_ast_grep_line(match.get("range", {}).get("start", {}).get("line"))
-            reference_type, confidence = self._classify_impact_reference(symbol_name, matched_text, structural=True)
-            references.append(
-                {
-                    "file": match.get("file", ""),
-                    "line": line_num,
-                    "text": code_snippet,
-                    "matched_text": matched_text,
-                    "type": reference_type,
-                    "confidence": confidence,
+        def prefix(boundary: int) -> tuple[ReadData, str | None]:
+            prefix_ref = first.ref.model_copy(update={"end": boundary})
+            prefix_item = first.model_copy(
+                update={
+                    "ref": prefix_ref,
+                    "location": Range(
+                        start=first_segment.geometry.position(first_start),
+                        end=first_segment.geometry.position(boundary),
+                    ),
+                    "source": first_segment.geometry.decode(first_start, boundary),
                 }
             )
-
-        return references, total_exact, None
-
-    @staticmethod
-    def _matched_ast_grep_line(match: Mapping[str, Any], symbol_name: str) -> str:
-        """Return the exact matched source line from an ast-grep context block."""
-        context = str(match.get("lines") or match.get("text") or "")
-        char_count = match.get("charCount")
-        leading = char_count.get("leading") if isinstance(char_count, Mapping) else None
-        if isinstance(leading, int) and 0 <= leading <= len(context):
-            line_start = context.rfind("\n", 0, leading) + 1
-            line_end = context.find("\n", leading)
-            if line_end < 0:
-                line_end = len(context)
-            return context[line_start:line_end].strip()
-        word = re.compile(r"\b" + re.escape(symbol_name) + r"\b")
-        return next((line.strip() for line in context.splitlines() if word.search(line)), context.strip())
-
-    @staticmethod
-    def _classify_impact_reference(symbol_name: str, text: str, *, structural: bool) -> tuple[str, str]:
-        """Classify one name match without claiming type-aware dependency analysis."""
-        escaped = re.escape(symbol_name)
-        if re.search(rf"\b(?:def|class|function|interface|type|enum)\s+{escaped}\b", text) or re.search(
-            rf"\b(?:const|let|var)\s+{escaped}\s*=", text
-        ):
-            return "definition", "high"
-        if re.search(rf"\b(?:import|from)\b[^\n]*\b{escaped}\b", text) or re.search(
-            rf"\b{escaped}\b[^\n]*\b(?:from|require)\b", text
-        ):
-            return "import", "high"
-        if re.search(rf"\b{escaped}\s*\(", text):
-            return "call", "high" if structural else "medium"
-        return ("read", "medium") if structural else ("text", "low")
-
-    def _filter_impact_references(
-        self,
-        references: list[ImpactReference],
-        symbol_name: str,
-        definition_path: str,
-        definition_start: int,
-        definition_end: int,
-    ) -> list[ImpactReference]:
-        """Keep only exact, source-file references outside the symbol definition."""
-        filtered: list[ImpactReference] = []
-        seen: set[tuple[str, int, str, str]] = set()
-        word_pattern = re.compile(r"\b" + re.escape(symbol_name) + r"\b")
-        gitignore_patterns = self._parse_gitignore()
-
-        for ref in references:
-            ref_file = str(ref.get("file", ""))
-            if not ref_file:
-                continue
-
-            ref_path = self._resolve_impact_reference_path(ref_file)
-            if ref_path is None or not self._is_supported_impact_file(ref_path, gitignore_patterns):
-                continue
-
-            text = str(ref.get("text", ""))
-            matched_text = str(ref.get("matched_text") or text)
-            if not word_pattern.search(matched_text):
-                continue
-
-            ref_line = int(ref.get("line", 0))
-            ref_path_str = str(ref_path)
-            if ref_path_str == definition_path and definition_start <= ref_line <= definition_end:
-                continue
-
-            ref_type = str(ref.get("type", "text"))
-            confidence = str(ref.get("confidence", "low"))
-            key = (ref_path_str, ref_line, text, ref_type)
-            if key in seen:
-                continue
-
-            seen.add(key)
-            filtered_ref: ImpactReference = {
-                "file": ref_path_str,
-                "line": ref_line,
-                "text": text,
-                "type": ref_type,
-                "confidence": confidence,
-            }
-            if "matched_text" in ref:
-                filtered_ref["matched_text"] = matched_text
-            filtered.append(filtered_ref)
-
-        return filtered
-
-    def _resolve_impact_reference_path(self, file_path: str) -> Path | None:
-        """Resolve ast-grep/rg result paths relative to the repository root."""
-        path = Path(file_path).expanduser()
-        if not path.is_absolute():
-            path = self.root_path / path
-        try:
-            return path.resolve()
-        except OSError:
-            return None
-
-    def _is_supported_impact_file(self, path: Path, gitignore_patterns: IgnorePolicy) -> bool:
-        """Return whether impact analysis should report a file as code."""
-        return path.suffix.lower() in LANGUAGE_MAP and not self._should_exclude(path, gitignore_patterns)
-
-    def _text_search(
-        self, symbol_name: str, context_lines: int, max_results: int | None
-    ) -> tuple[list[ImpactReference], bool]:
-        """Unified text search (ripgrep -> python fallback)."""
-        if max_results is not None:
-            return self._python_text_search(symbol_name, max_results=max_results)
-        references: list[ImpactReference] = []
-        gitignore_patterns = self._parse_gitignore()
-
-        # Try ripgrep
-        try:
-            cmd = ["rg", "-w", "--json", "-C", str(context_lines), symbol_name, str(self.root_path)]
-            with tempfile.TemporaryFile("w+", encoding="utf-8") as stdout_file:
-                result = subprocess.run(
-                    cmd,
-                    stdout=stdout_file,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    text=True,
-                    timeout=RG_TIMEOUT_SECONDS,
+            prefix_data = ReadData(items=[prefix_item])
+            prefix_cursor = (
+                make_cursor(
+                    first_index,
+                    boundary,
                 )
-                stdout = self._read_limited_process_output(stdout_file, MAX_RG_OUTPUT_CHARS)
-            if result.returncode == 0:
-                for line in stdout.strip().split("\n"):
-                    if line:
-                        try:
-                            data = json.loads(line)
-                            if data.get("type") == "match":
-                                match_data = data.get("data", {})
-                                file_path = match_data.get("path", {}).get("text", "")
-                                resolved = self._resolve_impact_reference_path(file_path)
-                                if resolved is None or not self._is_supported_impact_file(resolved, gitignore_patterns):
-                                    continue
-                                references.append(
-                                    {
-                                        "file": str(resolved),
-                                        "line": match_data.get("line_number", 0),
-                                        "text": match_data.get("lines", {}).get("text", "").strip(),
-                                        "type": "text",
-                                        "confidence": "low",
-                                    }
-                                )
-                        except json.JSONDecodeError:
-                            continue
-                return references, True
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+                if boundary < first_segment.end
+                else make_cursor(first_index + 1, None)
+            )
+            return prefix_data, prefix_cursor
 
-        # Python fallback (simplified, no context for now to save complexity)
-        return self._python_text_search(symbol_name)
+        best: tuple[ReadData, str | None] | None = None
+        low = 0
+        high = len(boundaries) - 1
+        while low <= high:
+            local_budget.check_deadline()
+            middle = (low + high) // 2
+            candidate = prefix(boundaries[middle])
+            _candidate_result, candidate_size = sized_result(*candidate)
+            if candidate_size <= page.max_bytes:
+                best = candidate
+                low = middle + 1
+            else:
+                high = middle - 1
+        if best is None:
+            minimum_candidate = prefix(boundaries[0]) if boundaries else (data, next_cursor)
+            _minimum_result, minimum = sized_result(*minimum_candidate)
+            raise _IndexerFailure(
+                "budget_too_small",
+                "one read result cannot fit the requested byte budget",
+                action="narrow_query",
+                minimum_bytes=minimum,
+            )
+        local_budget.check_deadline()
+        return best
 
-    def _read_limited_process_output(self, stream: Any, limit: int) -> str:
-        """Read a temp-backed subprocess stream only when it is within the configured cap."""
-        stream.seek(0, os.SEEK_END)
-        length = stream.tell()
-        if length > limit:
-            return ""
+    def read(
+        self,
+        capture: RepositoryCapture,
+        targets: Sequence[ReadTarget],
+        *,
+        context_lines: int = 0,
+        include_enclosing: bool = True,
+        budget: OperationBudget | None = None,
+    ) -> ReadData:
+        """Resolve and read a validated target batch from one capture."""
 
-        stream.seek(0)
-        output = stream.read()
-        if len(output) > limit:
-            return ""
-        return output
+        local_budget = budget or OperationBudget()
+        data, _cursor = self._read_data(
+            capture,
+            targets,
+            context_lines=context_lines,
+            include_enclosing=include_enclosing,
+            budget=local_budget,
+        )
+        return data
 
-    def _python_text_search(
-        self, symbol_name: str, max_results: int | None = None
-    ) -> tuple[list[ImpactReference], bool]:
-        """Fallback text search using Python when ripgrep is not available."""
-        references: list[ImpactReference] = []
-        _fingerprint, source_files = self._supported_source_snapshot()
+    # ------------------------------------------------------------------
+    # Typed operation service boundary
 
-        # Create word boundary pattern
-        pattern = re.compile(r"\b" + re.escape(symbol_name) + r"\b")
+    @staticmethod
+    def _normalized_query_payload(query: Any) -> Any:
+        payload = query.to_payload() if hasattr(query, "to_payload") else query
+        if isinstance(payload, Mapping):
+            normalized = dict(payload)
+            # Selection is represented by the final provider digest below.
+            # Omitting it here makes implicit and explicit equivalent
+            # selections share one semantic query identity.
+            normalized.pop("selection", None)
+            normalized.pop("focus", None)
+            return normalized
+        return payload
 
-        for file_path in source_files:
-            try:
-                with open(file_path, encoding="utf-8") as f:
-                    for line_num, line in enumerate(f, 1):
-                        if pattern.search(line):
-                            reference_type, confidence = self._classify_impact_reference(
-                                symbol_name, line, structural=False
-                            )
-                            references.append(
-                                {
-                                    "file": str(file_path),
-                                    "line": line_num,
-                                    "text": line.strip(),
-                                    "type": reference_type,
-                                    "confidence": confidence,
-                                }
-                            )
-                            if max_results is not None and len(references) >= max_results:
-                                return references, False
-            except Exception:
-                continue
+    @staticmethod
+    def _query_projection(query: Any, *, op: str) -> dict[str, Any]:
+        payload = query.to_payload() if hasattr(query, "to_payload") else {}
+        values: dict[str, Any] = {"operation": op}
+        if isinstance(payload, Mapping):
+            for name in ("detail", "sections", "member_depth", "documentation", "include_enclosing"):
+                if name in payload:
+                    values[name] = payload[name]
+        return values
 
-        return references, True
+    def _query_digest(
+        self,
+        query: Any,
+        *,
+        op: str,
+        capture: RepositoryCapture,
+        snapshot: str | None = None,
+        projection: Any | None = None,
+    ) -> str:
+        final_snapshot = snapshot or capture.manifest.snapshot_digest
+        return repository_query_digest(
+            op,
+            self._normalized_query_payload(query),
+            projection if projection is not None else self._query_projection(query, op=op),
+            capture.manifest.selection_digest,
+            final_snapshot,
+            self._toolchain_id(),
+        )
+
+    def _repository_provenance(
+        self,
+        *,
+        op: Literal["map", "find", "interface", "read", "impact", "search"],
+        query: Any,
+        capture: RepositoryCapture,
+        snapshot: str | None = None,
+        projection: Any | None = None,
+    ) -> RepositoryProvenance:
+        final_snapshot = snapshot or capture.manifest.snapshot_digest
+        return RepositoryProvenance(
+            kind="repository",
+            consistency="captured_read_set",
+            query=self._query_digest(
+                query,
+                op=op,
+                capture=capture,
+                snapshot=final_snapshot,
+                projection=projection,
+            ),
+            selection=capture.manifest.selection_digest,
+            snapshot=final_snapshot,
+            toolchain=self._toolchain_id(),
+        )
+
+    def _execute_map(
+        self,
+        arguments: MapArguments,
+        *,
+        budget: OperationBudget | None = None,
+    ) -> Success:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        query = arguments.query.model_copy(
+            update={"focus": sorted(arguments.query.focus, key=lambda value: value.encode("utf-8"))}
+        )
+        selection = Selection(paths=list(query.focus), exclusions=query.exclusions)
+        capture = self._capture_namespace(
+            selection,
+            budget=local_budget,
+            horizon={"focus": tuple(query.focus), "depth": query.depth},
+        )
+        provenance = self._repository_provenance(op="map", query=query, capture=capture)
+        page = arguments.page or PageMap()
+        rows = self._map_projection(capture, query, budget=local_budget)
+        row_ids = rows.row_ids
+        if len(row_ids) != len(set(row_ids)):
+            raise _IndexerFailure("internal_error", "map row identities are not unique")
+        start = self._seek_collection(
+            page.cursor,
+            op="map",
+            query_digest=provenance.query,
+            capture=capture,
+            row_ids=row_ids,
+            budget=local_budget,
+        )
+        if start > len(rows):
+            raise _IndexerFailure("invalid_cursor", "map cursor is beyond the result", action="restart_query")
+        return self._collection_result(
+            op="map",
+            capture=capture,
+            provenance=provenance,
+            coverage=Coverage(state="complete", basis="namespace"),
+            page=page,
+            rows=rows,
+            start=start,
+            row_ids=row_ids,
+            data_factory=lambda selected, _owners: MapData(items=selected),
+            budget=local_budget,
+        )
+
+    def _execute_find(
+        self,
+        arguments: FindArguments,
+        *,
+        budget: OperationBudget | None = None,
+        cache: DerivedCache | None = None,
+    ) -> Success:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        query = arguments.query
+        capture = self._capture_sources(query.selection, budget=local_budget)
+        provenance = self._repository_provenance(op="find", query=query, capture=capture)
+        page = arguments.page or PageFind()
+        rows, coverage = self._find_items(capture, query, cache=cache, budget=local_budget)
+        row_ids = rows.row_ids if isinstance(rows, _FindProjection) else [item.row_id for item in rows]
+        start = self._seek_collection(
+            page.cursor,
+            op="find",
+            query_digest=provenance.query,
+            capture=capture,
+            row_ids=row_ids,
+            budget=local_budget,
+        )
+        if start > len(rows):
+            raise _IndexerFailure("invalid_cursor", "find cursor is beyond the result", action="restart_query")
+        return self._collection_result(
+            op="find",
+            capture=capture,
+            provenance=provenance,
+            coverage=coverage,
+            page=page,
+            rows=rows,
+            start=start,
+            row_ids=row_ids,
+            data_factory=lambda selected, _owners: FindData(items=selected),
+            budget=local_budget,
+        )
+
+    def _execute_interface(
+        self,
+        arguments: InterfaceArguments,
+        *,
+        budget: OperationBudget | None = None,
+        cache: DerivedCache | None = None,
+    ) -> Success:
+        local_budget = budget or OperationBudget()
+        local_budget.check_deadline()
+        query = arguments.query
+        if isinstance(query, InterfaceFileQuery):
+            selection = Selection(paths=[query.target.path], exclusions="default")
+            capture = self._capture_sources(selection, budget=local_budget)
+        elif isinstance(query, InterfaceSymbolQuery):
+            selection = Selection(paths=[query.target.path], exclusions="default")
+            capture = self._capture_sources(selection, budget=local_budget)
+        else:
+            raise _IndexerFailure("invalid_request", "interface target is unsupported")
+        provenance = self._repository_provenance(op="interface", query=query, capture=capture)
+        page = arguments.page or PageInterface()
+        owners: list[InterfaceOwner] | None = None
+        if isinstance(query, InterfaceFileQuery):
+            captured = capture.files[0] if capture.files else None
+            if captured is None:
+                raise _IndexerFailure(
+                    "invalid_reference",
+                    "interface target file was not captured",
+                    path=query.target.path,
+                )
+            rows, coverage = self._interface_file_rows(captured, query, cache=cache, budget=local_budget)
+        else:
+            rows, owners, coverage = self._interface_symbol_rows(capture, query, cache=cache, budget=local_budget)
+        row_ids = [self._interface_row_id(item) for item in rows]
+        if len(row_ids) != len(set(row_ids)):
+            raise _IndexerFailure("internal_error", "interface row identities are not unique")
+        start = self._seek_collection(
+            page.cursor,
+            op="interface",
+            query_digest=provenance.query,
+            capture=capture,
+            row_ids=row_ids,
+            budget=local_budget,
+        )
+        if start > len(rows):
+            raise _IndexerFailure("invalid_cursor", "interface cursor is beyond the result", action="restart_query")
+        return self._collection_result(
+            op="interface",
+            capture=capture,
+            provenance=provenance,
+            coverage=coverage,
+            page=page,
+            rows=rows,
+            start=start,
+            row_ids=row_ids,
+            owners=owners,
+            data_factory=lambda selected, owner_values: InterfaceData(
+                **({"owners": owner_values} if owner_values else {}),
+                items=selected,
+            ),
+            budget=local_budget,
+        )
+
+    @staticmethod
+    def _failure_error(
+        failure: _IndexerFailure | RepositoryError,
+        *,
+        op: str = "read",
+        root: Root | None = None,
+        provenance: RepositoryProvenance | None = None,
+    ) -> Error:
+        code = getattr(failure, "code", "internal_error")
+        message = str(failure)
+        if len(message.encode("utf-8")) > _MAX_ERROR_MESSAGE_BYTES:
+            encoded = message.encode("utf-8")[:_MAX_ERROR_MESSAGE_BYTES]
+            message = encoded.decode("utf-8", errors="ignore") or "analysis failed"
+        path = getattr(failure, "path", None)
+        detail_values: dict[str, Any] = {}
+        kind = getattr(failure, "kind", None)
+        if isinstance(kind, str) and kind:
+            detail_values["kind"] = kind
+        if isinstance(path, str) and path not in {".", ""}:
+            detail_values["path"] = path
+        minimum_bytes = getattr(failure, "minimum_bytes", None)
+        if (
+            isinstance(minimum_bytes, int)
+            and not isinstance(minimum_bytes, bool)
+            and minimum_bytes >= _MIN_ERROR_DETAIL_BYTES
+        ):
+            detail_values["minimum_bytes"] = minimum_bytes
+        details = ErrorDetails(**detail_values) if detail_values else None
+        action = getattr(failure, "action", None)
+        allowed_actions = {
+            "correct_input",
+            "refresh_reference",
+            "restart_query",
+            "narrow_query",
+            "install_dependency",
+            "inspect_worktree",
+            "report_bug",
+        }
+        error_values: dict[str, Any] = {
+            "code": cast(Any, code),
+            "message": message,
+            "at": "query.targets",
+        }
+        if action in allowed_actions:
+            error_values["action"] = action
+        if details is not None:
+            error_values["details"] = details
+        result_values: dict[str, Any] = {
+            "schema": "xray.v1",
+            "ok": False,
+            "op": op,
+            "error": ErrorValue(**error_values),
+        }
+        if root is not None:
+            result_values["root"] = root
+        if provenance is not None:
+            result_values["provenance"] = provenance
+        return Error(**result_values)
+
+    def execute(
+        self,
+        request: Request
+        | MapArguments
+        | FindArguments
+        | InterfaceArguments
+        | ReadArguments
+        | ImpactArguments
+        | SearchArguments,
+        *,
+        budget: OperationBudget | None = None,
+    ) -> Success | Error:
+        """Execute one typed repository analysis request."""
+
+        operation: str | None = None
+        arguments: Any
+        if isinstance(request, (MapRequest, MapArguments)):
+            operation = "map"
+            arguments = request
+        elif isinstance(request, (FindRequest, FindArguments)):
+            operation = "find"
+            arguments = request
+        elif isinstance(request, (InterfaceRequest, InterfaceArguments)):
+            operation = "interface"
+            arguments = request
+        elif isinstance(request, (ImpactRequest, ImpactArguments)):
+            operation = "impact"
+            arguments = request
+        elif isinstance(request, (SearchRequest, SearchArguments)):
+            operation = "search"
+            arguments = request
+        elif isinstance(request, (ReadRequest, ReadArguments)):
+            operation = "read"
+            arguments = request
+        else:
+            return Error(
+                schema="xray.v1",
+                ok=False,
+                error=ErrorValue(code="invalid_request", message="indexer accepts only typed analysis arguments"),
+            )
+        local_budget = budget or OperationBudget(timeout_seconds=arguments.execution.timeout_seconds)
+        cache = self._cache_for(arguments.execution.cache == "auto")
+        root: Root | None = None
+        provenance: RepositoryProvenance | None = None
+        previous_toolchain = self._active_toolchain
+        try:
+            local_budget.check_deadline()
+            if cache is not None:
+                cache.evict(budget=local_budget)
+            self._active_toolchain = self._observe_toolchain(budget=local_budget)
+            root = normalize_root(arguments.root)
+            if root.id != self.root.id:
+                raise _IndexerFailure("invalid_reference", "request root does not match this indexer root")
+            if operation == "map":
+                return self._execute_map(arguments, budget=local_budget)
+            if operation == "find":
+                return self._execute_find(arguments, budget=local_budget, cache=cache)
+            if operation == "interface":
+                return self._execute_interface(arguments, budget=local_budget, cache=cache)
+            if operation == "impact":
+                return self._execute_impact(arguments, budget=local_budget, cache=cache)
+            if operation == "search":
+                return self._execute_search(arguments, budget=local_budget, cache=cache)
+            capture = self._capture_targets(tuple(arguments.query.targets), budget=local_budget)
+            provenance = self._repository_provenance(op="read", query=arguments.query, capture=capture)
+            page = arguments.page or PageRead()
+            coverage = Coverage(state="complete", basis="source_bytes")
+
+            def build_read_result(data: ReadData, next_cursor: str | None) -> Success:
+                page_result = PageResult() if next_cursor is None else PageResult(next_cursor=next_cursor)
+                return Success(
+                    schema="xray.v1",
+                    ok=True,
+                    op="read",
+                    root=capture.root,
+                    scope=capture.selection,
+                    provenance=provenance,
+                    data=data,
+                    page=page_result,
+                    coverage=coverage,
+                )
+
+            data, next_cursor = self._read_data(
+                capture,
+                tuple(arguments.query.targets),
+                context_lines=arguments.query.context_lines,
+                page=page,
+                query_digest=provenance.query,
+                cache=cache,
+                result_builder=build_read_result,
+                budget=local_budget,
+            )
+            return build_read_result(data, next_cursor)
+        except (RepositoryError, _IndexerFailure) as exc:
+            return self._failure_error(exc, op=operation or "read", root=root, provenance=provenance)
+        except Exception as exc:
+            failure = _IndexerFailure(
+                "internal_error",
+                f"{operation or 'analysis'} analysis failed: {exc}",
+                action="report_bug",
+            )
+            return self._failure_error(failure, op=operation or "read", root=root, provenance=provenance)
+        finally:
+            self._active_toolchain = previous_toolchain
+
+
+__all__ = [
+    "LANGUAGE_MAP",
+    "TOOLCHAIN_ID",
+    "DeclarationArtifact",
+    "DeclarationRecord",
+    "XRayIndexer",
+]
