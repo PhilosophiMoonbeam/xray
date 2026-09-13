@@ -4851,7 +4851,12 @@ class XRayIndexer:
         if isinstance(kind, str) and kind:
             detail_values["kind"] = kind
         if isinstance(path, str) and path not in {".", ""}:
-            detail_values["path"] = path
+            try:
+                validated_path = ErrorDetails(path=path).path
+            except ValueError:
+                validated_path = None
+            if validated_path is not None:
+                detail_values["path"] = validated_path
         minimum_bytes = getattr(failure, "minimum_bytes", None)
         if (
             isinstance(minimum_bytes, int)

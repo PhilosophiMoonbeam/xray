@@ -52,6 +52,29 @@ def payload(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
     return cast(dict[str, Any], value)
 
 
+def test_search_config_escape_returns_typed_containment_error(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    (repo / "escape-config.yml").write_text("ruleDirs:\n  - ../outside\n", encoding="utf-8")
+
+    result = run_cli(
+        "search",
+        repo,
+        "--config",
+        "escape-config.yml",
+        "--path",
+        "sample.py",
+        "--cache",
+        "off",
+    )
+
+    assert result.returncode == 1
+    assert result.stderr == ""
+    value = payload(result)
+    assert value["ok"] is False
+    assert value["error"]["code"] == "path_outside_root"
+    assert "details" not in value["error"] or "path" not in value["error"]["details"]
+
+
 def test_read_natural_location_uses_canonical_result_and_explicit_root(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
 
