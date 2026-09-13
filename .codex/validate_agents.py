@@ -77,6 +77,7 @@ REQUIRED_FILES = {
     CONFIG,
     HOOKS,
     Path(".codex/session_start.py"),
+    Path(".codex/validate_codex_doctor.py"),
     Path(".agents/skills/beads/SKILL.md"),
     Path(".agents/skills/beads/agents/openai.yaml"),
     *DESIGN_PACKETS,
@@ -108,6 +109,7 @@ MANIFEST_TARGETS = {
     ".codex/hooks.json",
     ".codex/session_start.py",
     ".codex/validate_agents.py",
+    ".codex/validate_codex_doctor.py",
     ".codex/validate_project_readiness.py",
     ".agents/skills/beads/SKILL.md",
     ".agents/skills/beads/agents/openai.yaml",
@@ -285,7 +287,13 @@ def hygiene_problems(relative: Path, data: bytes) -> list[str]:
 
 def governed_paths(root: Path) -> list[Path]:
     paths = set(REQUIRED_FILES)
-    paths.update({Path(".codex/validate_agents.py"), Path(".codex/validate_project_readiness.py")})
+    paths.update(
+        {
+            Path(".codex/validate_agents.py"),
+            Path(".codex/validate_codex_doctor.py"),
+            Path(".codex/validate_project_readiness.py"),
+        }
+    )
     return sorted(path for path in paths if (root / path).is_file())
 
 

@@ -96,7 +96,7 @@ while harness paths may change under the scoped governance contract.
 | Root instruction index | `AGENTS.md` | `sol_design` |
 | Codex roles and root configuration | `.codex/config.toml`, `.codex/agents/` | `sol_write` |
 | Session recovery and handoff | `.codex/hooks.json`, `.codex/session_start.py`, `CONTINUE.md` | root for current handoff; `sol_write` for hook mechanics |
-| Validators and canonical runner | `.codex/validate_agents.py`, `.codex/validate_project_readiness.py`, `Makefile` | `sol_write` |
+| Validators and canonical runner | `.codex/validate_agents.py`, `.codex/validate_codex_doctor.py`, `.codex/validate_project_readiness.py`, `Makefile` | `sol_write` |
 | Generated XRAY SQLite cleanup and ignore policy | `.xray/xray.db`, `.xray/xray.db-shm`, `.xray/xray.db-wal`, `.gitignore` | `luna_write` |
 
 ## Canonical command catalog
@@ -124,6 +124,12 @@ XRAY has no tracked generated source that must be regenerated. `uv build`
 creates ignored `build/` and `dist/` artifacts; tests use temporary directories
 and may use ignored Python/test caches. Broad checks and qualification commands
 remain available as explicit tools and do not activate Enterprise/Certification.
+
+The `codex-doctor` recipe validates Codex Doctor's redacted JSON report. It
+rejects malformed output and every failed installation, configuration,
+runtime, Git, terminal, app-server, or thread-inventory check. Missing Codex
+credentials alone are reported but are not a repository-readiness failure,
+because isolated and CI environments intentionally lack user authentication.
 
 Resolved qualification gap: on 2026-08-05, `uv sync --dev` resolved Ruff 0.16.1
 from `ruff>=0.14.0`, exposing 11 existing `PLR0917` violations. Repair

@@ -33,10 +33,11 @@ validate-product: validate-fast validate-static validate-full validate-package v
 validate-agent-config:
 	uv run python .codex/session_start.py --self-test
 	uv run python .codex/validate_agents.py --self-test
+	uv run python .codex/validate_codex_doctor.py --self-test
 	uv run python .codex/validate_agents.py
 
 codex-doctor:
-	codex --strict-config doctor --summary --no-color
+	uv run python .codex/validate_codex_doctor.py
 
 validate-agent-recipe: validate-agent-config codex-doctor
 	git diff --check

@@ -24,6 +24,7 @@ packets and companions remain intact evidence, not routine Sprint instructions.
 | `.codex/hooks.json` | Retain | One SessionStart group and existing hook mechanics |
 | `.codex/session_start.py` | Adapt | Bounded read-only recovery through `uv` |
 | `.codex/validate_agents.py` | Adapt | Parsing, registration, permissions, historical packet checks, and hygiene |
+| `.codex/validate_codex_doctor.py` | Adapt | Strict redacted Doctor-report validation with an external-auth exception |
 | `.codex/validate_project_readiness.py` | Retain | Existing readiness schema and checks |
 | `.agents/skills/beads/SKILL.md` | Adapt | Compact canonical-store/root-write/child-read-only workflow |
 | `.agents/skills/beads/agents/openai.yaml` | Preserve byte-invariant | Historical UI metadata |
