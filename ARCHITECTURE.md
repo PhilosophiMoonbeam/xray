@@ -92,7 +92,7 @@ specified in the owning sections below; README supplies usable commands.
 | Workflow skill | `src/xray/skills/xray-progressive-discovery/` | Progressive discovery resource and template. | public MCP contract |
 | Tests and fixtures | `tests/`, `test_samples/` | Observable adapter, schema, containment, bounds, cache, change, packaging, and concurrency evidence. | public behavior |
 | Audit reports | `.reports/` | Point-in-time observations only; never current authority. | observed artifacts |
-| Development harness | `AGENTS.md`, `PROJECT.md`, this file, `TEMPLATE_MANIFEST.md`, `docs/`, `.codex/`, `.claude/`, `.agents/`, `Makefile` | Readiness, agent policy, recovery, adoption, and gates; product source does not import it. | repository policy/tools |
+| Development harness | `AGENTS.md`, `PROJECT.md`, this file, `TEMPLATE_MANIFEST.md`, `docs/`, `.codex/`, `.agents/`, `Makefile` | Readiness, agent policy, recovery, adoption, and gates; product source does not import it. | repository policy/tools |
 
 Product owners control `src/xray`, packaging, installers, configuration, skills,
 and product documentation. Engine owners control capture, containment, cache,

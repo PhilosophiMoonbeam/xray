@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,6 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = Path(".codex/config.toml")
 HOOKS = Path(".codex/hooks.json")
-CLAUDE = Path(".claude/settings.json")
 ROLES = {
     "sol_design": ("gpt-5.6-sol", "high"),
     "sol_write": ("gpt-5.6-sol", "high"),
@@ -77,7 +77,6 @@ REQUIRED_FILES = {
     Path(".codex/session_start.py"),
     Path(".agents/skills/beads/SKILL.md"),
     Path(".agents/skills/beads/agents/openai.yaml"),
-    CLAUDE,
     *DESIGN_PACKETS,
     *ADOPTION_PACKETS,
     *(packet.with_suffix(".sha256") for packet in DESIGN_PACKETS | ADOPTION_PACKETS),
@@ -122,7 +121,7 @@ MANIFEST_TARGETS = {
     "Makefile",
     "README.md",
     ".gitignore",
-    ".claude/settings.json",
+    ".claude/",
     ".xray/xray.db*",
 }
 DELETED_RUNTIME = {
@@ -133,6 +132,7 @@ DELETED_RUNTIME = {
     Path(".codex/validate_language.py"),
     Path(".codex/validate_text.py"),
 }
+DELETED_HARNESS = {Path(".claude")}
 
 
 def sha256(data):
@@ -231,20 +231,6 @@ def hook_problems(hooks, composer):
     return problems
 
 
-def claude_problems(settings):
-    expected = {
-        "hooks": {
-            "SessionStart": [
-                {
-                    "hooks": [{"command": "bd --readonly prime --hook-json", "timeout": 35, "type": "command"}],
-                    "matcher": "startup|resume|clear|compact",
-                }
-            ]
-        }
-    }
-    return [] if settings == expected else ["Claude compatibility hook differs"]
-
-
 def index_problems(text: str, root: Path) -> list[str]:
     targets = set(re.findall(r"\[[^]]+\]\(([^)#]+)", text))
     problems = [f"AGENTS index target is missing: {item}" for item in sorted(INDEX_TARGETS - targets)]
@@ -267,6 +253,14 @@ def inventory_problems(paths: set[Path]) -> list[str]:
     problems = [f"unregistered role instruction: {path}" for path in sorted(found_roles - allowed_roles)]
     problems.extend(f"deleted V1 runtime remains: {path}" for path in sorted(DELETED_RUNTIME & paths))
     return problems
+
+
+def deleted_harness_problems(paths: set[Path]) -> list[str]:
+    return [f"removed harness path remains: {path}" for path in sorted(DELETED_HARNESS & paths)]
+
+
+def present_deleted_harness(root: Path) -> set[Path]:
+    return {path for path in DELETED_HARNESS if (root / path).exists() or (root / path).is_symlink()}
 
 
 def hygiene_problems(relative: Path, data: bytes) -> list[str]:
@@ -325,6 +319,7 @@ def repository_problems(root: Path = ROOT) -> tuple[list[str], list[str]]:
         return problems, []
     paths = {path.relative_to(root) for path in (root / ".codex").rglob("*") if path.is_file()}
     problems.extend(inventory_problems(paths))
+    problems.extend(deleted_harness_problems(present_deleted_harness(root)))
     try:
         config = read_toml(root / CONFIG)
         roles = {name: read_toml(root / f".codex/agents/{name}.toml") for name in ROLES}
@@ -334,13 +329,11 @@ def repository_problems(root: Path = ROOT) -> tuple[list[str], list[str]]:
         problems.extend(configuration_problems(config, roles))
     try:
         hooks = load_json(root / HOOKS)
-        claude = load_json(root / CLAUDE)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         problems.append(f"hook JSON is malformed or unreadable: {exc}")
     else:
         composer = (root / ".codex/session_start.py").read_text(encoding="utf-8")
         problems.extend(hook_problems(hooks, composer))
-        problems.extend(claude_problems(claude))
     problems.extend(index_problems((root / "AGENTS.md").read_text(encoding="utf-8"), root))
     problems.extend(manifest_problems((root / "TEMPLATE_MANIFEST.md").read_text(encoding="utf-8")))
     problems.extend(digest_problems(root))
@@ -384,6 +377,7 @@ def self_test() -> None:
     cases.append(("missing index", index_problems("# empty\n", ROOT)))
     cases.append(("wrong inventory", inventory_problems({Path(".codex/agents/unknown.toml")})))
     cases.append(("deleted V1 runtime", inventory_problems({next(iter(DELETED_RUNTIME))})))
+    cases.append(("deleted harness", deleted_harness_problems({next(iter(DELETED_HARNESS))})))
     cases.append(("wrong manifest", manifest_problems("| Path | Action |\n")))
     cases.append(("corrupt adoption companion", digest_problems(ROOT, lambda _: "0" * 64)))
     for name, result in cases:
@@ -393,6 +387,11 @@ def self_test() -> None:
         failures.append("self-test missed encoding/text hygiene")
     if not hygiene_problems(Path("sample.md"), b"\xff"):
         failures.append("self-test missed invalid UTF-8")
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / ".claude").symlink_to("missing-target")
+        if not deleted_harness_problems(present_deleted_harness(root)):
+            failures.append("self-test missed dangling removed-harness symlink")
     for name, parser, sample in (("TOML", tomllib.loads, "["), ("JSON", json.loads, "{")):
         try:
             parser(sample)

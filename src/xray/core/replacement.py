@@ -1079,19 +1079,33 @@ class GuardedChangeService:
         else:
             try:
                 root = SgRoot(text, language).root()
-                for node in root.find_all(kind="ERROR"):
-                    if budget is not None:
-                        budget.check_deadline()
-                    value = node.range()
-                    start_char = int(value.start.index)
-                    end_char = int(value.end.index)
-                    start = len(text[:start_char].encode("utf-8"))
-                    end = len(text[:end_char].encode("utf-8"))
-                    raw.append((start, max(start + 1, end), node.text()))
+                nodes = root.find_all(kind="ERROR")
+            except RepositoryError:
+                raise
             except Exception:
                 # An unavailable grammar is itself a parser failure, represented
                 # as one bounded diagnostic rather than an untruthful clean plan.
                 raw.append((0, min(len(content), 1), "parser unavailable"))
+            else:
+                try:
+                    for node in nodes:
+                        if budget is not None:
+                            budget.check_deadline()
+                        value = node.range()
+                        start_char = int(value.start.index)
+                        end_char = int(value.end.index)
+                        start = len(text[:start_char].encode("utf-8"))
+                        end = len(text[:end_char].encode("utf-8"))
+                        raw.append((start, max(start + 1, end), node.text()))
+                except RepositoryError:
+                    raise
+                except Exception as exc:
+                    raise ChangeFailure(
+                        "analysis_limit",
+                        "complete syntax diagnostics could not be established",
+                        path=path,
+                        action="narrow_query",
+                    ) from exc
         ordered = sorted(raw, key=lambda item: (item[0], item[1], item[2].encode("utf-8")))
         if len(ordered) > _MAX_DIAGNOSTICS:
             raise ChangeFailure(

@@ -38,7 +38,7 @@ packets and companions remain intact evidence, not routine Sprint instructions.
 | `Makefile` | Add/adapt | Non-interactive harness and product gates |
 | `README.md` | Preserve/adapt | Product body plus concise harness links |
 | `.gitignore` | Merge | Project, runtime, Beads, and `.xray/` policy |
-| `.claude/settings.json` | Retain/adapt | Read-only SessionStart adapter |
+| `.claude/` | Remove | Obsolete client-specific harness integration; current recovery is Codex-owned |
 | `.xray/xray.db*` | Remove named | Three frozen generated SQLite artifacts only |
 | Product source, tests, samples, installers, reports, skills, packaging | Preserve | No harness-driven product change |
 | Recipe `.git/` and `.beads/` | Omit | Never transplant recipe state |

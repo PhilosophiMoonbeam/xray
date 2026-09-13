@@ -50,9 +50,10 @@ Root alone mutates Beads; children use `bd --readonly`. The SessionStart
 composer provides bounded read-only recovery for `startup|resume|clear|compact`
 through `uv run python`.
 
-Retain Claude only as the read-only compatibility adapter. Recovery is
-evidence for current ownership when durable history is needed; it does not
-activate an Enterprise milestone. Hook execution alone is not proof of
+Historical adoption retained Claude as a read-only compatibility adapter. The
+current harness removes that client-specific integration. Codex recovery
+provides evidence for current ownership when durable history is needed; it does
+not activate an Enterprise milestone. Hook execution alone is not proof of
 current-work recovery.
 
 ## 4. Preserve XRAY behavior

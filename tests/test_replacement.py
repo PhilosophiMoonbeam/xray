@@ -14,7 +14,7 @@ import pytest
 from xray.core import replacement as replacement_module
 from xray.core.ast_grep import ChildOutcome
 from xray.core.replacement import ChangeFailure, FilesystemHooks, GuardedChangeService
-from xray.core.repository import OperationBudget
+from xray.core.repository import CancellationError, OperationBudget
 from xray.core.toolchain import ToolchainObservation, ToolchainProvider, ToolchainUnavailableError
 from xray.models import (
     ChangeApplyQuery,
@@ -152,6 +152,73 @@ def test_syntax_evidence_refuses_an_incomplete_diagnostic_set(monkeypatch: pytes
         )
 
     assert failure.value.code == "analysis_limit"
+
+
+def test_syntax_evidence_rejects_interrupted_diagnostic_enumeration(monkeypatch: pytest.MonkeyPatch) -> None:
+    class BrokenNode:
+        def range(self) -> SimpleNamespace:
+            raise RuntimeError("diagnostic enumeration failed")
+
+    class FakeRoot:
+        def __init__(self, _text: str, _language: str) -> None:
+            pass
+
+        def root(self) -> FakeRoot:
+            return self
+
+        def find_all(self, *, kind: str) -> list[BrokenNode]:
+            assert kind == "ERROR"
+            return [BrokenNode()]
+
+    monkeypatch.setattr(replacement_module, "SgRoot", FakeRoot)
+
+    with pytest.raises(ChangeFailure) as failure:
+        GuardedChangeService()._syntax_evidence(
+            "javascript",
+            b"broken();\n",
+            "sample.js",
+            analyzer_id="0" * 64,
+        )
+
+    assert failure.value.code == "analysis_limit"
+
+
+def test_syntax_evidence_preserves_cancellation_during_diagnostics(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeNode:
+        def range(self) -> SimpleNamespace:
+            return SimpleNamespace(start=SimpleNamespace(index=0), end=SimpleNamespace(index=1))
+
+        def text(self) -> str:
+            return "syntax error"
+
+    class FakeRoot:
+        def __init__(self, _text: str, _language: str) -> None:
+            pass
+
+        def root(self) -> FakeRoot:
+            return self
+
+        def find_all(self, *, kind: str) -> list[FakeNode]:
+            assert kind == "ERROR"
+            return [FakeNode()]
+
+    checks = 0
+
+    def cancel_during_enumeration() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks == 2
+
+    monkeypatch.setattr(replacement_module, "SgRoot", FakeRoot)
+
+    with pytest.raises(CancellationError):
+        GuardedChangeService()._syntax_evidence(
+            "javascript",
+            b"broken();\n",
+            "sample.js",
+            analyzer_id="0" * 64,
+            budget=OperationBudget(cancel=cancel_during_enumeration),
+        )
 
 
 def test_rule_plan_uses_captured_rule_fixes(tmp_path: Path) -> None:
