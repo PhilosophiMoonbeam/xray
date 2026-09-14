@@ -1,96 +1,87 @@
-# XRAY Harness Adaptation
+# Harness Maintenance
 
-This document describes the historical XRAY harness-adoption procedure. It does
-not override `PROJECT.md`, `AGENTS.md`, `ARCHITECTURE.md`, current standards,
-Codex configuration, or any packet and companion digest.
-Routine Development Sprint work does not reenact this procedure. An explicitly
-activated named Enterprise/Certification milestone may select its applicable
-steps and preserved artifacts.
+XRAY uses stock OMP roles and native configuration. The project
+`.omp/config.yml` remains an empty mapping; the active OMP profile and runtime
+determine bundled-agent behavior in effect, including models, reasoning,
+providers, retry behavior, and task defaults. An empty project mapping does not
+assert that those defaults are unchanged. `.omp/AGENTS.md` imports
+`../AGENTS.md` and `../PROJECT.md` for startup guidance and project facts.
+`.omp/APPEND_SYSTEM.md` carries only the planner/Main allocation policy:
+planner owns P1–P4 blueprints. Planner triggers are P1 fresh architecture,
+P2 a material contract pivot, P3 a blocker after two materially different
+evidence-led repairs, and P4 missing load-bearing semantics. Main executes
+bounded known work, delegates substantial or genuinely disjoint leaves,
+integrates, and verifies the integrated candidate once at the proportional
+V0–V3 level. It preserves the bundled base prompt, worker roles, permissions,
+tool requirements, safety controls, and protected-action approvals. Start OMP
+from the repository root so the imports and append are discovered. Changes
+apply to a new session, not retroactively. No hooks or custom project role
+files are part of the current runtime.
 
-## 1. Establish project authority
+Development Sprint is the current default. The next-major I5 qualification is
+paused/deactivated until an authorized maintainer explicitly accepts and
+activates its named milestone. Rejected findings and evidence remain rejected
+and truthful; frozen packets, reports, and old tracker records are history, not
+current runtime or routine Sprint authority.
 
-`PROJECT.md` is the current mode selector and remains `Status: READY` for a
-usable local harness; that status is not product certification. This
-historical procedure records how project facts, canonical `uv` commands,
-resources, delivery authority, and qualification gates were adopted.
-`ARCHITECTURE.md` describes XRAY's CLI, MCP adapter, core engine, packaging,
-caches, compatibility surfaces, generated artifacts, and mutation boundaries
-without changing product behavior.
+OMP is a user-level tool. Run `omp` directly and install or update it through
+its supported user-level package manager. The repository does not declare an
+OMP dependency, launcher wrapper, or CLI version pin. Do not add project role
+aliases, custom role files, model/effort/reasoning overrides, hooks, retry
+routes, per-worker ledgers, paper artifacts, or mandatory review chains. Core
+bundled roles are `task`, `sonic`, `scout`, `reviewer`, and
+`security-reviewer`; additional bundled roles require no repository
+registration. Native planner capability chooses planning mode; it does not
+dispatch automatically. A role choice never grants credentials or protected
+delivery authority.
 
-The root `AGENTS.md` remains a compact index. Add no nested instruction file
-without a real subtree-specific command, owner, invariant, or review rule.
-Apply the Repository Language Standard to owned prose and keep each rule at its
-named authority.
+## Normal maintenance
 
-## 2. Install the frozen Codex routes
+1. Read the affected settings and their owning documentation.
+2. Make the requested change and remove obsolete active references.
+3. After concurrent edits finish, Main selects the relevant lightweight checks
+   and runs them once on the integrated candidate.
+4. Report actual behavior, evidence, limitations, risk, and any blocker.
 
-The six role profiles and current configuration are preserved runtime
-settings, not a routine byte-identical prompt recipe. Keep their models,
-efforts, permissions, no-descendant setting, root-only authority, and host
-limits. Role prose follows the active mode and operations contract; it does
-not activate Enterprise or require a synthetic Bead.
+Use on-demand diagnostics and recovery when startup, runtime, or context is
+uncertain: inspect the installed OMP profile, read `PROJECT.md`, `CONTINUE.md`,
+and the applicable standards, and read cited Beads records with
+`bd --readonly`. Recovery is operator-driven, not a startup hook or automatic
+tracker synchronization. If durable ownership or history is unavailable,
+report the limitation and continue only a fully scoped independent Sprint task
+whose context and authority are available.
 
-Enable both `features.multi_agent` and `features.multi_agent_v2`. The semantic
-validator rejects a disabled V2 override so the control plane cannot silently
-return to the V1 lifecycle. Update configuration, operations, validators, and
-applicability links together when a separately authorized runtime boundary
-changes.
+## Maintained checks
 
-Trusted local automation uses `danger-full-access` with approval `never`.
-Those settings grant no credentials, destructive authority, production access,
-protected Git action, Beads synchronization, publication, release, or
-deployment. Use current official Codex documentation for Codex behavior and
-Context7 for other current developer documentation under root instructions.
+| Command | Purpose |
+|---|---|
+| `make validate-agent-recipe` | Verify the empty project layer, absence of project role overrides, and the required exported bundled-role inventory; it does not discover effective routing or check model/provider health. |
+| `make validate-project-readiness` | Check factual project readiness through `.omp/` without prose-size quotas or qualification claims. |
 
-## 3. Normalize XRAY-owned recovery
+These are integrated harness checks, not a mandatory gate chain. Routine
+maintenance does not require live model calls, an SDK evaluator, a benchmark,
+full recipe qualification, or a mandatory review chain. Neither check activates
+I5 or changes the selected operating mode.
 
-Never copy recipe `.git/` or `.beads/` state. Preserve XRAY's canonical
-planning database when an authorized contributor-routing change requires it.
-Root alone mutates Beads; children use `bd --readonly`. The SessionStart
-composer provides bounded read-only recovery for `startup|resume|clear|compact`
-through `uv run python`.
+## Product and security invariants
 
-Historical adoption retained Claude as a read-only compatibility adapter. The
-current harness removes that client-specific integration. Codex recovery
-provides evidence for current ownership when durable history is needed; it does
-not activate an Enterprise milestone. Hook execution alone is not proof of
-current-work recovery.
+Harness maintenance changes no XRAY CLI or MCP behavior, schemas, package
+resources, installers, skills, reports, or public identifiers. Preserve the
+Python 3.10+ floor, uv-only Python commands, JSON and `jq` workflows, operation
+and transport semantics, repository containment, bounded results and cursors,
+mutation safety, and truthful mutation outcomes. YAML-shaped examples remain
+descriptive harness notation; XRAY does not add YAML product output.
 
-## 4. Preserve XRAY behavior
+## State and authority
 
-This adoption does not change CLI or MCP behavior, schemas, packages, product
-skills, installers, reports, tests, caches, or public identifiers. Preserve
-compact JSON defaults, v1/full compatibility, JSON and `jq` pipelines,
-CLI/MCP semantics and documented surface differences, path containment,
-bounded results and cursors, mutation safety, Python 3.10+, and package data.
-The YAML-shaped assignment example is descriptive harness notation; XRAY does
-not add YAML output.
+Native goal, todo, task, and hub state covers the session and worker lifecycle.
+Beads is the durable backlog, dependency, blocker, and handoff store. Main
+alone mutates it; children use read-only access for cited context. Preserve
+Beads data and history, application work, credentials, provider sessions,
+external state, and recoverable dirty state. Do not create a replacement store,
+rewrite tracker history, or add automatic tracker synchronization.
 
-## 5. Calibrate execution
-
-Root implements directly for a cohesive Sprint slice. Allocate parallel
-writers only when independent leaves have disjoint behavior, paths, resources,
-and generated outputs. Use worktrees when isolation provides real value, not
-as universal paperwork. Add an independent reviewer only when a concrete risk
-or named acceptance contract makes it useful. Root integrates serially and
-keeps every unintegrated result recoverable.
-
-The host retains its MultiAgentV2 lifecycle and current capacity settings.
-Completed children may receive a useful follow-up or be relinquished according
-to the host lifecycle; no fixed repair or follow-up quota applies.
-
-## 6. Historical qualification procedure
-
-The former exact-candidate qualification procedure is suspended for routine
-work. An explicitly activated named Enterprise/Certification milestone may
-select its preserved packet contract, applicable gates, exact identity,
-independent review, attestation, replay, and evidence locations. Hash only
-artifacts that that contract identifies; do not create a repository-wide
-preserve manifest.
-
-Keep readiness `READY` for the usable harness. Local Sprint success does not
-authorize commit, push, merge, sync, release, publication, or deployment.
-Record actual evidence, rollback, residual risk, and remaining work in the
-final report or canonical Beads handoff when durable state is needed. Do not
-reopen historical adoption merely because an old packet or qualification Bead
-is present.
+Harness changes grant no credential, production, destructive, remote-Git,
+commit, push, merge, release, publication, deployment, or Beads-remote
+authority. Protected actions remain separately authorized, and historical
+packets and evidence never become current runtime merely because they exist.

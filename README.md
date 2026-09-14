@@ -385,6 +385,24 @@ source and owner tests define observable behavior; examples and audit reports
 are not alternate contracts. [`PROJECT.md`](PROJECT.md) lists available
 focused, static, packaging, CLI, MCP, and optional broad commands.
 
+Development Sprint is the current default. The next-major I5 qualification is
+paused/deactivated until an authorized maintainer explicitly accepts and
+activates its named milestone. For harness maintenance, follow
+[`AGENTS.md`](AGENTS.md), [harness maintenance](docs/ADAPTATION.md), and the
+[maintained paths](TEMPLATE_MANIFEST.md). The native project layer
+`.omp/config.yml` is intentionally empty. OMP is a user-level `omp` CLI with
+stock bundled roles; `.omp/AGENTS.md` imports repository startup guidance and
+`PROJECT.md`, while `.omp/APPEND_SYSTEM.md` carries only planner/Main
+allocation. No hooks or custom project role files are required.
+
+Use on-demand OMP diagnostics and read-only recovery when startup, runtime, or
+context is uncertain. Read `CONTINUE.md` and cited Beads context as needed;
+recovery does not automatically synchronize tracker state or turn historical
+packets into current authority. Preserve application and Beads state,
+credentials, provider sessions, and external resources. Harness configuration
+grants no protected delivery, production, destructive, credential, or remote
+Git authority.
+
 For routine Sprint work, select the narrowest checks covering the changed path:
 
 ```bash
@@ -394,9 +412,17 @@ uv run ruff check <changed paths>
 uv run xray <changed operation> <explicit small root>
 ```
 
+The maintained native harness checks are lightweight and integrated by Main
+once after concurrent edits:
+
+| Command | Purpose |
+|---|---|
+| `make validate-agent-recipe` | Verify the empty project config, no project role overrides, and required bundled-role inventory. |
+| `make validate-project-readiness` | Check factual project readiness through `.omp/`. |
+
 When MCP or shared behavior changes, launch `uv run xray-mcp` as a real
 standard-stdio child, initialize it, list the two adapter tools, and call the
 changed operation through a throwaway client. An in-process client test or an
 idle process does not replace this proof. Run packaging checks for packaging
-changes. `uv run pytest`, whole-repository static checks, and `make qualify` are
-explicit broad or Enterprise checks, not automatic routine gates.
+changes. Broad product tests and whole-repository static checks are explicit
+optional checks, not automatic routine gates or native OMP requirements.

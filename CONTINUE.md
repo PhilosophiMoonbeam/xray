@@ -1,25 +1,44 @@
-# XRAY next-major Enterprise/I5 qualification
+# XRAY next-major I5 qualification — paused recovery
 
 ## Next-session directive and authority
 
-Resume active Bead `xray-5e7.34`. The immediate outcome is a fresh qualification-method successor that repairs the deterministic aggregate relocation defect described below, passes independent review and the complete sealed method suite, and then advances through W4, W5, and W6. Do not restart completed product implementation or repeat resolved qualification repairs.
+I5 qualification is explicitly paused and deactivated. I5 acceptance has not
+occurred, and this file is a recoverable record rather than current
+qualification authority. Do not claim I5, execute W4-W6, rebuild or reseal a
+method, or begin a qualification ceremony from this handoff. Do not restart
+completed product implementation or repeat resolved qualification repairs.
 
-`PROJECT.md` activates the named **XRAY next-major I5 qualification** milestone. Its assurance objective is whole-product I5 acceptance against the preserved next-major v1-v4 contract, including G1-G8, on one unchanged candidate. This activation does not claim I5 acceptance.
+Recover Bead `xray-5e7.34` read-only when durable qualification history is
+needed. Parent Bead `xray-5e7` remains open because I5 acceptance is
+incomplete. A separately selected qualification outcome in `PROJECT.md` must
+name the assurance objective, acceptance contract, candidate, and authority
+before Main may decide whether any qualification work resumes.
+Main alone mutates or closes Beads; any stock OMP worker uses `bd --readonly`
+only for cited recovery context.
 
-The user has authorized add, commit, and push checkpoints to the current branch. Merge, release, deployment, publication, production access, credentials, and Beads Dolt push/pull remain unauthorized.
+The current repository mode is Development Sprint. Sprint work may proceed
+under `AGENTS.md`, `PROJECT.md`, `ARCHITECTURE.md`, and native OMP policy.
+Historical packets, rejected methods, old commands, Beads, and worker
+availability do not select or accept I5.
+
+Commit, push, merge, release, deployment, publication, production access,
+credentials, GitHub mutation, and Beads Dolt push/pull remain unauthorized.
+This recovery file grants no delivery authority.
 
 ## Repository and candidate state
 
 - Repository: `/home/bbferko/repos/xray`
-- Branch: `main`
-- Last pushed code-bearing checkpoint: `b6b1de7428a504f384cef57ef7d4b75c3deb3218`
-- The working tree was clean before this `CONTINUE.md` update.
+- Branch recorded by this handoff: `main`
 - Parent Bead `xray-5e7` remains open because I5 acceptance is incomplete.
-- Method Bead `xray-5e7.34` remains `in_progress` and contains the durable qualification history.
+- Method Bead `xray-5e7.34` remains `in_progress` and contains the durable
+  qualification history.
+- Preserve unrelated dirty state; do not assume that the current checkout is
+  clean or that a prior commit/push is an authorization.
+- The XRAY 1.0.0 Development Sprint candidate and its historical results are
+  not I5 evidence. Qualification, if separately selected later, must bind and
+  test the exact candidate it accepts.
 
-The XRAY 1.0.0 Development Sprint candidate is implemented and pushed. Qualification must bind and test the exact candidate it accepts. Sprint test results and historical qualification runs are not I5 evidence.
-
-## Current qualification method state
+## Rejected sealed method state
 
 There is no accepted or mutable active method root. Preserve every existing method and evidence root. Do not edit, rebuild, rebind, reseal, or execute a qualification phase from a rejected sealed root.
 
@@ -51,7 +70,7 @@ The one-time sealed full suite returned `185 passed, 1 failed, 46 subtests passe
 
 The sealed root is rejected. No post-seal edit, repair, rebuild, or reseal occurred.
 
-## Active blocker and accepted diagnosis
+## Recorded blocker and accepted diagnosis
 
 The failure is deterministic and belongs to the qualification method, not the product candidate. Two independent read-only reviews reproduced it in about 0.4 seconds. It fails closed with:
 
@@ -73,45 +92,63 @@ Relevant spans in the rejected sealed root:
 - `tools/controller.py:559` — `capture_method_root` binding
 - `tests/test_review_aggregate.py:191`, `:257`, and `:280` — fixture, seal, and relocation assertions
 
-## Fresh-successor repair contract
+## Pending successor repair contract
 
-Create a new writable successor from the rejected sealed root. Never mutate the sealed source. Confine the semantic repair to `tools/bundles.py` and the regression coverage to `tests/test_review_aggregate.py` unless new evidence proves a wider dependency.
+If Main later receives a separately selected qualification outcome, create a new
+writable successor from the rejected sealed root. Never mutate the sealed
+source. Confine the semantic repair to `tools/bundles.py` and the regression
+coverage to `tests/test_review_aggregate.py` unless new evidence proves a wider
+dependency.
 
 In `seal_aggregate`:
 
 1. Preserve the score receipt's authoritative original `capture_method_root`.
-2. Validate every relative tool-file identity against the copied aggregate `support` root.
-3. Re-close the tools file list and role contracts using copied support bytes while retaining the receipt's capture root.
+2. Validate every relative tool-file identity against the copied aggregate
+   `support` root.
+3. Re-close the tools file list and role contracts using copied support bytes
+   while retaining the receipt's capture root.
 4. Recompute the tools-role and top-level binding digests.
-5. Require exact equality with the gate receipt identity before publishing `support/bindings/score-identity.json`.
+5. Require exact equality with the gate receipt identity before publishing
+   `support/bindings/score-identity.json`.
 
-The preferred implementation is to pass the already validated projected receipt identity into `_close_score_identity(..., support=support)`. Do not relax identity equality, rewrite the provenance root, require the original method directory during relocated replay, normalize exit evidence, or copy the projected identity without revalidating every relative support file.
+The preferred implementation is to pass the already validated projected receipt
+identity into `_close_score_identity(..., support=support)`. Do not relax
+identity equality, rewrite the provenance root, require the original method
+directory during relocated replay, normalize exit evidence, or copy the
+projected identity without revalidating every relative support file.
 
-Required focused acceptance:
+Pending focused acceptance:
 
-1. The existing relocated-aggregate test passes unchanged through publication, source-method removal or relocation, and subprocess-free replay.
+1. The existing relocated-aggregate test passes unchanged through publication,
+   source-method removal or relocation, and subprocess-free replay.
 2. The aggregate score identity is byte-identical to the gate receipt.
-3. `capture_method_root` remains the original source root and contains no staging or publication path.
+3. `capture_method_root` remains the original source root and contains no
+   staging or publication path.
 4. The same identity validates against relocated `aggregate/support`.
 5. Changed copied-support bytes fail validation.
 6. An altered and fully rehashed capture root fails validation.
 7. Adding, removing, or reordering a support tool fails validation.
-8. Existing gate-registry replay, state-proof relocation, tamper, and failure-retention tests pass.
-9. Focused Ruff runs with `--no-cache`, and the method contains no generated cache artifacts.
+8. Existing gate-registry replay, state-proof relocation, tamper, and
+   failure-retention tests pass.
+9. Focused Ruff runs with `--no-cache`, and the method contains no generated
+   cache artifacts.
 
-## Dependency-ordered next actions
+## Resumption conditions
 
-1. Recover Bead `xray-5e7.34`, this file, and the rejected sealed-root identity. Confirm the sealed root remains unchanged before copying it.
-2. Create a fresh writable successor root. Record its derivation from the rejected sealed manifest and inventory; do not reuse the rejected root's identity as acceptance evidence.
-3. Implement the bounded aggregate identity repair and focused regressions above.
-4. Run focused aggregate, gate-registry, state-proof relocation, tamper, and failure-retention tests plus Ruff `--no-cache` with all caches outside the method root.
-5. Obtain independent changed-findings review. Do not advance with any P0 or P1 finding.
-6. Run the broad pre-seal suite. Update only required frozen producer identities, validate their exact semantic closure, then run the canonical static builder and inventory builder once.
-7. Run the complete sealed method suite and independent sealed-method acceptance review. Abandon the sealed root on any unexpected failure; never repair or reseal it.
-8. Only after sealed acceptance, run a wholly fresh W4 diagnostic and gate phase under new absent run, candidate-seal, gate, and runtime paths. Do not reuse diagnostic26 or any prior seal.
-9. Reconcile every W4 result. Run W5 production populations only after W4 acceptance: 3,000 candidate trials, 2,600 paired native-baseline trials, the focused latency/RSS/source populations, C13 traversal, and G1-G8 evidence.
-10. Run W6 immutable aggregation, scoring, relocation/replay, independent acceptance review, and truthful local I5 adjudication.
-11. Update Beads and this file at each recoverable checkpoint. Commit and push the current branch while the user's delivery authority remains active.
+No qualification action is currently authorized. If Main later records a
+separately selected qualification outcome, the dependency order is:
+
+1. Recover Bead `xray-5e7.34`, this file, and the rejected sealed-root identity
+   read-only. Confirm the sealed root remains unchanged before copying it.
+2. Create a fresh writable successor root only under that separately selected
+   outcome. Record its derivation from the rejected sealed manifest and
+   inventory; do not reuse the rejected root's identity as acceptance evidence.
+3. Apply the bounded aggregate identity repair and pending focused acceptance
+   above, then obtain the required independent acceptance review.
+4. Do not launch W4, W5, or W6, run a qualification ceremony, or claim I5
+   until the selected outcome authorizes those stages and the successor has
+   passed its complete sealed acceptance. This handoff contains no executable
+   W4-W6 automation, and it grants no commit or push authority.
 
 ## Preserved terminal evidence
 
@@ -129,14 +166,22 @@ Diagnostic26 produced zero gate cases because replay rejected truthful idempoten
 
 ## Stop conditions
 
-Stop the affected stage for an unbound candidate or method, stale manifest, missing or duplicate population key, incomplete gold, ambiguous attempt, unresolved P0/P1 finding, changed frozen contract, unsafe mutation, contradictory evidence, unexpected sealed-suite failure, or missing authority. Do not launch W4 or W5 before the fresh successor passes complete sealed acceptance. Do not claim I5 from Sprint tests, historical counts, partial populations, or a scorer whose inputs are not completely bound.
+No qualification stage is active. If a separately selected outcome later
+authorizes resumption, stop the affected stage for an unbound candidate or
+method, stale manifest, missing or duplicate population key, incomplete gold,
+ambiguous attempt, unresolved P0/P1 finding, changed frozen contract, unsafe
+mutation, contradictory evidence, unexpected sealed-suite failure, or missing
+authority. Do not launch W4 or W5 before the fresh successor passes complete
+sealed acceptance. Do not claim I5 from Sprint tests, historical counts,
+partial populations, or a scorer whose inputs are not completely bound.
 
 ## Authoritative references
 
-- `PROJECT.md` and `ARCHITECTURE.md` — active mode and product boundaries
-- `docs/next-major-design-packet-v1.md` through v4 and companions — I5 acceptance contract
+- `PROJECT.md` and `ARCHITECTURE.md` — current Sprint mode and product boundaries
+- `docs/next-major-design-packet-v1.md` through v4 and companions — preserved
+  I5 acceptance contract only if a separately selected outcome activates it
 - `docs/implementation-standard.md` — implementation and verification requirements
 - `docs/agent-operations.md` — evidence, review, integration, and delivery boundaries
-- Bead `xray-5e7.34` — durable qualification history and current claim
+- Bead `xray-5e7.34` — durable qualification history and incomplete current claim
 
 `CONTINUE.md` is the live recovery surface, not an archive. Keep only current authority, exact recovery state, unresolved work, material evidence, and the next dependency-ordered actions.

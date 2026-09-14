@@ -1,150 +1,148 @@
 # XRAY Implementation Standard
 
-## Outcome and scope
+## Implement the requested outcome
 
-Meet current requirements with the lowest total complexity and diagnostic cost
-allowed by authority. Apply this standard only when PROJECT permits the work.
-It grants no authority and does not override closer instructions. Apply the
-Repository Language Standard to changed owned text.
+Make the smallest complete change that meets current requirements. Inspect the
+existing implementation, relevant contracts, and current dependency
+capabilities before introducing another pattern. Keep related behavior
+understandable and avoid abstractions, configuration, or compatibility paths
+for hypothetical use.
 
-**Supported behavior** is externally observable behavior required by the task,
-repository authority, an owned specification, compatibility, deployment, or
-persistent-data constraint. Existing code, tests, releases, data, and consumers
-are evidence of possible support; they do not create authority alone.
+Preserve supported behavior and persistent user data. Make authorized schema or
+data transitions explicit. Remove obsolete code, callers, tests,
+configuration, and documentation when the change supersedes them; do not
+retain a second path without a real compatibility requirement.
 
-XRAY 1.0.0 remains the compatibility baseline: unified `xray.v1` JSON,
-complete `xray.change.v1` plans, eleven CLI/MCP operations, standard FastMCP
-stdio discovery through two adapter tools, explicit-root containment, bounded
-results and snapshot-bound cursors, unresolved name-based impact, guarded
-changes, package entry points and resources, Python 3.10+, and optional
-content-derived `DerivedCache` artifacts. YAML is contained rule/config input
-only and is never product output. XRAY does not add a language server,
-type-aware dependency graph, daemon, project database, automatic commits, or
-background recovery service.
+Enforce invariants in their owning component. Validate untrusted input at trust
+boundaries, duplicating enforcement only across independent trust or failure
+boundaries. Handle failures through the established error mechanism rather than
+suppressing symptoms. Respect tool rules, ownership, and protected authority.
+Resolve material ambiguity from available evidence; ask only when the
+remaining choice would change the requested behavior, scope, or authority.
 
-## Required actions
+## Blueprint and local decision boundary
 
-1. Make the smallest complete change that satisfies the requested outcome.
-2. Build an end-to-end increment that keeps affected behavior testable and
-   understandable.
-3. Before material behavior changes, identify affected behavior and support,
-   compatibility, authorization, and data-preservation consequences.
-4. Preserve supported behavior after each increment.
-5. Remove obsolete in-scope code, tests, configuration, and documentation.
-6. Enforce each introduced or changed invariant at its owning component.
-7. Validate untrusted input at each introduced or changed trust boundary.
-8. Handle or surface each introduced operational failure through the established
-   error mechanism.
+Implement against the current accepted blueprint. The planner owns a fresh
+blueprint or materially changed design only under the P1–P4 triggers in
+[agent operations](agent-operations.md). A current blueprint remains valid
+until one of those triggers actually invalidates it.
 
-Preserve persistent user data unless explicit authority permits deletion or
-reinterpretation. Implement required data changes explicitly. Retain a
-migration only for supported behavior, data preservation, or an authorized
-upgrade path.
+Within a settled blueprint, Main and implementers own bounded execution and
+implementation-local design. Preserve the blueprint's acceptance, interfaces,
+invariants, authority, and persistent-data transitions; a contract-preserving
+local refactor or known repair does not need a new planner decision. Main may
+repair and integrate a known solution directly when dispatch adds no useful
+parallelism or expertise. A material contract change or stubborn blocker
+returns to agent operations; do not turn ordinary work into a planner or
+reviewer gate.
 
-Before adding a dependency or custom implementation, inspect current
-documentation, types, and capabilities of existing dependencies. Prefer an
-existing maintained dependency when it lowers total implementation and
-maintenance cost without a blocking defect.
+## Verification tiers
 
-Add a focused permanent test when existing infrastructure can verify changed
-behavior or a reproduced regression and the test protects a plausible future
-failure. Otherwise use a throwaway behavioral smoke. Test observable behavior,
-not implementation details, when both provide equal precision.
+Select the lowest tier that proves the changed claim, then record the exact
+claim and limitations:
 
-## Prohibited actions
+- **V0 — Policy, documentation, or mechanical.** Check changed references,
+  links, JSON/configuration, commands, and the relevant maintained harness
+  contract. Prose-only workflow edits do not require an application build,
+  database, browser, live-model, or full test-suite run.
+- **V1 — Focused behavior.** Run affected maintained checks and one actual
+  exercise of the changed path. For UI work, use the actual affected surface
+  and materially affected interactions or recovery states rather than every
+  historical viewport and state combination.
+- **V2 — Load-bearing integrated boundary.** Perform V1 plus the affected
+  real containment, authorization, migration or upgrade, rollback or recovery,
+  package, provider-contract, architecture, generated-data, build, browser,
+  or transport lane. Choose by the changed contract and invalidated evidence,
+  not by diff size; use independent risk-matched security or correctness
+  review when warranted.
+- **V3 — Explicit qualification.** Run the exact-candidate full software,
+  scale, release, browser, performance, or operations gates when the
+  requested claim reaches them, with separately authorized provider or
+  operating procedures. Preserve complete existing gate semantics and fail
+  closed when required evidence is missing.
 
-Do not:
+V0–V2 completion is not full qualification, release readiness, operating
+evidence, provider approval, or protected authorization. Those are separate
+claims and remain open until their own requirements are executed. XRAY I5
+qualification is paused/deactivated until an authorized acceptance reactivates
+it; historical and rejected evidence remains truthful and is never relabeled
+as acceptance.
 
-- retain obsolete runtime paths, fallbacks, compatibility layers, migrations,
-  or tests without supported behavior;
-- add abstractions, configuration, indirection, or extension points for
-  hypothetical requirements;
-- restructure an unaffected component for preference compliance;
-- discard a failure without evidence or weaken a required product guard;
-- expand scope, authority, resources, or delivery claims because a broad check
-  or old qualification item exists.
+## XRAY changed-path requirements
 
-## Verification
+Preserve XRAY's supported product contract: Python 3.10+, `uv`-only Python
+commands, the unified `xray.v1` envelope, complete `xray.change.v1` plans,
+eleven CLI/MCP operations, standard FastMCP stdio discovery through exactly two
+adapter tools, explicit-root containment, bounded results and snapshot-bound
+cursors, unresolved name-based impact, guarded changes, package resources and
+entry points, and optional content-derived caches. YAML is rule/config input
+only and is never product output.
 
-Select the narrowest checks covering changed behavior and materially affected
-boundaries. Routine Sprint completion uses:
+CLI-facing changes require a real focused `uv run xray` subprocess against an
+explicit small fixture or authorized root. MCP-facing or shared behavior
+requires a real `uv run xray-mcp` standard-stdio child initialized through a
+throwaway client, with discovery of the two adapter tools and a call to the
+changed operation. An in-process MCP client or idle server is not transport
+proof. Add a focused negative case when validation, authorization,
+containment, subprocess permission, or guarded mutation behavior changes.
 
-- changed-path tests for observable behavior and relevant regressions;
-- the applicable type or static check for changed code and its contract
-  surface;
-- a real focused CLI process for CLI-facing changes;
-- a real standard-stdio `xray-mcp` child, initialized through a throwaway
-  client, for MCP-facing or shared behavior;
-- consistent affected consumers, documentation, and configuration;
-- a focused negative case when validation, authorization, containment, or
-  mutation failure behavior changed.
+Do not introduce a language server, type-aware dependency graph, daemon,
+project database, automatic commits, or background recovery service. Preserve
+the current subprocess bounds, timeouts, output limits, error classification,
+and explicit authorization for protected actions.
 
-An in-process MCP `Client(mcp)` test or an idle server does not prove stdio
-transport behavior. Shared changes need one focused scenario on each affected
-public transport. Do not run every operation, language, cache state, or corpus
-without an affected-contract reason.
+## Verify once at the appropriate boundary
 
-Run Python, tests, builds, and Python tooling through the `uv` commands in
-`PROJECT.md`. Package metadata, dependencies, entry points, installers,
-resources, or version-sensitive primitives require an isolated installed
-package smoke and a Python-floor check relevant to the claim. Routine source
-work does not require an offline multi-interpreter qualification matrix.
+During concurrent editing, children skip tests, builds, lint, formatters, and
+other validation. Main verifies after integration. Select affected maintained
+checks and a focused exercise of changed behavior; avoid running overlapping
+check chains merely to collect more receipts. Release and protected-delivery
+requirements still apply when that work is in scope.
 
-Governance-only edits need no product smoke, build, or product test when
-product behavior is unchanged. Review changed authority, links, scenarios, and
-applicable configuration syntax. Report unavailable checks with the exact
-prerequisite, unverified behavior, and authorized alternative. An unavailable
-required changed-path proof prevents claiming that path complete; unrelated
-pre-existing failures remain recorded evidence, not an unbounded repair task.
+For a bug, use the reported failure or a reproduction to guide the fix and
+confirm the changed path no longer fails. Keep a regression test when it
+guards a plausible recurrence. For a feature, update existing tests whose
+observable contract changes and exercise the new behavior. Add a permanent
+test for a real boundary, invariant, failure, or uncertain edge case—not for
+every edit or to assert implementation details. A focused smoke exercise can
+be sufficient for a straightforward new path.
 
-For an authorized instruction change, concise rationale, changed authoritative
-rules, and scenario review are sufficient unless an explicitly activated
-Enterprise/Certification milestone names a formal evidence contract. Exact
-artifact hashes, complete transformation maps, attestation ledgers, and broad
-qualification are not routine verification.
+For UI changes, inspect the actual affected surface and interactions,
+including loading, error, empty, keyboard, responsive, or persistence states
+only when materially affected. For documentation or harness configuration,
+check the changed references, configuration, or command rather than unrelated
+application behavior. Agent operations supplies batch coordination and
+integrated verification.
 
-## Risk-proportional safeguards
+If a check fails, investigate the cause without weakening the check. If a
+required check cannot run, report the command, exact blocker, unverified
+behavior, and any useful alternative evidence. Do not claim proof that was
+not obtained or treat a passing review as execution evidence.
 
-Escalate the actual risk, not the label of the task. Seek a planner decision,
-specialist review, focused negative proof, disposable-root checkpoint, or
-recoverable backup when changing a trust boundary, untrusted parser/config
-input, secret handling, subprocess permission, source mutation, installer,
-rollback, cancellation, persistent data, compatibility floor, package
-boundary, shared schema/API, or outcome-ambiguous write.
+## Implement before broad qualification
 
-Back up before a real destructive or persistent-data transition. Do not back up
-every read or edit ceremonially. Never retry an uncertain mutation merely to
-discover whether it applied; establish the authoritative outcome first.
+Build complete local increments without waiting for provider-console access,
+customer pilots, production rehearsal, or unrelated release suites. Use
+documented provider contracts and explicit conservative development
+assumptions; keep protected effects disabled until their real activation
+conditions are met. Missing external approval is not a blanket prohibition on
+repository work. Missing security semantics that determine who gains
+authority remain a genuine boundary: do not invent a permissive policy or
+substitute a successful stub.
 
-## Stop and completion
+Exercise changed behavior locally before handing it off. That focused proof
+does not certify live interoperability, operating outcomes, or production
+safety. When broader verification is deferred, record the unverified claim,
+exact remaining scenario, prerequisites, assumptions, and next action in the
+canonical Beads handoff when durable state is needed. An initial
+implementation may be available for further development while its
+qualification remains pending. Report those states separately; do not
+describe the whole product outcome as complete or production-ready.
 
-After inspecting available evidence, stop when unresolved intent, authority,
-scope, risk, compatibility, output, acceptance, or delivery has two plausible
-readings that would change behavior. Report the governing source,
-interpretations, consequences, and recommendation. Continue when evidence
-resolves the question or all choices are reversible and in scope.
+## Complete and report
 
-Stop the affected action for unavailable authorization, a prohibited operation,
-an uncertain destructive target, a material contract conflict, contradictory
-evidence, an unexplained introduced regression, or an unsafe/outcome-ambiguous
-mutation. Do not use missing qualification artifacts, a missing per-task Bead,
-document-count ceiling, inactive benchmark population, or fixed retry quota as
-a routine blocker.
-
-Ordinary product work is complete only when:
-
-1. requested acceptance criteria are met;
-2. changed-path tests pass, including a retained regression test when warranted;
-3. the relevant type or static check passes;
-4. the real focused CLI and/or MCP smoke covering each affected public
-   transport passes;
-5. affected consumers, documentation, and configuration are consistent;
-6. no introduced or acceptance-relevant material defect remains; and
-7. actual checks, limitations, risks, and unverified claims are reported.
-
-Stop there. Do not automatically run the full suite, whole-repository static
-analysis, package matrix, `make qualify`, historical G/Q populations, exact
-candidate sealing, replay, or independent review rounds. An explicitly
-activated Enterprise/Certification milestone instead uses its named existing
-acceptance contract and records a truthful result without granting delivery
-authority.
+Complete the requested behavior, migrate affected callers, preserve required
+data paths, and update relevant documentation. Main reviews material changes
+and evidence without a separate acceptance form. The report identifies the
+outcome, checks actually run, and unresolved risks or blockers. No commit,
+push, production mutation, or deployment is implied by local completion.

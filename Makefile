@@ -1,4 +1,4 @@
-.PHONY: setup validate-fast validate-static validate-full validate-package validate-smoke validate-cleanliness validate-product validate-agent-config codex-doctor validate-agent-recipe validate-harness validate-project-readiness validate qualify clean-checkout
+.PHONY: setup validate-fast validate-static validate-full validate-package validate-smoke validate-cleanliness validate-product validate-agent-recipe validate-harness validate-project-readiness validate
 
 .NOTPARALLEL:
 
@@ -30,25 +30,13 @@ validate-cleanliness:
 
 validate-product: validate-fast validate-static validate-full validate-package validate-smoke
 
-validate-agent-config:
-	uv run python .codex/session_start.py --self-test
-	uv run python .codex/validate_agents.py --self-test
-	uv run python .codex/validate_codex_doctor.py --self-test
-	uv run python .codex/validate_agents.py
-
-codex-doctor:
-	uv run python .codex/validate_codex_doctor.py
-
-validate-agent-recipe: validate-agent-config codex-doctor
+validate-agent-recipe:
+	uv run python .omp/validate.py
 	git diff --check
 
 validate-harness: validate-agent-recipe
 
 validate-project-readiness:
-	uv run python .codex/validate_project_readiness.py
+	uv run python .omp/validate_project_readiness.py
 
 validate: validate-product validate-harness validate-cleanliness
-
-qualify: validate validate-project-readiness
-
-clean-checkout: setup qualify

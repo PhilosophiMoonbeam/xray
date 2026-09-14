@@ -1,68 +1,68 @@
-# XRAY Harness Migration Manifest
+# Maintained Harness Paths
 
-This inventory records the current XRAY control-plane paths and historical
-adoption artifacts. `PROJECT.md` is the sole mode selector and activation home;
-current standards and configuration retain their stated authority. Frozen
-packets and companions remain intact evidence, not routine Sprint instructions.
+This is a short inventory, not a portable profile or synchronization protocol.
+Update only paths affected by the requested change. Native OMP configuration is
+the current harness surface; frozen adoption and qualification records are
+preserved history, not current runtime or authority.
 
-| Path | Action | Result |
-|---|---|---|
-| `AGENTS.md` | Maintain | Compact authority index that points to the active mode and current standards |
-| `CONTINUE.md` | Maintain | Current multi-session state, blockers, evidence, and next dependency-ordered actions |
-| `PROJECT.md` | Maintain | Development Sprint default, explicit Enterprise activation, commands, resources, and delivery facts |
-| `ARCHITECTURE.md` | Maintain | Product components, interfaces, compatibility, storage, and mutation |
-| `docs/adoption-design-packet-v1.md` | Preserve frozen | Historical `xray-oep.1` adoption evidence |
-| `docs/adoption-design-packet-v1.sha256` | Preserve frozen | Exact version 1 packet digest |
-| `docs/adoption-design-packet-v2.md` | Preserve frozen | Historical `xray-aly` adoption evidence |
-| `docs/adoption-design-packet-v2.sha256` | Preserve frozen | Exact version 2 packet digest |
-| `docs/next-major-design-packet-v3.md` | Preserve frozen | Historical pending V3 qualification evidence |
-| `docs/next-major-design-packet-v3.sha256` | Preserve frozen | Exact version 3 packet digest |
-| `docs/next-major-design-packet-v4.md` | Preserve frozen | Historical pending applicability evidence |
-| `docs/next-major-design-packet-v4.sha256` | Preserve frozen | Exact version 4 packet digest |
-| `.codex/config.toml` | Adapt | Current root route, MultiAgentV2, six roles, and host ceiling |
-| `.codex/agents/*.toml` | Adapt mutable | Mode-aware role prompts with preserved models, permissions, and no descendants |
-| `.codex/hooks.json` | Retain | One SessionStart group and existing hook mechanics |
-| `.codex/session_start.py` | Adapt | Bounded read-only recovery through `uv` |
-| `.codex/validate_agents.py` | Adapt | Parsing, registration, permissions, historical packet checks, and hygiene |
-| `.codex/validate_codex_doctor.py` | Adapt | Strict redacted Doctor-report validation with an external-auth exception |
-| `.codex/validate_project_readiness.py` | Retain | Existing readiness schema and checks |
-| `.agents/skills/beads/SKILL.md` | Adapt | Compact canonical-store/root-write/child-read-only workflow |
-| `.agents/skills/beads/agents/openai.yaml` | Preserve byte-invariant | Historical UI metadata |
-| `docs/ADAPTATION.md` | Preserve/adapt | Historical adoption procedure and applicability boundaries |
-| `docs/agent-model-routing.md` | Adapt | Sprint routing and conditional independent review |
-| `docs/agent-operations.md` | Adapt | Sprint work, conditional assurance, evidence, recovery, and delivery |
-| `docs/implementation-standard.md` | Adapt | Supported behavior, focused verification, and completion |
-| `docs/repository-language-standard.md` | Adapt | Owned-text clarity and conditional transformation proof |
-| `docs/instruction-transformation-evidence.md` | Preserve/adapt | Historical transformation and deletion evidence |
-| `examples/assignment-contracts.md` | Add byte-identical | Non-authoritative reference |
-| `examples/beads-dag.md` | Add byte-identical | Non-authoritative reference |
-| `examples/nested-AGENTS.md` | Add byte-identical | Non-authoritative reference |
-| `Makefile` | Add/adapt | Non-interactive harness and product gates |
-| `README.md` | Preserve/adapt | Product body plus concise harness links |
-| `.gitignore` | Merge | Project, runtime, Beads, and `.xray/` policy |
-| `.claude/` | Remove | Obsolete client-specific harness integration; current recovery is Codex-owned |
-| `.xray/xray.db*` | Remove named | Three frozen generated SQLite artifacts only |
-| Product source, tests, samples, installers, reports, skills, packaging | Preserve | No harness-driven product change |
-| Recipe `.git/` and `.beads/` | Omit | Never transplant recipe state |
-| Existing XRAY Beads topology | Preserve/normalize | Back up history; portable routing; no child writes or sync |
+## Maintained current paths
 
-The recipe omitted README and manifest rows; both appear above. Frozen packets,
-companions, examples, and historical evidence remain preserved. YAML-shaped
-examples remain descriptive, not product YAML output.
+| Paths | Purpose |
+|---|---|
+| `.omp/config.yml` | Intentionally empty project layer; the active OMP profile and runtime own bundled-agent behavior and global task defaults. |
+| `.omp/AGENTS.md`, `AGENTS.md`, `PROJECT.md` | Native startup imports, repository guidance, project facts, mode, commands, and authority. |
+| `.omp/APPEND_SYSTEM.md` | Planner/Main allocation only; preserves the bundled base prompt, worker roles, permissions, tools, and safety controls. |
+| `.omp/validate.py` | Lightweight native configuration and bundled-role inventory check behind `make validate-agent-recipe`. |
+| `.omp/validate_project_readiness.py` | Factual readiness check behind `make validate-project-readiness`; it does not impose prose-size quotas. |
+| `Makefile` | Maintained non-interactive harness and product command entrypoints; the native harness checks are the two targets above. |
+| `.agents/skills/beads/` and `CONTINUE.md` | Durable backlog/recovery guidance and current handoff; Main owns tracker mutation. |
+| `docs/agent-operations.md`, `docs/agent-model-routing.md` | Main orchestration, planner triggers, stock-role selection, delegation, recovery, and delivery boundaries. |
+| `docs/implementation-standard.md`, `docs/repository-language-standard.md` | Implementation, focused proof, completion, and owned-prose guidance. |
+| `docs/ADAPTATION.md`, `TEMPLATE_MANIFEST.md`, `README.md` | Harness maintenance, maintained-path inventory, and concise development links. |
+| `ARCHITECTURE.md` | Product interfaces, compatibility, storage, containment, mutation, and current change policy. |
 
-## Synchronization edges
+The repository has no custom OMP role files, aliases, model/effort/reasoning
+overrides, hooks, retry routes, or SDK qualification evaluator. The installed
+OMP CLI supplies the core bundled `task`, `sonic`, `scout`, `reviewer`, and
+`security-reviewer` roles; additional bundled roles remain available without a
+repository registration. OMP installation, version selection, profile settings,
+and effective routing are user-level concerns. The repository neither installs
+nor pins the OMP CLI.
 
-- Role change: registration, role TOML, validator, routing, and applicable
-  current evidence. Mutable role prose is not byte-hashed.
-- Permission or hook: config, hook JSON/script, validator, and recovery.
-- Thread limit: config, operations, validator, and host capability settings.
-- Command, resource, delivery: `PROJECT.md`, Make targets, and closer authority.
-- Interface: `ARCHITECTURE.md`, dependencies, compatibility evidence, and
-  affected consumers.
-- Language or implementation rule: its named authority, affected links, and
-  focused evidence.
-- Historical byte invariant: exact packet/example or metadata contract only;
-  mutable policy uses semantic checks and focused review.
+## History, not current runtime
 
-Apply synchronized changes through the owning authority and preserve unrelated
-state. Root alone integrates, records rollback, and changes durable work state.
+Preserve these frozen records and their exact-byte companions. They document
+past adoption or proposed qualification decisions; they do not select the
+current mode, supply runtime roles, authorize work, or prove I5 acceptance.
+
+| Paths | Classification |
+|---|---|
+| `docs/adoption-design-packet-v1.md` and `.sha256` | Frozen historical adoption evidence |
+| `docs/adoption-design-packet-v2.md` and `.sha256` | Frozen historical harness evidence |
+| `docs/next-major-design-packet-v1.md` and `.sha256` | Frozen future-design history |
+| `docs/next-major-design-packet-v2.md` and `.sha256` | Frozen future-design history |
+| `docs/next-major-design-packet-v3.md` and `.sha256` | Frozen qualification-method history |
+| `docs/next-major-design-packet-v4.md` and `.sha256` | Frozen qualification-applicability history |
+| `docs/instruction-transformation-evidence.md`, `examples/*.md` | Historical, non-authoritative transformation and reference evidence |
+
+Do not rewrite, regenerate, re-hash, or resurrect these records for routine
+Development Sprint work. Rejected findings remain truthful, and a historical
+packet, report, example, or tracker record cannot activate paused/deactivated
+I5 qualification.
+
+## Preserve-state exclusions
+
+These are not harness reset or synchronization surfaces:
+
+- application source, tests, samples, installers, package resources, skills,
+  reports, and generated product evidence;
+- repository identity and history in `.git/`, existing dirty work, and Beads
+  data, backups, databases, interactions, hooks, and history;
+- credentials, provider sessions, user-level OMP state, and external/shared
+  resources.
+
+Preserve them in place. Never transplant recipe `.git/` or tracker state,
+create a replacement Beads store, or add automatic startup synchronization.
+Harness maintenance grants no credentials, production or destructive access,
+remote-Git or Beads-remote authority, commit/push/merge, release, publication,
+deployment, or other protected delivery authority.

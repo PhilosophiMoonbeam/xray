@@ -1,6 +1,6 @@
 # XRAY Agent Index
 
-XRAY is a Python code-intelligence CLI and MCP server. Root owns intent, risk,
+XRAY is a Python code-intelligence CLI and MCP server. Main owns intent, risk,
 Beads, allocation, adjudication, integration, delivery, and completion.
 Repository policy, protected systems, CI when present, and humans retain their
 own authority.
@@ -8,9 +8,11 @@ own authority.
 User, platform, and orchestrator instructions override this file. A closer
 `AGENTS.override.md` or `AGENTS.md` overrides broader repository guidance only
 for its subtree. Within repository policy, `PROJECT.md` selects Development
-Sprint or an explicitly activated named Enterprise/Certification milestone.
-No repository instruction grants credentials, production access, destructive
-authority, remote mutation, merge, publication, or deployment.
+Sprint by default.
+A qualification milestone is current only after Main records a separate explicit
+selection of its named outcome and acceptance contract. No repository
+instruction grants credentials, production access, destructive authority,
+remote mutation, merge, publication, or deployment.
 
 ## Instruction index
 
@@ -37,36 +39,54 @@ fact. Inspect the affected configuration, tests, scripts, permissions,
 resources, and instructions before editing; preserve unrelated state. Make the
 smallest complete change and remove obsolete behavior within scope.
 
-## Root and child boundaries
+## Main and worker boundaries
 
-Root decides meaning and risk. It delegates execution, not authority. Use a
-child only for concrete, bounded work when delegation saves a turn, enables
-genuine concurrency, or supplies risk-required independent evidence. Children
-do not mutate Beads, coordinate peers, create descendants, widen scope,
-self-approve, integrate, or deliver. Exact roles, models, efforts, and runtime
-controls live in `.codex/config.toml` and `.codex/agents/*.toml`.
+Main decides meaning, risk, allocation, integration, delivery, and completion.
+Native OMP exposes planning separately from its bundled worker roles and current
+host controls. It supplies bundled workers such as `scout`, `reviewer`,
+`security-reviewer`, `task`, and `sonic`. The native project layer is
+intentionally minimal: `.omp/config.yml` is `{}`;
+`.omp/AGENTS.md` imports this guide and `PROJECT.md`; `.omp/APPEND_SYSTEM.md`
+defines only the planner/Main allocation contract. There are no repository role
+aliases, model or effort overrides, custom `.omp/agents`, automatic tracker
+hooks, or per-worker ledgers.
 
-Only root mutates the canonical tracker through `bd -C ~/.beads-planning`.
-Children read Beads with `bd --readonly` when a cited durable contract is
-needed. Root uses Beads for durable multi-session work, dependencies, blockers,
-and handoff; a Bead is not required for each local question, edit, hypothesis,
-or test.
+Main escalates to the planner only for:
+
+- **P1:** fresh architecture;
+- **P2:** a material contract pivot;
+- **P3:** a blocker after two materially different evidence-led repairs; or
+- **P4:** missing load-bearing semantics.
+
+The planner returns one actionable decision for the selected trigger. Main
+accepts or rejects that decision and retains intent, scope, risk, integration,
+delivery, and completion authority. Main executes bounded known work, delegates
+substantial or genuinely disjoint leaves to bundled OMP workers, and verifies
+the integrated result once at the proportional V0–V3 level. Children retain their
+assigned stock role and do not inherit Main's orchestration, integration,
+tracker-mutation, scope-expansion, approval, or delivery authority.
+
+Only Main mutates the canonical tracker through `bd -C ~/.beads-planning`.
+Workers read Beads with `bd --readonly` when a cited durable contract is needed.
+Main uses Beads for durable multi-session work, dependencies, blockers, and
+handoff; a Bead is not required for each local question, edit, hypothesis, or
+test. Read-only tracker recovery never creates a replacement store or
+fabricates state.
 
 An assignment states the outcome or question, owned paths, relevant interfaces
 and invariants, allowed operations/resources, observable acceptance, and known
 risks. Add compatibility, rollback, runtime, or return details when they affect
-safe execution. Missing information blocks only when needed for safe
-execution.
+safe execution. Missing information blocks only when needed for safe execution.
 
 Concurrent writers require disjoint primary writes, generated outputs,
 resources, and stateful operations. Worktrees are risk-driven: use them when
 isolation is needed, and serialize overlapping work. Keep current host limits
-and capability settings. Root integrates accepted artifacts and keeps
+and capability settings. Main integrates accepted artifacts and keeps
 unintegrated work recoverable.
 
-MultiAgentV2 has no V1 `close_agent` tool. Root may retain a completed child
-for a useful follow-up and otherwise relinquish it according to the host
-lifecycle. Children never claim that interruption grants delivery authority.
+Native OMP lifecycle controls do not grant repository authority. Main may retain
+or release a completed worker according to stock OMP behavior; interruption
+never grants delivery authority or proves completion.
 
 Routine evidence is the actual command or scenario, exit/result, material
 observation, environment when relevant, and limitation. Exact artifact hashes,
@@ -80,34 +100,34 @@ action, or an unsafe/outcome-ambiguous mutation. Change diagnostic approach or
 obtain useful specialist evidence when a failure remains materially stuck; do
 not count retries or impose a fixed repair quota.
 
-Root alone integrates locally. Without separate delivery authority, stop after
+Main alone integrates locally. Without separate delivery authority, stop after
 local verification. Commit, push, merge, release, deployment, GitHub mutation,
 publication, credentials, production actions, and Beads Dolt push/pull remain
 unauthorized.
 
 ## Progress checkpoints and handoff
 
-For authorized multi-session work, root keeps `CONTINUE.md` current when the
+For authorized multi-session work, Main keeps `CONTINUE.md` current when the
 file exists. At meaningful recoverable checkpoints and before session end or
 interruption, remove completed work from that file, retain only state and
 evidence needed for recovery, add newly planned work and blockers, and state the
 next dependency-ordered action. Git and Beads retain history; `CONTINUE.md` is
-not an archive and does not activate Enterprise/Certification by itself.
+not an archive and does not select or accept a qualification milestone.
 
-Root updates the applicable Bead before closing a session. When the user or
-another controlling authority has separately authorized delivery, root stages
-the scoped changes, runs applicable checks, commits, and pushes the current
-branch at useful recoverable checkpoints. Checkpoint authority does not grant
-merge, release, deployment, publication, production, credential, or Beads Dolt
-remote authority.
+Main updates the applicable Bead before closing a session. Without separately
+granted delivery authority, Main stops after local verification. Commit, push,
+merge, release, deployment, GitHub mutation, publication, credentials,
+production actions, and Beads Dolt push/pull remain unauthorized. A checkpoint
+does not expand those limits.
 
 ## Project tool rules
 
 Use the Beads skill and `bd prime` for durable context. Use Context7 for
-current non-Codex library, framework, SDK, API, CLI, or cloud documentation;
-use current official OpenAI documentation for Codex. Use Playwright for
-browser inspection or verification only when browser behavior is in scope and
-project authority supplies the application and command.
+current library, framework, SDK, API, CLI, or cloud documentation. Use the
+current stock OMP command and bundled-role documentation for harness behavior.
+Use Playwright for browser inspection or verification only when browser
+behavior is in scope and project authority supplies the application and
+command.
 
 For Context7, run at most three commands:
 
@@ -135,12 +155,13 @@ targets first. Use `scp -o BatchMode=yes` and `ssh -o BatchMode=yes`; use
 repository root, workspace root, unresolved variable, or broad glob with a
 destructive command.
 
-Harness authority changes update the affected policy, role/configuration,
-validator, recovery, and applicability links. Review the semantic diff and
-run only applicable configuration or static checks authorized for the change.
+Harness authority changes update the affected policy, native OMP project layer,
+validator, recovery, and applicability links. Review the semantic diff and run
+only applicable configuration or static checks authorized for the change.
 Frozen packets, companions, and byte-invariant examples remain historical
-artifacts unless an explicitly activated milestone says otherwise. Record
-limitations instead of weakening product or delivery boundaries.
+artifacts unless Main records a separately selected milestone outcome that
+explicitly authorizes a material boundary change. Record limitations instead of
+weakening product or delivery boundaries.
 
 <!-- graft:start -->
 ## Graft — repo context graph

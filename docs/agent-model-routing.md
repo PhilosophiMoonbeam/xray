@@ -1,73 +1,98 @@
 # XRAY Agent Routing
 
-Root selects the cheapest route that preserves required semantic quality,
-evidence, and authority. Exact models and efforts live in Codex configuration,
-not this document. PROJECT.md selects Development Sprint or an explicitly
-activated named Enterprise/Certification milestone; a role never activates a
-mode.
+Use the most specific bundled role listed by the active OMP runtime:
 
-## Routing order
+| Core role | Use |
+|---|---|
+| `task` | General implementation, debugging, repair, and slice-local technical design when no specialist fits. |
+| `sonic` | Strictly mechanical edits or data collection with complete instructions. |
+| `scout` | Fast, read-only research inside the repository. |
+| `reviewer` | Read-only code-quality and correctness review when independent scrutiny matches the risk. |
+| `security-reviewer` | Read-only vulnerability review when the changed trust boundary warrants it. |
 
-Apply the first matching route:
+Additional bundled roles, including closer roles exposed by the runtime, are
+part of the same stock inventory. Use them when their runtime description is a
+closer match; do not require repository registration or a version-specific role
+list. Role choice grants no additional delivery, write, credential, or
+protected-resource authority.
 
-1. Keep ambiguity, integration, delivery, and tightly coupled work with root.
-2. Send a new or materially revised architecture, shared API/schema,
-   persistence model, compatibility policy, trust boundary, or cross-component
-   interface to `sol_design` for one actionable decision before implementation.
-3. Send a materially stuck failure to `breakthrough_read` when a changed
-   diagnostic approach or independent reasoning can reduce uncertainty.
-4. Send a scoped consequential review to `terra_verify` when focused
-   counterexample search materially reduces concrete risk.
-5. Send spatial, visual, 3D, novel-pattern, complex-adaptation, or
-   semantic-quality-sensitive implementation to `sol_write`.
-6. Send conventional contract-complete implementation to `luna_write` when
-   delegation saves a turn or enables safe concurrency.
-7. Send one bounded repository question to `luna_read` when its answer unblocks
-   a decision or independent leaf.
+## Planner use and blueprint reuse
 
-Do not route solely because an old qualification item, Bead, packet, role, or
-broad command exists. A planner is not required for routine work without a
-material architecture threshold. Review is optional unless concrete risk or an
-activated acceptance contract requires it.
+Classify the next decision under [Agent operations](agent-operations.md)'s
+P1–P4 taxonomy. Use the designated deep-design planner only when an
+operations trigger requires a fresh or materially changed blueprint, a
+stubborn blocker decision, or missing load-bearing semantics. An accepted
+blueprint remains authoritative until a real P1–P4 trigger invalidates it.
+Main and implementers resolve routine known work and implementation-local
+design within that blueprint.
 
-Choose one execution lane before decomposition:
+A new session, assignment boundary, first failed repair, ordinary understood
+check failure, merge conflict, or restatement request does not trigger
+planning. Research and review do not become required stages merely because a
+planner was used. Main checks the planner's result once and requests a
+specific correction only for a material defect; there is no
+planner–reviewer–planner approval carousel.
 
-- **root-fast:** one cohesive slice that cannot be dispatched safely;
-- **parallel:** at least two independent leaves shorten the critical path;
-- **independent-review:** one consequential claim needs optional independent
-  review.
+If the planner capability is unavailable, report the gap and continue work
+covered by an accepted blueprint or known solution. Never silently replace it
+with a general agent or a model selector.
 
-Keep current host limits and capability settings. Concurrent writers need
-disjoint primary paths, generated outputs, exclusive resources, and agreed
-interfaces. Use worktrees when isolation provides real value; serialize overlap.
-The existence of a role is not a reason to delegate. Higher reasoning changes
-the work performed, not authority, scope, tools, files, retry limits, or gates.
+## Conditional role use
 
-## Design authority
+Use `task` or the closest implementation specialist for substantial leaf work,
+focused debugging, or a disjoint vertical slice. Agents own
+implementation-local design inside the accepted blueprint. Main may directly
+investigate, reproduce, repair, integrate, or verify a bounded known solution
+when dispatch would add overhead without useful parallelism or expertise; this
+does not make Main the default architect. Sonic receives complete instructions
+only.
 
-Routine implementation cites PROJECT, ARCHITECTURE, the applicable standards,
-and any scoped architecture-neutral contract. A new or materially revised
-architecture needs one actionable `sol_design` decision covering affected
-behavior, non-goals, interfaces, invariants, ownership, compatibility,
-rollback, risk, acceptance, and resources. A versioned Design Packet and digest
-are required only when an explicitly activated Enterprise/Certification
-milestone names them.
+Use `scout` for independent repository discovery that will genuinely shorten
+the critical path or spare an expensive scan. Use a suitable available
+specialist for external, dependency, or security research. Small lookups
+belong inline. Research returns facts and implications, not a competing
+blueprint and not an obligatory pre-planner stage.
 
-Root accepts or rejects the decision. A designer does not implement or approve.
-A writer does not revise architecture. Terra does not repair. Any material
-contract-invalidating finding returns to root and, when needed, to
-`sol_design`; routine implementation failures do not reopen planning.
+Use `reviewer` when independent correctness or compatibility scrutiny
+materially reduces risk, and `security-reviewer` when identity, authorization,
+sensitive-disclosure, trust-boundary, or protected-action changes warrant it.
+One risk-matched review at the integrated boundary is preferable to repeated
+leaf reviews. Review is not a default gate; a local finding returns directly
+to execution, and only a P1–P4 decision returns to the planner. Any
+qualification-required independent review remains a separate qualification
+obligation until its governing contract is reconciled.
 
-The role set preserves root-only authority, no descendants, declared writes,
-permissions, models, efforts, and host controls. A completed child may receive
-a useful follow-up without a fixed quota; root decides whether to retain or
-relinquish its lane according to the host lifecycle.
+Follow [Agent operations](agent-operations.md) for dispatch, rolling-frontier
+coordination, shared-checkout ownership, verification, and recovery. Stock
+role permissions remain authoritative; assignment wording cannot turn a
+read-only role into a writer.
 
-## Cost and quality
+## Runtime and model selection
 
-Compare the observed value of a route against its critical-path cost and risk.
-Add parallelism, specialist reasoning, recovery, or review only when it
-materially improves the affected outcome. Do not require performance-of-agent
-telemetry, retained-worktree counts, repair quotas, unchanged-artifact reruns,
-or certification evidence for ordinary Sprint work. Record material defects,
-limitations, and uncertainty instead of optimizing a metric.
+Use the designated planning capability when exposed by the runtime; do not
+treat a model selector as an agent name. If that capability is unavailable,
+report the gap as described above rather than inventing a role. Repository
+skills and verification requirements apply inside assignments. Advisor work is
+optional and never an approval stage.
+
+Bundled definitions own each agent's tools, spawn permissions, and runtime
+behavior. Global model-role selectors are separate from bundled agent names:
+they select the model used for a native role, not a repository-defined agent.
+The `plan` role selects the model for native planning mode; it does not
+automatically dispatch a planner. Advisor assignment is independent from
+advisor activation. The project does not require enabling an advisor.
+
+Do not reproduce or freeze stock routing choices in project configuration,
+per-task model overrides, or effort hints. The active profile and runtime
+determine stock behavior in effect; an empty project mapping does not assert
+unchanged defaults. Isolation and other capability choices are global.
+
+The project validator checks only the empty project layer and that an OMP CLI
+export contains the required bundled-role inventory. It does not discover the
+effective runtime, resolve model roles, or check provider or model health.
+Diagnose the installed CLI or active profile rather than creating a project
+alias or silently routing specialist work to a different role.
+
+Agent operations owns delegation, shared-checkout coordination, verification,
+and durable backlog handling. Role choice grants no additional delivery or
+protected-resource authority.

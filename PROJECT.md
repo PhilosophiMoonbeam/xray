@@ -8,25 +8,26 @@ qualification or grant delivery authority.
 
 ## Operating mode
 
-Enterprise/Certification is active for the named **XRAY next-major I5
-qualification** milestone. Its assurance objective is whole-product I5
-acceptance, including G1-G8, on one unchanged candidate. The preserved
-next-major design packets v1-v4 and the adjudicated method requirements are the
-applicable acceptance contract. This activation ends on completion,
-cancellation, or explicit deactivation; new work then returns to Development
-Sprint by default.
+Development Sprint is the current default. Main may select a bounded Sprint
+task without a qualification ceremony, frozen packet, exhaustive assignment
+fields, mandatory specialist or reviewer chain, transformation or count
+attestation, or I0/I5 or W0-W6 qualification.
 
-Within repository policy, this section selects the mode. It supersedes standing
-process obligations inherited from adoption packets, next-major instructions,
-and older handoffs when they conflict with the active mode. Routine Sprint work
-does not require a frozen or hashed Design Packet for every change, exhaustive
-assignment fields, mandatory specialist or reviewer chains, transformation or
-count attestation, or I0/I5 or W0-W6 qualification before routine completion.
-Product behavior, compatibility, authorization, containment, data preservation,
-truthful mutation outcomes, and delivery limits remain unchanged. Frozen
-packets and historical evidence retain their bytes and meaning; their exhaustive
-procedures apply only to their explicitly activated Enterprise/Certification
-milestone.
+The XRAY next-major I5 qualification is explicitly paused and deactivated. I5
+acceptance has not occurred, and neither this file, `CONTINUE.md`, Beads,
+historical packets, rejected methods, old commands, nor worker availability
+accepts or reactivates it. The preserved next-major design packets v1-v4,
+adjudicated method requirements, and rejected evidence remain truthful
+historical and recovery material. Resumption would require Main to record a
+separately selected qualification outcome naming its assurance objective,
+acceptance contract, candidate, and authority before any qualification action.
+
+This mode supersedes standing process obligations inherited from adoption
+packets, next-major instructions, and older handoffs when they conflict with
+current Sprint work. Product behavior, compatibility, authorization,
+containment, data preservation, truthful mutation outcomes, and delivery limits
+remain unchanged. Frozen packets and historical evidence retain their bytes and
+meaning; their exhaustive procedures are not current Sprint authority.
 
 ## Purpose
 
@@ -41,9 +42,10 @@ process.
 
 Product and user contracts remain in `README.md`, `ARCHITECTURE.md`, and
 `src/xray/`. Historical adoption and next-major packets remain preserved
-evidence; PROJECT selects when their named acceptance contract applies.
-Routine implementation, delegation, evidence, and completion rules live in
-the current standards linked from `AGENTS.md`.
+evidence; a separately selected qualification outcome would identify when a
+named acceptance contract applies. Routine implementation, delegation,
+evidence, and completion rules live in the current standards linked from
+`AGENTS.md`.
 
 ## Architecture
 
@@ -69,35 +71,35 @@ advertises an unimplemented operation.
 
 ## Integration branch
 
-`main` is the integration branch. Root adjudicates and integrates accepted
-artifacts serially. Exact-tree or exact-SHA qualification is an
-Enterprise/Certification activity only when its named milestone is active; it
-must bind the candidate being qualified rather than reuse evidence from another
-tree.
+`main` is the integration branch. Main adjudicates and integrates accepted
+artifacts serially. Exact-tree or exact-SHA qualification is permitted only
+after a separately selected qualification outcome names its milestone and
+contract; it must bind the candidate being qualified rather than reuse evidence
+from another tree.
 
 ## Component ownership
 
 Concurrent writes require disjoint primary paths, generated outputs, and
 stateful resources. Use a worktree when it provides needed isolation; it is not
 a routine paperwork requirement. Product paths remain owned by product owners,
-while harness paths may change under the scoped governance contract.
+while Main governs native OMP paths under the scoped governance contract.
 
-| Component | Owned paths | Canonical specialist |
+| Component | Owned paths | Current allocation |
 |---|---|---|
-| Product CLI and JSON presentation | `src/xray/cli.py`, `src/xray/models.py`, `src/xray/presentation.py` | `sol_write` |
-| MCP server and packaged MCP skill | `src/xray/mcp_server.py`, `src/xray/skills/` | `sol_write` |
-| Indexing and ast-grep integration | `src/xray/core/` | `sol_write` |
-| Packaging and installation | `pyproject.toml`, `install.sh`, `uninstall.sh`, `mcp-config-generator.py` | `luna_write` |
-| Product verification | `tests/`, `test_samples/` | `terra_verify` |
-| Product documentation and CLI skill | `README.md`, `.reports/`, `skills/xray-cli/` | `luna_write` |
-| Readiness and architecture authority | `PROJECT.md`, `ARCHITECTURE.md` | `sol_design` |
-| Standards, manifest, examples, and README authority links | `docs/`, `TEMPLATE_MANIFEST.md`, `examples/`, authorized harness links in `README.md` | `luna_write` |
-| Beads topology and compact Beads skill | existing XRAY `.beads/`, dedicated planning checkout, `.agents/skills/beads/` | root only for tracker state; `luna_write` for skill files |
-| Root instruction index | `AGENTS.md` | `sol_design` |
-| Codex roles and root configuration | `.codex/config.toml`, `.codex/agents/` | `sol_write` |
-| Session recovery and handoff | `.codex/hooks.json`, `.codex/session_start.py`, `CONTINUE.md` | root for current handoff; `sol_write` for hook mechanics |
-| Validators and canonical runner | `.codex/validate_agents.py`, `.codex/validate_codex_doctor.py`, `.codex/validate_project_readiness.py`, `Makefile` | `sol_write` |
-| Generated XRAY SQLite cleanup and ignore policy | `.xray/xray.db`, `.xray/xray.db-shm`, `.xray/xray.db-wal`, `.gitignore` | `luna_write` |
+| Product CLI and JSON presentation | `src/xray/cli.py`, `src/xray/models.py`, `src/xray/presentation.py` | Main; stock OMP worker only when Main delegates |
+| MCP server and packaged MCP skill | `src/xray/mcp_server.py`, `src/xray/skills/` | Main; stock OMP worker only when Main delegates |
+| Indexing and ast-grep integration | `src/xray/core/` | Main; stock OMP worker only when Main delegates |
+| Packaging and installation | `pyproject.toml`, `install.sh`, `uninstall.sh`, `mcp-config-generator.py` | Main; stock OMP worker only when Main delegates |
+| Product verification | `tests/`, `test_samples/` | Main; stock OMP worker only when Main delegates |
+| Product documentation and CLI skill | `README.md`, `.reports/`, `skills/xray-cli/` | Main; stock OMP worker only when Main delegates |
+| Readiness and architecture authority | `PROJECT.md`, `ARCHITECTURE.md` | Main; planner only for P1-P4 |
+| Standards, manifest, examples, and README authority links | `docs/`, `TEMPLATE_MANIFEST.md`, `examples/`, authorized harness links in `README.md` | Main; stock OMP worker only when Main delegates |
+| Beads topology and compact Beads skill | existing XRAY `.beads/`, dedicated planning checkout, `.agents/skills/beads/` | Main only for tracker state; stock OMP worker read-only for cited context |
+| Main instruction index | `AGENTS.md` | Main |
+| Native OMP project layer | `.omp/config.yml`, `.omp/AGENTS.md`, `.omp/APPEND_SYSTEM.md` | Main |
+| Session recovery and handoff | `CONTINUE.md` | Main |
+| Validators and canonical runner | `.omp/validate.py`, `.omp/validate_project_readiness.py`, `Makefile` | Main |
+| Generated XRAY SQLite cleanup and ignore policy | `.xray/xray.db`, `.xray/xray.db-shm`, `.xray/xray.db-wal`, `.gitignore` | Main; stock OMP worker only when Main delegates |
 
 ## Canonical command catalog
 
@@ -117,19 +119,25 @@ narrowest real runtime smoke for the active mode and affected transport.
 | MCP stdio smoke | repository root | When MCP or shared behavior is affected, launch `uv run xray-mcp` as an actual stdio child with a throwaway client, initialize, discover the two adapter tools, and call the changed operation. |
 | Broad test suite | repository root | `uv run pytest` is an explicit broad check, not a routine Sprint gate. |
 | Build and package | repository root | `uv build` when packaging or distribution behavior is affected. |
-| Enterprise qualification | repository root | `make qualify` and named packet gates only after explicit Enterprise/Certification activation. |
-| Local inspection | repository root | `git diff --check` and status inspection when the root chooses to review the scoped change. |
+| Paused I5 qualification | repository root | No current qualification command or ceremony. Main may act only after a separately selected qualification outcome names the contract, candidate, and authority. |
+| Native OMP inventory | repository root | `omp agents unpack --dir <isolated temporary directory> --json` for the bundled-role inventory only. |
+| OMP project validator | repository root | `uv run python .omp/validate.py` for the empty native project layer and harness inventory. |
+| Factual readiness validator | repository root | `uv run python .omp/validate_project_readiness.py` for repository readiness facts without prose-size quotas. |
 
 XRAY has no tracked generated source that must be regenerated. `uv build`
 creates ignored `build/` and `dist/` artifacts; tests use temporary directories
-and may use ignored Python/test caches. Broad checks and qualification commands
-remain available as explicit tools and do not activate Enterprise/Certification.
+and may use ignored Python/test caches. Broad checks remain explicit tools and
+do not activate or accept the paused I5 milestone.
 
-The `codex-doctor` recipe validates Codex Doctor's redacted JSON report. It
-rejects malformed output and every failed installation, configuration,
-runtime, Git, terminal, app-server, or thread-inventory check. Missing Codex
-credentials alone are reported but are not a repository-readiness failure,
-because isolated and CI environments intentionally lack user authentication.
+The native OMP project layer is intentionally empty and declarative:
+`.omp/config.yml` is `{}`, `.omp/AGENTS.md` imports `AGENTS.md` and
+`PROJECT.md`, and `.omp/APPEND_SYSTEM.md` defines only planner/Main
+allocation. `uv run python .omp/validate.py` rejects any legacy `.codex`
+surface, a populated or symlinked custom `.omp/agents` directory, or a missing
+bundled stock role; it also checks the required native inventory. The factual
+readiness validator retains `Status: READY`, required sections, links, release
+identity, and inactive-surface checks without prose-size quotas. These checks
+grant no credentials or delivery authority.
 
 Resolved qualification gap: on 2026-08-05, `uv sync --dev` resolved Ruff 0.16.1
 from `ruff>=0.14.0`, exposing 11 existing `PLR0917` violations. Repair
@@ -140,17 +148,18 @@ pending product qualification or waive any product invariant.
 
 ## Delivery authority
 
-Root owns intent, risk, allocation, integration, and completion. Only root
-mutates or closes Beads, and only root may create local branches or worktrees
+Main owns intent, risk, allocation, integration, and completion. Only Main
+mutates or closes Beads, and only Main may create local branches or worktrees
 when needed. A bounded Sprint task may proceed without a Bead; use the
 canonical planning store for durable multi-session work, dependencies,
-blockers, and handoff. Children read Beads with `bd --readonly` and do not
-claim, create, update, link, close, back up, route, or synchronize tracker
+blockers, and handoff. Stock OMP workers read Beads with `bd --readonly` and do
+not claim, create, update, link, close, back up, route, or synchronize tracker
 state.
 
 Commit, push, merge, release, deployment, GitHub mutation, publication, and
-Beads Dolt push/pull remain unauthorized unless the user separately grants
-them. A passing check or Enterprise result never expands that authority.
+Beads Dolt push/pull remain unauthorized unless Main receives separate
+authority. A passing check or qualification result never expands that
+authority.
 
 ## External and shared resources
 
@@ -175,7 +184,7 @@ them. A passing check or Enterprise result never expands that authority.
   wrappers. Preserve configured request limits, timeouts, output bounds, and
   error classification.
 - The canonical Beads history remains in the dedicated local planning
-  checkout; only root may write it. The product checkout's zero-issue database
+  checkout; only Main may write it. The product checkout's zero-issue database
   is noncanonical contributor metadata during migration.
 
 ## Sensitive and destructive operations
@@ -200,9 +209,9 @@ them. A passing check or Enterprise result never expands that authority.
   explicitly selected checkout.
 - Git remote operations, GitHub CLI mutations, credentials, releases,
   publication, production access, and deployment require separate authority.
-- Beads routing, backup/restore, memory mutation, database changes, hook
-  installation, and Dolt remotes are root-only. Push and pull are not authorized
-  by this profile.
+- Beads routing, backup/restore, memory mutation, database changes, tracker
+  automation installation, and Dolt remotes are Main-only. Push and pull are not
+  authorized by this profile.
 - The three tracked `.xray/xray.db*` files are obsolete product-index state, not
   Beads. Only the specifically assigned cleanup leaf may remove them after the
   frozen identity/dependency evidence; no Beads database may be removed.
@@ -211,20 +220,22 @@ them. A passing check or Enterprise result never expands that authority.
 
 ## Required nested instructions
 
-None. The tracked base contains only the root `AGENTS.md`, and inspection found
-no subtree with distinct authority, commands, or invariants that justifies a
-nested `AGENTS.md` or `AGENTS.override.md`. Add one only when evidence establishes
-a real subtree-specific rule; examples of nested instructions remain
-non-authoritative.
+None. The tracked base contains only `AGENTS.md`, and inspection found no
+subtree with distinct authority, commands, or invariants that justifies a
+nested `AGENTS.md` or `AGENTS.override.md`. Add one only when evidence
+establishes a real subtree-specific rule; examples of nested instructions
+remain non-authoritative.
 
-## CI and Enterprise qualification
+## CI and paused qualification
 
 XRAY has no current `.github` workflow or other CI configuration. Do not invent
 or imply a remote CI gate. The command catalog above supplies focused Sprint
-checks and optional broad checks. An explicitly activated Enterprise milestone
-uses its named packet contract, applicable full gates, exact candidate
-identity, independent review, and attestation or replay only where that
-contract requires them. Historical qualification evidence is not current proof.
+checks and optional broad checks. I5 qualification is paused and deactivated:
+no current packet gate, population, exact-candidate ceremony, replay, or
+independent qualification review is authorized. A separately selected outcome
+must name the milestone, assurance objective, acceptance contract, candidate,
+authority, and applicable evidence before any such work resumes. Historical
+qualification evidence is not current proof or acceptance.
 
 Local success never authorizes commit, push, merge, release, synchronization,
 publication, deployment, or protected delivery.
@@ -252,8 +263,8 @@ boundary, not the historical adoption base. Back up before a real destructive
 or persistent-data transition and preserve recoverable dirty state. Use exact
 validated paths for cache cleanup, forceful file operations, and restoration;
 never target a home, repository root, workspace root, or unresolved glob.
-Restore Beads only from a verified backup when root is authorized to mutate it;
-never restore tracker state from the recipe.
+Restore Beads only from a verified backup when Main is authorized to mutate it;
+never restore tracker state from a recipe.
 
 ## Evidence
 
@@ -262,9 +273,9 @@ never restore tracker state from the recipe.
   implemented 1.0.0 candidate.
 - Historical adoption and next-major decisions: the preserved packet files and
   their companions. They are not routine Sprint authority or current proof
-  unless their named Enterprise/Certification milestone is activated.
+  unless Main separately selects a named qualification outcome.
 - Durable work, dependencies, blockers, and handoff: the canonical Beads store
-  through root-authorized operations. A Bead is not required for each local
+  through Main-authorized operations. A Bead is not required for each local
   question, edit, hypothesis, or test.
 - Routine completion evidence: actual changed-path checks, relevant static
   checks, focused CLI/MCP smoke when affected, consumer/documentation
